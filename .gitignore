@@ -1,0 +1,16 @@
+# ---------------------------------------------------------------------------
+# Notas do usuario: dados pessoais, nunca devem entrar no repositorio.
+# No backend SQLite isto passa a ser notas.db (e seus arquivos auxiliares).
+# ---------------------------------------------------------------------------
+data/
+notas.db
+notas.db-journal
+notas.db-wal
+notas.db-shm
+
+# Backups temporarios de trabalho (nao sao artefatos do projeto)
+*.bak-*
+
+# Importacao/exportacao de markdown feitas em teste
+*.import-tmp/
+*.export-tmp/
