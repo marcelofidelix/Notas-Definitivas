@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <sqlite3.h>   /* Backend de armazenamento SQLite (v6.29.0) */
 
 #ifdef _WIN32
   #ifndef _WIN32_WINNT
@@ -370,10 +371,17 @@ static const Theme themes[NUM_THEMES] = {
 #define STYLE_UNDERLINE "\x1b[4m"
 #define STYLE_RESET     "\x1b[0m"
 
+/* Rotulos dos prompts de importacao/exportacao. Sao macros para que o desenho
+ * do rodape e o calculo da coluna do cursor usem a MESMA string. */
+#define PROMPT_IMPORT_LABEL " \xe2\xac\x87 Importar de: "
+#define PROMPT_EXPORT_LABEL " \xe2\xac\x86 Exportar para: "
+
 /* =========================================================================
  * Constants and Keycodes
  * ========================================================================= */
 #define DATA_DIR "data"
+#define DB_PATH "notas.db"       /* Banco SQLite unico com todas as notas (v6.29.0) */
+#define DB_SCHEMA_VERSION 1
 #define DEFAULT_LEFT_WIDTH 40
 #define MIN_LEFT_WIDTH 18
 #define MAX_HISTORY 64
@@ -398,7 +406,9 @@ enum EditorMode {
     MODE_PROMPT_RENAME_NOTE,
     MODE_PROMPT_FIND,
     MODE_PROMPT_REPLACE_FIND,
-    MODE_PROMPT_REPLACE_WITH
+    MODE_PROMPT_REPLACE_WITH,
+    MODE_PROMPT_IMPORT_DIR,
+    MODE_PROMPT_EXPORT_DIR
 };
 
 enum EditorFocus {
@@ -593,6 +603,8 @@ typedef struct {
     int btn_find_start, btn_find_end;
     int btn_replace_start, btn_replace_end;
     int btn_life_start, btn_life_end;
+    int btn_import_start, btn_import_end;   /* [Importar] - pasta .md -> SQLite */
+    int btn_export_start, btn_export_end;   /* [Exportar] - SQLite -> pasta .md */
 
     /* Urgency / Criticality Filter State (0 = all, 1 = Red, 2 = Orange, 3 = Yellow) */
     int filter_urgency;
@@ -1525,7 +1537,9 @@ static void open_link_target(const char *raw_target) {
                    strncasecmp(target, "mailto:", 7) == 0 ||
                    strncasecmp(target, "www.", 4) == 0);
     if (is_web) {
-        char url_buf[4096];
+        /* 4096 + 8 para o prefixo: com 4096 o gcc alertava truncagem
+         * silenciosa (o alvo pode ter ate 4095 bytes). */
+        char url_buf[4104];
         if (strncasecmp(target, "www.", 4) == 0) {
             snprintf(url_buf, sizeof(url_buf), "https://%s", target);
         } else {
@@ -1804,7 +1818,7 @@ static void editor_paste_string(const char *text, int len) {
         return;
     }
 
-    if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_REPLACE_WITH) {
+    if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
         int plen = (int)strlen(E.prompt_buf);
         for (int j = 0; j < len && plen < 240; j++) {
             if (text[j] == '\r' || text[j] == '\n') break;
@@ -2176,6 +2190,30 @@ static void extract_note_title(const char *filepath, const char *fname, char *ou
     }
 }
 
+/* Comparador de exibicao da lista de notas:
+ *   1) grupo de urgencia: nivel 1, depois 2, depois 3, e por ultimo as sem
+ *      marcacao ([ ]);
+ *   2) dentro de cada grupo, a editada MAIS RECENTEMENTE primeiro;
+ *   3) desempate por nome, para a ordem ser estavel entre redesenhos.
+ * Reaproveita compare_notes_mtime() para o criterio de data. A definicao dela
+ * vem logo abaixo, por isso a declaracao antecipada aqui. */
+static int compare_notes_mtime(const void *a, const void *b);
+
+static int compare_notes_priority(const void *a, const void *b) {
+    const NoteInfo *na = (const NoteInfo *)a;
+    const NoteInfo *nb = (const NoteInfo *)b;
+
+    int ra = (na->attention_level >= 1 && na->attention_level <= 3)
+             ? na->attention_level - 1 : 3;
+    int rb = (nb->attention_level >= 1 && nb->attention_level <= 3)
+             ? nb->attention_level - 1 : 3;
+    if (ra != rb) return ra - rb;
+
+    int c = compare_notes_mtime(a, b);
+    if (c != 0) return c;
+    return strcmp(na->filename, nb->filename);
+}
+
 static int compare_notes_mtime(const void *a, const void *b) {
     const NoteInfo *na = (const NoteInfo *)a;
     const NoteInfo *nb = (const NoteInfo *)b;
@@ -2200,6 +2238,565 @@ static char *read_entire_file(const char *path, long *out_len) {
     return buf;
 }
 
+
+/* =========================================================================
+ * Armazenamento SQLite (v6.29.0)
+ * -------------------------------------------------------------------------
+ * Toda a persistencia de notas passou a ficar em um unico banco SQLite
+ * (notas.db), criado ao lado do executavel. O diretorio data/ com arquivos .md
+ * deixou de ser o armazenamento principal: passou a ser apenas origem e
+ * destino das rotinas de importacao e exportacao.
+ *
+ * COMO O RESTO DO PROGRAMA CONTINUA FUNCIONANDO SEM ALTERACAO:
+ * o campo filepath (NoteInfo.filepath, Tab.cur_filepath, E.cur_filepath)
+ * segue sendo a chave usada por toda a interface, mas agora carrega um caminho
+ * VIRTUAL no formato "db:<id>". Como toda a logica de abas, undo, preview,
+ * historico, busca e links apenas compara essa string, nada mais precisou
+ * mudar. Caminhos reais de arquivo continuam aceitos como fallback, o que
+ * mantem o argumento de linha de comando (abrir um .md avulso) funcionando.
+ * ========================================================================= */
+
+static sqlite3 *g_db = NULL;
+
+static inline bool db_is_open(void) { return g_db != NULL; }
+
+static void db_close(void) {
+    if (g_db) {
+        sqlite3_close(g_db);
+        g_db = NULL;
+    }
+}
+
+static bool db_exec(const char *sql) {
+    if (!g_db || !sql) return false;
+    char *err = NULL;
+    if (sqlite3_exec(g_db, sql, NULL, NULL, &err) != SQLITE_OK) {
+        if (err) sqlite3_free(err);
+        return false;
+    }
+    return true;
+}
+
+/* Abre (criando se necessario) o banco e garante o schema. O banco nasce
+ * VAZIO: nenhuma nota de exemplo e criada. */
+static bool db_open(void) {
+    if (g_db) return true;
+
+    if (sqlite3_open(DB_PATH, &g_db) != SQLITE_OK) {
+        if (g_db) { sqlite3_close(g_db); g_db = NULL; }
+        return false;
+    }
+    sqlite3_busy_timeout(g_db, 3000);
+
+    /* WAL permite leitura e escrita concorrentes sem travar o loop da
+     * interface; synchronous=NORMAL e o ajuste recomendado pela propria SQLite
+     * para o modo WAL. */
+    db_exec("PRAGMA journal_mode=WAL;");
+    db_exec("PRAGMA synchronous=NORMAL;");
+
+    if (!db_exec("CREATE TABLE IF NOT EXISTS notes ("
+                 "id        INTEGER PRIMARY KEY AUTOINCREMENT,"
+                 "name      TEXT    NOT NULL UNIQUE,"
+                 "content   TEXT    NOT NULL DEFAULT '',"
+                 "mtime     INTEGER NOT NULL DEFAULT 0,"
+                 "attention INTEGER NOT NULL DEFAULT 0);")) {
+        return false;
+    }
+    if (!db_exec("CREATE INDEX IF NOT EXISTS idx_notes_mtime ON notes(mtime DESC);")) {
+        return false;
+    }
+    db_exec("PRAGMA user_version=1;");
+    return true;
+}
+
+/* -------------------------------------------------------------------------
+ * Identidade de nota: "db:<id>"
+ * ------------------------------------------------------------------------- */
+static int note_id_from_path(const char *path) {
+    if (!path || strncmp(path, "db:", 3) != 0) return -1;
+    return atoi(path + 3);
+}
+
+static void note_path_from_id(int id, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "db:%d", id);
+}
+
+/* -------------------------------------------------------------------------
+ * Consultas e mutacoes
+ * ------------------------------------------------------------------------- */
+static int db_find_id_by_name(const char *name) {
+    if (!g_db || !name || !*name) return -1;
+    sqlite3_stmt *st = NULL;
+    int id = -1;
+    if (sqlite3_prepare_v2(g_db, "SELECT id FROM notes WHERE name=?1 LIMIT 1;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return id;
+}
+
+static int db_insert_note(const char *name, const char *content, time_t mtime, int attention) {
+    if (!g_db || !name || !*name) return -1;
+    sqlite3_stmt *st = NULL;
+    int id = -1;
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO notes(name, content, mtime, attention) VALUES(?1,?2,?3,?4);",
+            -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, content ? content : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)(mtime > 0 ? mtime : time(NULL)));
+    sqlite3_bind_int(st, 4, attention);
+    if (sqlite3_step(st) == SQLITE_DONE) id = (int)sqlite3_last_insert_rowid(g_db);
+    sqlite3_finalize(st);
+    return id;
+}
+
+static bool db_update_content(int id, const char *content, time_t mtime) {
+    if (!g_db || id < 0) return false;
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(g_db,
+            "UPDATE notes SET content=?1, mtime=?2 WHERE id=?3;",
+            -1, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(st, 1, content ? content : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(mtime > 0 ? mtime : time(NULL)));
+    sqlite3_bind_int(st, 3, id);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = (sqlite3_changes(g_db) > 0);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static bool db_update_name(int id, const char *newname) {
+    if (!g_db || id < 0 || !newname || !*newname) return false;
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(g_db, "UPDATE notes SET name=?1 WHERE id=?2;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(st, 1, newname, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, id);
+    /* Se ja existir outra nota com esse nome, o UNIQUE falha e nada muda. */
+    if (sqlite3_step(st) == SQLITE_DONE) ok = (sqlite3_changes(g_db) > 0);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static bool db_delete_note(int id) {
+    if (!g_db || id < 0) return false;
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM notes WHERE id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = (sqlite3_changes(g_db) > 0);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static bool db_set_attention(int id, int level) {
+    if (!g_db || id < 0) return false;
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(g_db, "UPDATE notes SET attention=?1 WHERE id=?2;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int(st, 1, level);
+    sqlite3_bind_int(st, 2, id);
+    if (sqlite3_step(st) == SQLITE_DONE) ok = true;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static bool db_get_name(int id, char *out, size_t out_sz) {
+    if (out && out_sz) out[0] = '\0';
+    if (!g_db || id < 0) return false;
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(g_db, "SELECT name FROM notes WHERE id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *nm = (const char *)sqlite3_column_text(st, 0);
+        if (nm) { safe_strcpy(out, out_sz, nm); ok = true; }
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static char *db_get_content(int id, long *out_len) {
+    if (out_len) *out_len = 0;
+    if (!g_db || id < 0) return NULL;
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT content FROM notes WHERE id=?1;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+    sqlite3_bind_int(st, 1, id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *txt = sqlite3_column_text(st, 0);
+        int len = sqlite3_column_bytes(st, 0);
+        if (txt && len >= 0) {
+            out = (char *)malloc((size_t)len + 1);
+            if (out) {
+                memcpy(out, txt, (size_t)len);
+                out[len] = '\0';
+                if (out_len) *out_len = len;
+            }
+        }
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+static int db_count_notes(void) {
+    if (!g_db) return 0;
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (sqlite3_prepare_v2(g_db, "SELECT COUNT(*) FROM notes;", -1, &st, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* -------------------------------------------------------------------------
+ * Acesso uniforme: banco (caminho "db:<id>") ou arquivo real (fallback)
+ * ------------------------------------------------------------------------- */
+static char *note_read_content(const char *path, long *out_len) {
+    int id = note_id_from_path(path);
+    if (id >= 0) return db_get_content(id, out_len);
+    return read_entire_file(path, out_len);
+}
+
+static bool note_write_content(const char *path, const char *data, long len) {
+    int id = note_id_from_path(path);
+    if (id >= 0) return db_update_content(id, data, time(NULL));
+
+    FILE *f = fopen_utf8(path, "wb");
+    if (!f) return false;
+    if (data && len > 0) fwrite(data, 1, (size_t)len, f);
+    fclose(f);
+    return true;
+}
+
+/* Serializa o buffer de linhas do editor no formato markdown em disco. */
+static char *lines_to_content(Line *lines, int num_lines, long *out_len) {
+    ABuffer ab;
+    ab_init(&ab);
+    for (int i = 0; i < num_lines; i++) {
+        if (lines[i].chars && lines[i].len > 0) ab_append(&ab, lines[i].chars, lines[i].len);
+        ab_append(&ab, "\n", 1);
+    }
+    if (!ab.b) {
+        ab.b = (char *)malloc(1);
+        if (ab.b) ab.b[0] = '\0';
+        if (out_len) *out_len = 0;
+        return ab.b;
+    }
+    if (out_len) *out_len = ab.len;
+    return ab.b; /* posse transferida para o chamador (nao usar ab_free aqui) */
+}
+
+/* Carrega 'content' (memoria) como linhas do editor ativo. Equivale ao antigo
+ * loop de fgets(), mas sem depender de arquivo e sem limite de 16 KB por linha. */
+static void editor_load_content(const char *content) {
+    if (!content) return;
+    const char *p = content;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        int linelen = nl ? (int)(nl - p) : (int)strlen(p);
+        while (linelen > 0 && p[linelen - 1] == '\r') linelen--;
+        buf_insert_line(E.num_lines, p, linelen);
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Nomes e extensoes
+ * ------------------------------------------------------------------------- */
+static bool is_markdown_ext(const char *fname) {
+    const char *ext = strrchr(fname, '.');
+    if (!ext) return true; /* mesma regra do scan original: sem extensao conta */
+    return strcasecmp(ext, ".md") == 0 || strcasecmp(ext, ".markdown") == 0 ||
+           strcasecmp(ext, ".mdown") == 0 || strcasecmp(ext, ".txt") == 0 ||
+           strcasecmp(ext, ".text") == 0;
+}
+
+/* Deixa um nome seguro para virar nome de arquivo. */
+static void sanitize_note_name(const char *in, char *out, size_t out_sz) {
+    size_t j = 0;
+    if (!in) { out[0] = '\0'; return; }
+    for (size_t i = 0; in[i] && j + 1 < out_sz; i++) {
+        char c = in[i];
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|') {
+            c = '_';
+        }
+        out[j++] = c;
+    }
+    out[j] = '\0';
+}
+
+/* Expande "~" no inicio para o diretorio pessoal. */
+static void expand_user_path(const char *in, char *out, size_t out_sz) {
+    if (in && in[0] == '~' && (in[1] == '/' || in[1] == '\\' || in[1] == '\0')) {
+        const char *home = getenv("HOME");
+#ifdef _WIN32
+        if (!home) home = getenv("USERPROFILE");
+#endif
+        if (home) {
+            snprintf(out, out_sz, "%s%s", home, in + 1);
+            return;
+        }
+    }
+    safe_strcpy(out, out_sz, in ? in : "");
+}
+
+/* -------------------------------------------------------------------------
+ * Importacao: pasta com arquivos .md  ->  banco
+ * ------------------------------------------------------------------------- */
+static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_updated,
+                                 char *errbuf, size_t errsz) {
+    if (out_added) *out_added = 0;
+    if (out_updated) *out_updated = 0;
+    if (errbuf && errsz) errbuf[0] = '\0';
+
+    if (!db_is_open()) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "banco de dados indisponivel");
+        return -1;
+    }
+    if (!dirpath || !*dirpath) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "nenhuma pasta informada");
+        return -1;
+    }
+
+    int added = 0, updated = 0;
+    bool dir_found = false;
+
+#ifdef _WIN32
+    WCHAR wdir[1024];
+    if (MultiByteToWideChar(CP_UTF8, 0, dirpath, -1, wdir, 1024) <= 0) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "caminho invalido");
+        return -1;
+    }
+    WCHAR pattern[1024];
+    wcsncpy(pattern, wdir, 1000);
+    pattern[1000] = L'\0';
+    wcscat(pattern, L"\\*");
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(pattern, &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        dir_found = true;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            char fname[512];
+            if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, fname, sizeof(fname), NULL, NULL) <= 0) continue;
+            if (fname[0] == '.' || !is_markdown_ext(fname)) continue;
+            char full[2048];
+            snprintf(full, sizeof(full), "%s\\%s", dirpath, fname);
+            long clen = 0;
+            char *content = read_entire_file(full, &clen);
+            if (!content) continue;
+            char name[256];
+            safe_strcpy(name, sizeof(name), fname);
+            char *dot = strrchr(name, '.');
+            if (dot) *dot = '\0';
+            if (name[0]) {
+                time_t mt = filetime_to_timet(&fd.ftLastWriteTime);
+                if (mt <= 0) mt = time(NULL);
+                int existing = db_find_id_by_name(name);
+                if (existing >= 0) {
+                    if (db_update_content(existing, content, mt)) updated++;
+                } else if (db_insert_note(name, content, mt, 0) >= 0) {
+                    added++;
+                }
+            }
+            free(content);
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+#else
+    DIR *d = opendir(dirpath);
+    if (d) {
+        dir_found = true;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            if (!is_markdown_ext(ent->d_name)) continue;
+
+            char full[2048];
+            snprintf(full, sizeof(full), "%s/%s", dirpath, ent->d_name);
+            struct stat st;
+            if (stat(full, &st) != 0 || S_ISDIR(st.st_mode)) continue;
+
+            long clen = 0;
+            char *content = read_entire_file(full, &clen);
+            if (!content) continue;
+
+            char name[256];
+            safe_strcpy(name, sizeof(name), ent->d_name);
+            char *dot = strrchr(name, '.');
+            if (dot) *dot = '\0';
+            if (name[0]) {
+                time_t mt = (st.st_mtime > 0) ? st.st_mtime : time(NULL);
+                int existing = db_find_id_by_name(name);
+                if (existing >= 0) {
+                    if (db_update_content(existing, content, mt)) updated++;
+                } else if (db_insert_note(name, content, mt, 0) >= 0) {
+                    added++;
+                }
+            }
+            free(content);
+        }
+        closedir(d);
+    }
+#endif
+
+    if (!dir_found) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "pasta nao encontrada: %s", dirpath);
+        return -1;
+    }
+    if (out_added) *out_added = added;
+    if (out_updated) *out_updated = updated;
+    return added + updated;
+}
+
+/* -------------------------------------------------------------------------
+ * Exportacao: banco  ->  pasta com arquivos .md
+ * ------------------------------------------------------------------------- */
+static int export_notes_to_dir(const char *dirpath, char *errbuf, size_t errsz) {
+    if (errbuf && errsz) errbuf[0] = '\0';
+
+    if (!db_is_open()) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "banco de dados indisponivel");
+        return -1;
+    }
+    if (!dirpath || !*dirpath) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "nenhuma pasta informada");
+        return -1;
+    }
+
+    /* Cria a pasta de destino se ainda nao existir (o mkdir falhar por ja
+     * existir nao e erro). */
+    mkdir_cross(dirpath);
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT name, content FROM notes ORDER BY mtime DESC;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "falha ao ler o banco");
+        return -1;
+    }
+
+    int written = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(st, 0);
+        const char *content = (const char *)sqlite3_column_text(st, 1);
+        int clen = sqlite3_column_bytes(st, 1);
+        if (!name || !*name) continue;
+
+        char safe[256];
+        sanitize_note_name(name, safe, sizeof(safe));
+        if (!safe[0]) continue;
+
+        char fname[2048];
+        snprintf(fname, sizeof(fname), "%s%c%s.md", dirpath, PATH_SEP, safe);
+
+        FILE *f = fopen_utf8(fname, "wb");
+        if (!f) continue;
+        if (content && clen > 0) fwrite(content, 1, (size_t)clen, f);
+        fclose(f);
+        written++;
+    }
+    sqlite3_finalize(st);
+
+    return written;
+}
+
+
+/* -------------------------------------------------------------------------
+ * Pontos de entrada usados pela interface (botoes [Importar] / [Exportar])
+ * ------------------------------------------------------------------------- */
+static void ui_import_from_dir(const char *raw_dir) {
+    char dir[1024];
+    expand_user_path(raw_dir, dir, sizeof(dir));
+
+    /* remove espacos e aspas das pontas (colar caminho costuma trazer aspas) */
+    char *s = dir;
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = '\0';
+    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"') || (s[0] == '\'' && s[n - 1] == '\''))) {
+        s[n - 1] = '\0';
+        s++;
+    }
+
+    if (!*s) {
+        set_status_msg("Importacao cancelada: nenhuma pasta informada.");
+        return;
+    }
+
+    int added = 0, updated = 0;
+    char err[256];
+    int total = import_notes_from_dir(s, &added, &updated, err, sizeof(err));
+    if (total < 0) {
+        set_status_msg("Importacao falhou: %s", err);
+        return;
+    }
+
+    rescan_notes();
+    g_screen_clear_needed = 1;
+    if (total == 0) {
+        set_status_msg("Nenhum arquivo markdown encontrado em: %s", s);
+    } else {
+        set_status_msg("Importadas %d nota(s): %d nova(s), %d atualizada(s) de %s",
+                       total, added, updated, s);
+    }
+}
+
+static void ui_export_to_dir(const char *raw_dir) {
+    char dir[1024];
+    expand_user_path(raw_dir, dir, sizeof(dir));
+
+    char *s = dir;
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = '\0';
+    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"') || (s[0] == '\'' && s[n - 1] == '\''))) {
+        s[n - 1] = '\0';
+        s++;
+    }
+
+    if (!*s) {
+        set_status_msg("Exportacao cancelada: nenhuma pasta informada.");
+        return;
+    }
+
+    if (db_count_notes() == 0) {
+        set_status_msg("Nada para exportar: o banco esta vazio.");
+        return;
+    }
+
+    char err[256];
+    int written = export_notes_to_dir(s, err, sizeof(err));
+    if (written < 0) {
+        set_status_msg("Exportacao falhou: %s", err);
+        return;
+    }
+    set_status_msg("Exportadas %d nota(s) como arquivos .md em %s", written, s);
+}
+
 static void note_update_cache(NoteInfo *n) {
     if (n->search_norm) {
         free(n->search_norm);
@@ -2208,7 +2805,7 @@ static void note_update_cache(NoteInfo *n) {
     n->search_norm_len = 0;
 
     long file_len = 0;
-    char *raw = read_entire_file(n->filepath, &file_len);
+    char *raw = note_read_content(n->filepath, &file_len);
 
     char header[256] = "";
     if (raw && file_len > 0) {
@@ -2263,71 +2860,80 @@ static const char *get_attention_color(int level) {
     }
 }
 
+/* Os niveis de urgencia agora vivem na coluna 'attention' do banco e ja vem
+ * carregados por rescan_notes(). Aqui apenas derivamos o atalho booleano
+ * needs_attention, usado pelo realce da lista lateral. */
 static void load_attention_flags(void) {
-    char att_path[512];
-    snprintf(att_path, sizeof(att_path), "%s%c.attention", DATA_DIR, PATH_SEP);
-    FILE *f = fopen_utf8(att_path, "r");
-    if (!f) return;
-    char lbuf[256];
-    while (fgets(lbuf, sizeof(lbuf), f)) {
-        int len = (int)strlen(lbuf);
-        while (len > 0 && (lbuf[len - 1] == '\r' || lbuf[len - 1] == '\n')) lbuf[--len] = '\0';
-        if (len == 0) continue;
-        char *colon = strrchr(lbuf, ':');
-        int level = 1; /* default to level 1 if no level specified (backward compatibility) */
-        if (colon) {
-            *colon = '\0';
-            level = atoi(colon + 1);
-            if (level < 1 || level > 3) level = 1;
-        }
-        for (int i = 0; i < E.num_notes; i++) {
-            if (strcmp(E.notes[i].filename, lbuf) == 0) {
-                E.notes[i].attention_level = level;
-                E.notes[i].needs_attention = (level > 0);
+    for (int i = 0; i < E.num_notes; i++) {
+        E.notes[i].needs_attention = (E.notes[i].attention_level > 0);
+    }
+}
+
+/* Persiste no banco o nivel de urgencia de cada nota em memoria. */
+static void save_attention_flags(void) {
+    for (int i = 0; i < E.num_notes; i++) {
+        int id = note_id_from_path(E.notes[i].filepath);
+        if (id >= 0) db_set_attention(id, E.notes[i].attention_level);
+    }
+}
+
+/* Reordena a lista pela prioridade e mantem a selecao sobre a nota indicada,
+ * para o cursor nao "pular" para outra nota quando a ordem muda. */
+static void notes_resort_keep(const char *keep_path) {
+    if (E.num_notes > 1) {
+        qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_priority);
+    }
+    apply_note_search(E.search_query);
+    if (keep_path && *keep_path) {
+        for (int k = 0; k < E.num_filtered; k++) {
+            if (strcmp(E.notes[E.filtered_indices[k]].filepath, keep_path) == 0) {
+                E.selected_note_idx = k;
                 break;
             }
         }
-    }
-    fclose(f);
-}
-
-static void save_attention_flags(void) {
-    char att_path[512];
-    snprintf(att_path, sizeof(att_path), "%s%c.attention", DATA_DIR, PATH_SEP);
-    FILE *f = fopen_utf8(att_path, "w");
-    if (!f) return;
-    for (int i = 0; i < E.num_notes; i++) {
-        if (E.notes[i].attention_level > 0 && E.notes[i].attention_level <= 3) {
-            fprintf(f, "%s:%d\n", E.notes[i].filename, E.notes[i].attention_level);
+        if (E.focus == FOCUS_LEFT && E.num_filtered > 0) {
+            load_preview(E.notes[E.filtered_indices[E.selected_note_idx]].filepath);
         }
     }
-    fclose(f);
 }
 
 static void toggle_note_attention_at(int actual_idx) {
     if (actual_idx < 0 || actual_idx >= E.num_notes) return;
+
+    /* Guarda identidade e titulo ANTES de reordenar: depois do qsort o indice
+     * actual_idx pode apontar para outra nota. */
+    char keep[512];
+    char titulo[256];
+    safe_strcpy(keep, sizeof(keep), E.notes[actual_idx].filepath);
+    safe_strcpy(titulo, sizeof(titulo), E.notes[actual_idx].title);
+
     E.notes[actual_idx].attention_level = (E.notes[actual_idx].attention_level + 1) % 4;
     E.notes[actual_idx].needs_attention = (E.notes[actual_idx].attention_level > 0);
+    int nivel = E.notes[actual_idx].attention_level;
     save_attention_flags();
+
+    /* A lista e exibida por prioridade (1, 2, 3 e depois as demais), entao a
+     * nota marcada muda de grupo imediatamente. */
+    notes_resort_keep(keep);
+
     g_screen_clear_needed = 1;
-    switch (E.notes[actual_idx].attention_level) {
+    switch (nivel) {
         case 1:
-            set_status_msg("🔴 Urgência Nível 1 [Crítica - Vermelho]: %s", E.notes[actual_idx].title);
+            set_status_msg("🔴 Urgência Nível 1 [Crítica - Vermelho]: %s", titulo);
             break;
         case 2:
-            set_status_msg("🟠 Urgência Nível 2 [Média - Laranja]: %s", E.notes[actual_idx].title);
+            set_status_msg("🟠 Urgência Nível 2 [Média - Laranja]: %s", titulo);
             break;
         case 3:
-            set_status_msg("🟡 Urgência Nível 3 [Baixa - Amarelo]: %s", E.notes[actual_idx].title);
+            set_status_msg("🟡 Urgência Nível 3 [Baixa - Amarelo]: %s", titulo);
             break;
         default:
-            set_status_msg("Marcação de urgência removida: %s", E.notes[actual_idx].title);
+            set_status_msg("Marcação de urgência removida: %s", titulo);
             break;
     }
 }
 
 static void rescan_notes(void) {
-    mkdir_cross(DATA_DIR);
 
     /* Preserve existing cached notes to avoid redundant disk I/O */
     NoteInfo *old_notes = E.notes;
@@ -2340,112 +2946,35 @@ static void rescan_notes(void) {
 
     time_t now = time(NULL);
 
-#ifdef _WIN32
-    WIN32_FIND_DATAW fd;
-    WCHAR pattern[512];
-    MultiByteToWideChar(CP_UTF8, 0, DATA_DIR, -1, pattern, 256);
-    wcscat(pattern, L"\\*.*");
-    HANDLE hFind = FindFirstFileW(pattern, &fd);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                char utf8_filename[256];
-                WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, utf8_filename, sizeof(utf8_filename), NULL, NULL);
-                if (utf8_filename[0] == '.') continue;
-                const char *ext = strrchr(utf8_filename, '.');
-                bool is_note = false;
-                if (ext) {
-                    if (strcasecmp(ext, ".md") == 0 || strcasecmp(ext, ".markdown") == 0 ||
-                        strcasecmp(ext, ".mdown") == 0 || strcasecmp(ext, ".txt") == 0 ||
-                        strcasecmp(ext, ".text") == 0) {
-                        is_note = true;
-                    }
-                } else {
-                    is_note = true;
-                }
-                if (is_note) {
-                    if (E.num_notes >= cap) {
-                        cap *= 2;
-                        E.notes = (NoteInfo *)realloc(E.notes, sizeof(NoteInfo) * cap);
-                    }
-                    NoteInfo *n = &E.notes[E.num_notes++];
-                    memset(n, 0, sizeof(NoteInfo));
-                    snprintf(n->filename, sizeof(n->filename), "%s", utf8_filename);
-                    snprintf(n->filepath, sizeof(n->filepath), "%s\\%s", DATA_DIR, utf8_filename);
+    /* Varredura do banco: cada linha vira um NoteInfo com caminho virtual
+     * "db:<id>". A ordenacao por data continua sendo feita logo abaixo. */
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(g_db,
+                "SELECT id, name, mtime, attention FROM notes ORDER BY mtime DESC;",
+                -1, &st, NULL) == SQLITE_OK) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                int nid = sqlite3_column_int(st, 0);
+                const char *nm = (const char *)sqlite3_column_text(st, 1);
+                time_t mt = (time_t)sqlite3_column_int64(st, 2);
+                int att = sqlite3_column_int(st, 3);
+                if (!nm || !*nm) continue;
 
-                    n->mtime = filetime_to_timet(&fd.ftLastWriteTime);
-                    if (n->mtime <= 0) {
-                        struct stat st;
-                        if (stat_cross(n->filepath, &st) == 0 && st.st_mtime > 0) {
-                            n->mtime = st.st_mtime;
-                        } else {
-                            n->mtime = now;
-                        }
-                    }
-                    format_rel_time(n->mtime, now, n->rel_time, sizeof(n->rel_time));
-
-                    /* Reuse cached search_norm if mtime unchanged */
-                    NoteInfo *found_old = NULL;
-                    for (int o = 0; o < old_num_notes; o++) {
-                        if (old_notes[o].search_norm && strcmp(old_notes[o].filepath, n->filepath) == 0) {
-                            found_old = &old_notes[o];
-                            break;
-                        }
-                    }
-
-                    if (found_old && found_old->mtime == n->mtime && found_old->search_norm) {
-                        safe_strcpy(n->title, sizeof(n->title), found_old->title);
-                        n->search_norm = found_old->search_norm;
-                        n->search_norm_len = found_old->search_norm_len;
-                        n->attention_level = found_old->attention_level;
-                        n->needs_attention = found_old->needs_attention;
-                        found_old->search_norm = NULL;
-                    } else {
-                        extract_note_title(n->filepath, n->filename, n->title, sizeof(n->title));
-                        n->search_norm = NULL;
-                        note_update_cache(n);
-                    }
-                }
-            }
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-    }
-#else
-    DIR *d = opendir(DATA_DIR);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (ent->d_name[0] == '.') continue;
-            char fullpath[1024];
-            snprintf(fullpath, sizeof(fullpath), "%s/%s", DATA_DIR, ent->d_name);
-            struct stat st;
-            if (stat(fullpath, &st) != 0 || S_ISDIR(st.st_mode)) continue;
-
-            const char *ext = strrchr(ent->d_name, '.');
-            bool is_note = false;
-            if (ext) {
-                if (strcasecmp(ext, ".md") == 0 || strcasecmp(ext, ".markdown") == 0 ||
-                    strcasecmp(ext, ".mdown") == 0 || strcasecmp(ext, ".txt") == 0 ||
-                    strcasecmp(ext, ".text") == 0) {
-                    is_note = true;
-                }
-            } else {
-                is_note = true;
-            }
-            if (is_note) {
                 if (E.num_notes >= cap) {
                     cap *= 2;
                     E.notes = (NoteInfo *)realloc(E.notes, sizeof(NoteInfo) * cap);
                 }
                 NoteInfo *n = &E.notes[E.num_notes++];
                 memset(n, 0, sizeof(NoteInfo));
-                snprintf(n->filename, sizeof(n->filename), "%s", ent->d_name);
-                snprintf(n->filepath, sizeof(n->filepath), "%s/%s", DATA_DIR, ent->d_name);
+                snprintf(n->filename, sizeof(n->filename), "%s.md", nm);
+                note_path_from_id(nid, n->filepath, sizeof(n->filepath));
 
-                n->mtime = (st.st_mtime > 0) ? st.st_mtime : now;
+                n->mtime = (mt > 0) ? mt : now;
+                n->attention_level = att;
+                n->needs_attention = (att > 0);
                 format_rel_time(n->mtime, now, n->rel_time, sizeof(n->rel_time));
 
-                /* Reuse cached search_norm if mtime unchanged */
+                /* reaproveita o cache de busca se a nota nao mudou de data */
                 NoteInfo *found_old = NULL;
                 for (int o = 0; o < old_num_notes; o++) {
                     if (old_notes[o].search_norm && strcmp(old_notes[o].filepath, n->filepath) == 0) {
@@ -2458,7 +2987,6 @@ static void rescan_notes(void) {
                     safe_strcpy(n->title, sizeof(n->title), found_old->title);
                     n->search_norm = found_old->search_norm;
                     n->search_norm_len = found_old->search_norm_len;
-                    n->needs_attention = found_old->needs_attention;
                     found_old->search_norm = NULL;
                 } else {
                     extract_note_title(n->filepath, n->filename, n->title, sizeof(n->title));
@@ -2466,10 +2994,10 @@ static void rescan_notes(void) {
                     note_update_cache(n);
                 }
             }
+            sqlite3_finalize(st);
         }
-        closedir(d);
     }
-#endif
+
 
     if (old_notes) {
         for (int i = 0; i < old_num_notes; i++) {
@@ -2481,7 +3009,7 @@ static void rescan_notes(void) {
     load_attention_flags();
 
     if (E.num_notes > 1) {
-        qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_mtime);
+        qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_priority);
     }
 
     if (E.filtered_indices) free(E.filtered_indices);
@@ -2596,23 +3124,25 @@ static void load_preview(const char *path) {
     free_preview();
     safe_strcpy(g_preview.filepath, sizeof(g_preview.filepath), path);
 
-    FILE *f = fopen_utf8(path, "r");
-    if (!f) return;
+    long clen = 0;
+    char *content = note_read_content(path, &clen);
+    if (!content) return;
 
-    char lbuf[16384];
-    while (fgets(lbuf, sizeof(lbuf), f)) {
-        int linelen = (int)strlen(lbuf);
-        while (linelen > 0 && (lbuf[linelen - 1] == '\n' || lbuf[linelen - 1] == '\r')) {
-            lbuf[--linelen] = '\0';
-        }
+    const char *p = content;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        int linelen = nl ? (int)(nl - p) : (int)strlen(p);
+        while (linelen > 0 && p[linelen - 1] == '\r') linelen--;
         if (g_preview.num_lines >= g_preview.cap_lines) {
             g_preview.cap_lines = g_preview.cap_lines ? g_preview.cap_lines * 2 : 32;
             g_preview.lines = (Line *)realloc(g_preview.lines, sizeof(Line) * g_preview.cap_lines);
         }
         Line *l = &g_preview.lines[g_preview.num_lines++];
-        line_init(l, lbuf, linelen);
+        line_init(l, p, linelen);
+        if (!nl) break;
+        p = nl + 1;
     }
-    fclose(f);
+    free(content);
 
     if (g_preview.num_lines == 0) {
         g_preview.lines = (Line *)malloc(sizeof(Line));
@@ -2835,11 +3365,27 @@ static void open_note_by_path(const char *path, bool record_history) {
     memset(nt, 0, sizeof(Tab));
 
     safe_strcpy(nt->cur_filepath, sizeof(nt->cur_filepath), path);
-    const char *slash = strrchr(path, PATH_SEP);
+
+    int pid_ = note_id_from_path(path);
+    if (pid_ >= 0) {
+        /* caminho virtual "db:<id>": o nome vem do banco, nao do caminho */
+        char nm[256];
+        if (db_get_name(pid_, nm, sizeof(nm))) {
+            /* buffer intermediario maior: nome (ate 255) + ".md" nao cabe em
+             * 256 bytes; o safe_strcpy abaixo trunca com seguranca se preciso. */
+            char fn[300];
+            snprintf(fn, sizeof(fn), "%s.md", nm);
+            safe_strcpy(nt->cur_filename, sizeof(nt->cur_filename), fn);
+        } else {
+            safe_strcpy(nt->cur_filename, sizeof(nt->cur_filename), path);
+        }
+    } else {
+        const char *slash = strrchr(path, PATH_SEP);
 #ifndef _WIN32
-    if (!slash) slash = strrchr(path, '/');
+        if (!slash) slash = strrchr(path, '/');
 #endif
-    safe_strcpy(nt->cur_filename, sizeof(nt->cur_filename), slash ? slash + 1 : path);
+        safe_strcpy(nt->cur_filename, sizeof(nt->cur_filename), slash ? slash + 1 : path);
+    }
     extract_note_title(path, nt->cur_filename, nt->title, sizeof(nt->title));
 
     E.active_tab = new_idx;
@@ -2860,18 +3406,11 @@ static void open_note_by_path(const char *path, bool record_history) {
     safe_strcpy(E.cur_filepath, sizeof(E.cur_filepath), nt->cur_filepath);
     safe_strcpy(E.cur_filename, sizeof(E.cur_filename), nt->cur_filename);
 
-    FILE *f = fopen_utf8(path, "r");
-    if (f) {
-        int linelen;
-        char lbuf[16384];
-        while (fgets(lbuf, sizeof(lbuf), f)) {
-            linelen = (int)strlen(lbuf);
-            while (linelen > 0 && (lbuf[linelen - 1] == '\n' || lbuf[linelen - 1] == '\r')) {
-                lbuf[--linelen] = '\0';
-            }
-            buf_insert_line(E.num_lines, lbuf, linelen);
-        }
-        fclose(f);
+    long clen = 0;
+    char *content = note_read_content(path, &clen);
+    if (content) {
+        editor_load_content(content);
+        free(content);
     }
 
     if (E.num_lines == 0) {
@@ -2892,18 +3431,14 @@ static bool save_current_note(void) {
         set_status_msg("Nenhuma nota aberta para salvar.");
         return false;
     }
-    FILE *f = fopen_utf8(E.cur_filepath, "wb");
-    if (!f) {
-        set_status_msg("Erro salvando arquivo: %s", E.cur_filepath);
+    long clen = 0;
+    char *content = lines_to_content(E.lines, E.num_lines, &clen);
+    bool wrote_ok = content ? note_write_content(E.cur_filepath, content, clen) : false;
+    if (content) free(content);
+    if (!wrote_ok) {
+        set_status_msg("Erro salvando nota: %s", E.cur_filename);
         return false;
     }
-    for (int i = 0; i < E.num_lines; i++) {
-        if (E.lines[i].chars && E.lines[i].len > 0) {
-            fwrite(E.lines[i].chars, 1, E.lines[i].len, f);
-        }
-        fputc('\n', f);
-    }
-    fclose(f);
     E.modified = false;
     E.first_unsaved_time = 0;
     tab_save_active();
@@ -2913,12 +3448,8 @@ static bool save_current_note(void) {
     bool found_in_notes = false;
     for (int i = 0; i < E.num_notes; i++) {
         if (strcmp(E.notes[i].filepath, E.cur_filepath) == 0) {
-            struct stat st;
-            if (stat_cross(E.cur_filepath, &st) == 0 && st.st_mtime > 0) {
-                E.notes[i].mtime = st.st_mtime;
-            } else {
-                E.notes[i].mtime = now;
-            }
+            /* o mtime foi gravado no banco pelo proprio note_write_content() */
+            E.notes[i].mtime = now;
             format_rel_time(E.notes[i].mtime, now, E.notes[i].rel_time, sizeof(E.notes[i].rel_time));
             extract_note_title(E.cur_filepath, E.notes[i].filename, E.notes[i].title, sizeof(E.notes[i].title));
             note_update_cache(&E.notes[i]);
@@ -2931,7 +3462,7 @@ static bool save_current_note(void) {
         rescan_notes();
     } else {
         if (E.num_notes > 1) {
-            qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_mtime);
+            qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_priority);
         }
         apply_note_search(E.search_query);
     }
@@ -2947,15 +3478,11 @@ static bool save_tab_by_idx(int t_idx) {
     }
     Tab *t = &E.tabs[t_idx];
     if (!t->cur_filepath[0]) return false;
-    FILE *f = fopen_utf8(t->cur_filepath, "wb");
-    if (!f) return false;
-    for (int i = 0; i < t->num_lines; i++) {
-        if (t->lines[i].chars && t->lines[i].len > 0) {
-            fwrite(t->lines[i].chars, 1, t->lines[i].len, f);
-        }
-        fputc('\n', f);
-    }
-    fclose(f);
+    long clen = 0;
+    char *content = lines_to_content(t->lines, t->num_lines, &clen);
+    bool wrote_ok = content ? note_write_content(t->cur_filepath, content, clen) : false;
+    if (content) free(content);
+    if (!wrote_ok) return false;
     t->modified = false;
     t->first_unsaved_time = 0;
 
@@ -2963,12 +3490,8 @@ static bool save_tab_by_idx(int t_idx) {
     time_t now = time(NULL);
     for (int i = 0; i < E.num_notes; i++) {
         if (strcmp(E.notes[i].filepath, t->cur_filepath) == 0) {
-            struct stat st;
-            if (stat_cross(t->cur_filepath, &st) == 0 && st.st_mtime > 0) {
-                E.notes[i].mtime = st.st_mtime;
-            } else {
-                E.notes[i].mtime = now;
-            }
+            /* o mtime foi gravado no banco pelo proprio note_write_content() */
+            E.notes[i].mtime = now;
             format_rel_time(E.notes[i].mtime, now, E.notes[i].rel_time, sizeof(E.notes[i].rel_time));
             extract_note_title(t->cur_filepath, E.notes[i].filename, E.notes[i].title, sizeof(E.notes[i].title));
             note_update_cache(&E.notes[i]);
@@ -3004,7 +3527,7 @@ static void check_autosave(void) {
 
     if (autosaved_count > 0) {
         if (E.num_notes > 1) {
-            qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_mtime);
+            qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_priority);
         }
         apply_note_search(E.search_query);
 
@@ -3029,18 +3552,20 @@ static void open_or_create_wikilink_note(const char *note_name) {
     }
     clean_name[j] = '\0';
 
-    char target_path[512];
-    snprintf(target_path, sizeof(target_path), "%s%c%s.md", DATA_DIR, PATH_SEP, clean_name);
-
-    struct stat st;
-    if (stat_cross(target_path, &st) != 0) {
-        FILE *f = fopen_utf8(target_path, "w");
-        if (f) {
-            fprintf(f, "# %s\n\nNova nota criada via link.\n", note_name);
-            fclose(f);
+    int nid = db_find_id_by_name(clean_name);
+    if (nid < 0) {
+        char body[512];
+        snprintf(body, sizeof(body), "# %s\n\nNova nota criada via link.\n", note_name);
+        nid = db_insert_note(clean_name, body, time(NULL), 0);
+        if (nid < 0) {
+            set_status_msg("Erro ao criar nota via link: %s", clean_name);
+            return;
         }
         rescan_notes();
     }
+
+    char target_path[512];
+    note_path_from_id(nid, target_path, sizeof(target_path));
     open_note_by_path(target_path, true);
     set_status_msg("Nota aberta: [[%s]]", note_name);
 }
@@ -3079,25 +3604,35 @@ static void create_new_note(const char *raw_name) {
         snprintf(filename, sizeof(filename), "%s.md", title);
     }
 
-    char filepath[1024];
-    snprintf(filepath, sizeof(filepath), "%s%c%s", DATA_DIR, PATH_SEP, filename);
+    /* O nome logico da nota e sanitizado (sem / \ : * ? " < > |), pois ele
+     * passa a ser a chave unica na tabela e o nome do arquivo na exportacao. */
+    char safe_name[256];
+    sanitize_note_name(title, safe_name, sizeof(safe_name));
+    if (!safe_name[0]) {
+        set_status_msg("Nome de nota invalido.");
+        return;
+    }
 
-    struct stat st;
-    if (stat_cross(filepath, &st) == 0) {
+    int existing_id = db_find_id_by_name(safe_name);
+    if (existing_id >= 0) {
+        char existing_path[512];
+        note_path_from_id(existing_id, existing_path, sizeof(existing_path));
         set_status_msg("Nota '%s' já existe! Abrindo...", filename);
-        open_note_by_path(filepath, true);
+        open_note_by_path(existing_path, true);
         E.focus = FOCUS_RIGHT;
         return;
     }
 
-    mkdir_cross(DATA_DIR);
-    FILE *f = fopen_utf8(filepath, "w");
-    if (!f) {
-        set_status_msg("Erro ao criar arquivo: %s", filename);
+    char initial[512];
+    snprintf(initial, sizeof(initial), "# %s\n\n", title);
+    int new_id = db_insert_note(safe_name, initial, time(NULL), 0);
+    if (new_id < 0) {
+        set_status_msg("Erro ao criar nota: %s", safe_name);
         return;
     }
-    fprintf(f, "# %s\n\n", title);
-    fclose(f);
+
+    char filepath[512];
+    note_path_from_id(new_id, filepath, sizeof(filepath));
 
     rescan_notes();
     free_preview();
@@ -3186,27 +3721,68 @@ static bool rename_note(const char *old_path, const char *raw_new_name) {
         snprintf(new_filename, sizeof(new_filename), "%s.md", new_title);
     }
 
+    char safe_new[256];
+    sanitize_note_name(new_title, safe_new, sizeof(safe_new));
+    if (!safe_new[0]) {
+        set_status_msg("Novo nome invalido.");
+        return false;
+    }
+
+    /* 1024 para caber DATA_DIR + separador + new_filename (ate 512 bytes) */
     char new_filepath[1024];
-    snprintf(new_filepath, sizeof(new_filepath), "%s%c%s", DATA_DIR, PATH_SEP, new_filename);
+    int rid = note_id_from_path(old_path);
 
-    if (strcmp(old_path, new_filepath) == 0) {
-        set_status_msg("O nome da nota permanece o mesmo.");
-        return true;
-    }
+    if (rid < 0) {
+        /* Fallback legado: nota aberta diretamente de um arquivo real
+         * (ex.: passar um caminho .md na linha de comando). */
+        snprintf(new_filepath, sizeof(new_filepath), "%s%c%s", DATA_DIR, PATH_SEP, new_filename);
 
-    struct stat st;
-    if (stat_cross(new_filepath, &st) == 0) {
-        set_status_msg("Já existe uma nota com o nome: %s", new_filename);
-        return false;
-    }
+        if (strcmp(old_path, new_filepath) == 0) {
+            set_status_msg("O nome da nota permanece o mesmo.");
+            return true;
+        }
 
-    /* Save active tab if it's open */
-    tab_save_active();
+        struct stat st;
+        if (stat_cross(new_filepath, &st) == 0) {
+            set_status_msg("Já existe uma nota com o nome: %s", new_filename);
+            return false;
+        }
 
-    /* Rename file on disk */
-    if (rename_utf8(old_path, new_filepath) != 0) {
-        set_status_msg("Erro ao renomear arquivo no disco.");
-        return false;
+        tab_save_active();
+
+        if (rename_utf8(old_path, new_filepath) != 0) {
+            set_status_msg("Erro ao renomear arquivo no disco.");
+            return false;
+        }
+    } else {
+        /* Nota no banco: o id (e portanto o caminho virtual) nao muda; apenas
+         * a coluna 'name' e atualizada. */
+        char current_name[256] = "";
+        for (int i = 0; i < E.num_notes; i++) {
+            if (strcmp(E.notes[i].filepath, old_path) == 0) {
+                safe_strcpy(current_name, sizeof(current_name), E.notes[i].title);
+                break;
+            }
+        }
+        if (current_name[0] && strcmp(current_name, safe_new) == 0) {
+            set_status_msg("O nome da nota permanece o mesmo.");
+            return true;
+        }
+
+        int conflict = db_find_id_by_name(safe_new);
+        if (conflict >= 0 && conflict != rid) {
+            set_status_msg("Já existe uma nota com o nome: %s", new_filename);
+            return false;
+        }
+
+        tab_save_active();
+
+        if (!db_update_name(rid, safe_new)) {
+            set_status_msg("Erro ao renomear a nota no banco.");
+            return false;
+        }
+
+        note_path_from_id(rid, new_filepath, sizeof(new_filepath));
     }
 
     /* Update internal content: replace first line heading # Old Title with # New Title */
@@ -4838,27 +5414,37 @@ static void render_left_panel(ABuffer *ab, int row) {
         ab_append(ab, TH_BG_SIDEBAR, -1);
         int cur_col = 1;
 
+        /* Rotulos compactos quando o painel e estreito:
+         *   completo  " [Todas] [1] [2] [3]"   = 20 colunas
+         *   compacto  " [T] [1] [2] [3]"       = 16 colunas
+         * So o botao [Todas] encolhe; [1]/[2]/[3] ja sao minimos. Os limites
+         * (campos _start/_end) sao gravados a partir do rotulo usado, entao o clique
+         * continua correto nos dois modos. */
+        int compacto = (w < 20);
+
         ab_append(ab, " ", 1);
         cols_drawn += 1;
         cur_col += 1;
 
-        /* Button [Todas] */
+        /* Button [Todas] / [T] (compacto) */
+        const char *lbl_all = compacto ? "[T]" : "[Todas]";
+        int w_all = compacto ? 3 : 7;
         E.btn_filter_all_start = cur_col;
         if (E.filter_urgency == 0) {
             ab_append(ab, TH_BG_SELECT, -1);
             ab_append(ab, TH_FG_WHITE, -1);
             ab_append(ab, STYLE_BOLD, -1);
-            ab_append(ab, "[Todas]", 7);
+            ab_append(ab, lbl_all, -1);
             ab_append(ab, STYLE_RESET, -1);
             ab_append(ab, TH_BG_SIDEBAR, -1);
         } else {
             ab_append(ab, TH_FG_MUTED, -1);
-            ab_append(ab, "[Todas]", 7);
+            ab_append(ab, lbl_all, -1);
             ab_append(ab, STYLE_RESET, -1);
             ab_append(ab, TH_BG_SIDEBAR, -1);
         }
-        cols_drawn += 7;
-        cur_col += 7;
+        cols_drawn += w_all;
+        cur_col += w_all;
         E.btn_filter_all_end = cur_col;
 
         ab_append(ab, " ", 1);
@@ -5878,7 +6464,12 @@ static void render_status_bar(ABuffer *ab) {
     const char *life_btn = (!compact_btns) ? " [🧬 Life] " : " [🧬] ";
     int life_w = utf8_width(life_btn);
 
-    int btns_w = new_w + ren_w + del_w + wrap_w + find_w + rep_w + tbtn_w + life_w;
+    const char *imp_btn = (!compact_btns) ? " [⬇ Importar] " : " [⬇] ";
+    const char *exp_btn = (!compact_btns) ? " [⬆ Exportar] " : " [⬆] ";
+    int imp_w = utf8_width(imp_btn);
+    int exp_w = utf8_width(exp_btn);
+
+    int btns_w = new_w + ren_w + del_w + wrap_w + find_w + rep_w + tbtn_w + life_w + imp_w + exp_w;
 
     /* -----------------------------------------------------------------
      * LINE 1: Status Bar (Mode Badge + Markdown Note Name + Cursor Info)
@@ -5997,6 +6588,24 @@ static void render_status_bar(ABuffer *ab) {
     cur_col += life_w;
     E.btn_life_end = cur_col;
 
+    /* [⬇ Importar]: pasta de arquivos .md  ->  banco */
+    E.btn_import_start = cur_col;
+    ab_append(ab, TH_BG_SELECT, -1);
+    ab_append(ab, TH_FG_H2, -1);
+    ab_append(ab, STYLE_BOLD, -1);
+    ab_append(ab, imp_btn, (int)strlen(imp_btn));
+    cur_col += imp_w;
+    E.btn_import_end = cur_col;
+
+    /* [⬆ Exportar]: banco  ->  pasta de arquivos .md */
+    E.btn_export_start = cur_col;
+    ab_append(ab, TH_BG_SELECT, -1);
+    ab_append(ab, TH_FG_H2, -1);
+    ab_append(ab, STYLE_BOLD, -1);
+    ab_append(ab, exp_btn, (int)strlen(exp_btn));
+    cur_col += exp_w;
+    E.btn_export_end = cur_col;
+
     int pad2 = E.screen_cols - cur_col + 1;
     while (pad2-- > 0) ab_append(ab, " ", 1);
     ab_append(ab, "\x1b[K" STYLE_RESET, -1);
@@ -6073,6 +6682,28 @@ static void render_command_line(ABuffer *ab) {
         ab_append(ab, STYLE_BOLD, -1);
         char prompt[300];
         snprintf(prompt, sizeof(prompt), " 🔄 Substituir '%s' por: ", E.replace_find_buf);
+        ab_append(ab, prompt, -1);
+        ab_append(ab, STYLE_RESET, -1);
+        ab_append(ab, TH_FG_WHITE, -1);
+        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
+        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
+        int pad = E.screen_cols - plen;
+        while (pad-- > 0) ab_append(ab, " ", 1);
+    } else if (E.mode == MODE_PROMPT_IMPORT_DIR) {
+        const char *prompt = PROMPT_IMPORT_LABEL;
+        ab_append(ab, TH_FG_ACCENT, -1);
+        ab_append(ab, STYLE_BOLD, -1);
+        ab_append(ab, prompt, -1);
+        ab_append(ab, STYLE_RESET, -1);
+        ab_append(ab, TH_FG_WHITE, -1);
+        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
+        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
+        int pad = E.screen_cols - plen;
+        while (pad-- > 0) ab_append(ab, " ", 1);
+    } else if (E.mode == MODE_PROMPT_EXPORT_DIR) {
+        const char *prompt = PROMPT_EXPORT_LABEL;
+        ab_append(ab, TH_FG_ACCENT, -1);
+        ab_append(ab, STYLE_BOLD, -1);
         ab_append(ab, prompt, -1);
         ab_append(ab, STYLE_RESET, -1);
         ab_append(ab, TH_FG_WHITE, -1);
@@ -6287,6 +6918,17 @@ static void refresh_screen(void) {
     } else if (E.mode == MODE_PROMPT_REPLACE_WITH) {
         char prompt[300];
         snprintf(prompt, sizeof(prompt), " 🔄 Substituir '%s' por: ", E.replace_find_buf);
+        int pwidth = utf8_width(prompt);
+        int cur_pos = E.prompt_cursor;
+        int plen = (int)strlen(E.prompt_buf);
+        if (cur_pos < 0) cur_pos = 0;
+        if (cur_pos > plen) cur_pos = plen;
+        int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
+        char cpos[32];
+        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
+        ab_append(&ab, cpos, (int)strlen(cpos));
+    } else if (E.mode == MODE_PROMPT_IMPORT_DIR || E.mode == MODE_PROMPT_EXPORT_DIR) {
+        const char *prompt = (E.mode == MODE_PROMPT_IMPORT_DIR) ? PROMPT_IMPORT_LABEL : PROMPT_EXPORT_LABEL;
         int pwidth = utf8_width(prompt);
         int cur_pos = E.prompt_cursor;
         int plen = (int)strlen(E.prompt_buf);
@@ -6722,7 +7364,7 @@ static int editor_read_key(void) {
             return -1;
         } else {
             /* Standalone Esc followed immediately by another character */
-            if (E.mode == MODE_INSERT || (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_REPLACE_WITH)) {
+            if (E.mode == MODE_INSERT || (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR)) {
                 return -1; /* Don't abort text editing / prompt on stray Alt combinations */
             }
             g_unget_byte = seq[0];
@@ -6776,8 +7418,13 @@ static void execute_delete_selected_note(void) {
         char target_path[512];
         safe_strcpy(target_path, sizeof(target_path), E.notes[actual].filepath);
 
-        /* Delete file from disk */
-        unlink_utf8(target_path);
+        /* Remove a nota do banco (ou o arquivo, se for caminho real) */
+        int did = note_id_from_path(target_path);
+        if (did >= 0) {
+            db_delete_note(did);
+        } else {
+            unlink_utf8(target_path);
+        }
 
         /* Close tabs associated with this note */
         for (int i = E.num_tabs - 1; i >= 0; i--) {
@@ -6815,7 +7462,7 @@ static void handle_mouse_event(void) {
     long now = get_current_time_ms();
 
     /* 1. Modal Prompt Insulation: protect prompt modes from background clicks/drags */
-    if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_REPLACE_WITH) {
+    if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
         if (E.mouse_btn == 0 && !E.mouse_released && E.mouse_row == E.screen_rows) {
             int pwidth = 0;
             if (E.mode == MODE_PROMPT_NEW_NOTE) pwidth = utf8_width(" 📝 Nova nota: ");
@@ -6980,6 +7627,18 @@ static void handle_mouse_event(void) {
                     g_last_activity_time = get_current_time_ms();
                     set_status_msg("Simulação do Game of Life encerrada.");
                     return;
+                } else if (E.mouse_col >= E.btn_import_start && E.mouse_col < E.btn_import_end) {
+                    E.mode = MODE_PROMPT_IMPORT_DIR;
+                    E.prompt_buf[0] = '\0';
+                    E.prompt_cursor = 0;
+                    set_status_msg("%sinforme a pasta com os arquivos .md", PROMPT_IMPORT_LABEL);
+                    return;
+                } else if (E.mouse_col >= E.btn_export_start && E.mouse_col < E.btn_export_end) {
+                    E.mode = MODE_PROMPT_EXPORT_DIR;
+                    E.prompt_buf[0] = '\0';
+                    E.prompt_cursor = 0;
+                    set_status_msg("%sinforme a pasta de destino", PROMPT_EXPORT_LABEL);
+                    return;
                 }
             }
         }
@@ -7015,6 +7674,52 @@ static void handle_mouse_event(void) {
             return;
         }
 
+        /* Botoes de filtro de urgencia: tratados AQUI, FORA do guarda
+         * `E.mouse_col <= E.left_width` que envolve o painel esquerdo.
+         * Motivo (bug corrigido): os botoes sao desenhados ate a coluna 20,
+         * mas o guarda so aceita cliques dentro da largura do painel. Com o
+         * painel estreito (minimo 18 colunas via Ctrl+<-), os botoes [2] e [3]
+         * caiam fora da area clicavel e nao filtravam nada - exatamente o
+         * sintoma relatado no Windows, onde a largura do console era menor. */
+        /* Click on bottom urgency filter buttons */
+        int filter_btn_row = E.screen_rows - (1 + E.status_bar_lines);
+        if (E.mouse_row == filter_btn_row) {
+            if (E.mouse_col >= E.btn_filter_1_start && E.mouse_col < E.btn_filter_1_end) {
+                E.filter_urgency = (E.filter_urgency == 1) ? 0 : 1;
+                apply_note_search(E.search_query);
+                if (E.filter_urgency == 1)
+                    set_status_msg("🔴 Filtrando notas com Urgência Nível 1 (Crítico - Vermelho): %d encontrada(s)", E.num_filtered);
+                else
+                    set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
+                return;
+            }
+            if (E.mouse_col >= E.btn_filter_2_start && E.mouse_col < E.btn_filter_2_end) {
+                E.filter_urgency = (E.filter_urgency == 2) ? 0 : 2;
+                apply_note_search(E.search_query);
+                if (E.filter_urgency == 2)
+                    set_status_msg("🟠 Filtrando notas com Urgência Nível 2 (Médio - Laranja): %d encontrada(s)", E.num_filtered);
+                else
+                    set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
+                return;
+            }
+            if (E.mouse_col >= E.btn_filter_3_start && E.mouse_col < E.btn_filter_3_end) {
+                E.filter_urgency = (E.filter_urgency == 3) ? 0 : 3;
+                apply_note_search(E.search_query);
+                if (E.filter_urgency == 3)
+                    set_status_msg("🟡 Filtrando notas com Urgência Nível 3 (Baixo - Amarelo): %d encontrada(s)", E.num_filtered);
+                else
+                    set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
+                return;
+            }
+            if (E.mouse_col >= E.btn_filter_all_start && E.mouse_col < E.btn_filter_all_end) {
+                E.filter_urgency = 0;
+                apply_note_search(E.search_query);
+                set_status_msg("Filtro removido: exibindo todas as %d notas", E.num_filtered);
+                return;
+            }
+            return;
+        }
+
         /* Left Panel click (notes selection, attention checkbox, or filter buttons) */
         if (E.mouse_col <= E.left_width) {
             E.has_selection = false;
@@ -7038,44 +7743,6 @@ static void handle_mouse_event(void) {
                 return;
             }
 
-            /* Click on bottom urgency filter buttons */
-            int filter_btn_row = E.screen_rows - (1 + E.status_bar_lines);
-            if (E.mouse_row == filter_btn_row) {
-                if (E.mouse_col >= E.btn_filter_1_start && E.mouse_col < E.btn_filter_1_end) {
-                    E.filter_urgency = (E.filter_urgency == 1) ? 0 : 1;
-                    apply_note_search(E.search_query);
-                    if (E.filter_urgency == 1)
-                        set_status_msg("🔴 Filtrando notas com Urgência Nível 1 (Crítico - Vermelho): %d encontrada(s)", E.num_filtered);
-                    else
-                        set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
-                    return;
-                }
-                if (E.mouse_col >= E.btn_filter_2_start && E.mouse_col < E.btn_filter_2_end) {
-                    E.filter_urgency = (E.filter_urgency == 2) ? 0 : 2;
-                    apply_note_search(E.search_query);
-                    if (E.filter_urgency == 2)
-                        set_status_msg("🟠 Filtrando notas com Urgência Nível 2 (Médio - Laranja): %d encontrada(s)", E.num_filtered);
-                    else
-                        set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
-                    return;
-                }
-                if (E.mouse_col >= E.btn_filter_3_start && E.mouse_col < E.btn_filter_3_end) {
-                    E.filter_urgency = (E.filter_urgency == 3) ? 0 : 3;
-                    apply_note_search(E.search_query);
-                    if (E.filter_urgency == 3)
-                        set_status_msg("🟡 Filtrando notas com Urgência Nível 3 (Baixo - Amarelo): %d encontrada(s)", E.num_filtered);
-                    else
-                        set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
-                    return;
-                }
-                if (E.mouse_col >= E.btn_filter_all_start && E.mouse_col < E.btn_filter_all_end) {
-                    E.filter_urgency = 0;
-                    apply_note_search(E.search_query);
-                    set_status_msg("Filtro removido: exibindo todas as %d notas", E.num_filtered);
-                    return;
-                }
-                return;
-            }
 
             int clicked_note = (E.mouse_row - 4) + E.sidebar_scroll_y;
             if (clicked_note >= 0 && clicked_note < E.num_filtered) {
@@ -7790,13 +8457,15 @@ static void editor_process_keypress(void) {
     /* ---------------------------------------------------------------------
      * Modal Prompts have highest priority (protected from all shortcuts)
      * --------------------------------------------------------------------- */
-    if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_REPLACE_WITH) {
+    if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
         g_last_typing_time = get_current_time_ms();
         if (c == KEY_ESC || c == 3) {
             if (E.mode == MODE_PROMPT_NEW_NOTE) set_status_msg("Criação de nota cancelada.");
             else if (E.mode == MODE_PROMPT_RENAME_NOTE) set_status_msg("Renomeação cancelada.");
             else if (E.mode == MODE_PROMPT_FIND) set_status_msg("Busca cancelada.");
             else if (E.mode == MODE_PROMPT_REPLACE_FIND || E.mode == MODE_PROMPT_REPLACE_WITH) set_status_msg("Substituição cancelada.");
+            else if (E.mode == MODE_PROMPT_IMPORT_DIR) set_status_msg("Importação cancelada.");
+            else if (E.mode == MODE_PROMPT_EXPORT_DIR) set_status_msg("Exportação cancelada.");
             E.mode = MODE_NORMAL;
             E.prompt_buf[0] = '\0';
             E.prompt_cursor = 0;
@@ -7804,7 +8473,23 @@ static void editor_process_keypress(void) {
             return;
         }
         if (c == '\r' || c == '\n') {
-            if (E.mode == MODE_PROMPT_NEW_NOTE) {
+            if (E.mode == MODE_PROMPT_IMPORT_DIR) {
+                char dir_in[256];
+                safe_strcpy(dir_in, sizeof(dir_in), E.prompt_buf);
+                E.mode = MODE_NORMAL;
+                E.prompt_buf[0] = '\0';
+                E.prompt_cursor = 0;
+                ui_import_from_dir(dir_in);
+                E.focus = FOCUS_LEFT;
+                g_screen_clear_needed = 1;
+            } else if (E.mode == MODE_PROMPT_EXPORT_DIR) {
+                char dir_out[256];
+                safe_strcpy(dir_out, sizeof(dir_out), E.prompt_buf);
+                E.mode = MODE_NORMAL;
+                E.prompt_buf[0] = '\0';
+                E.prompt_cursor = 0;
+                ui_export_to_dir(dir_out);
+            } else if (E.mode == MODE_PROMPT_NEW_NOTE) {
                 E.mode = MODE_NORMAL;
                 create_new_note(E.prompt_buf);
                 E.prompt_buf[0] = '\0';
@@ -8846,6 +9531,17 @@ static void editor_process_keypress(void) {
             set_status_msg("Criar nova nota:");
             return;
         }
+        /* A linha de comando PRECISA continuar acessivel sem nenhuma aba
+         * aberta: sem isto o ':' era engolido pelo return abaixo e nao havia
+         * como sair do programa com :q / :q!. Isso ficou visivel a partir da
+         * v6.29.0, quando o estado sem abas passou a ser o inicial (banco
+         * novo/vazio). Tambem reabilita :life, :theme, :help etc. nesse estado. */
+        if (c == ':') {
+            E.mode = MODE_COMMAND;
+            E.cmd_buf[0] = '\0';
+            E.cmd_cursor = 0;
+            return;
+        }
         return;
     }
 
@@ -9288,6 +9984,9 @@ static void free_editor(void) {
         free(E.yank_buf);
         E.yank_buf = NULL;
     }
+
+    /* Fecha o banco por ultimo: as rotinas acima podem consultar/apagar notas. */
+    db_close();
 }
 
 /* =========================================================================
@@ -9305,7 +10004,15 @@ static void init_editor(void) {
 
     get_window_size(&E.screen_rows, &E.screen_cols);
 
-    /* Scan data/ folder */
+    /* Abre (criando se necessario) o banco SQLite. Ele NASCE VAZIO: nenhuma
+     * nota de exemplo e criada; o estado sem abas ja e tratado pela interface. */
+    if (!db_open()) {
+        disable_raw_mode();
+        fprintf(stderr, "Erro fatal: nao foi possivel abrir/criar o banco %s\n", DB_PATH);
+        exit(1);
+    }
+
+    /* Varredura das notas no banco */
     rescan_notes();
 
     /* If there are notes, open the first/most recent one in Tab 0 */
@@ -9315,29 +10022,9 @@ static void init_editor(void) {
         E.focus = FOCUS_LEFT;
         load_preview(E.notes[0].filepath);
     } else {
-        char initial_path[512];
-        snprintf(initial_path, sizeof(initial_path), "%s%cBem-vindo.md", DATA_DIR, PATH_SEP);
-        FILE *f = fopen_utf8(initial_path, "w");
-        if (f) {
-            fprintf(f, "# Bem-vindo ao Notas Definitivas\n\n"
-                       "Este é o seu editor Markdown pessoal e base de conhecimento.\n\n"
-                       "## Recursos Principais\n"
-                       "- Abas dinâmicas no topo com animação de título longo\n"
-                       "- Feche abas com o botão da roda do mouse ou clicando em ×\n"
-                       "- Temas do VSCode: Tokyo Night, One Dark Pro, Dracula, Monokai, GitHub, etc.\n"
-                       "- Navegação estilo Vim: `h`, `j`, `k`, `l`, `gt`, `gT`, `i`, `v`, `y`, `p`, `u`, `Ctrl+r`\n"
-                       "- Busca multi-palavras em memória com `Ctrl+F` (independente de ordem e acentuação)\n"
-                       "- Suporte a WikiLinks: crie ou abra notas com [[Minhas Anotações]]\n"
-                       "- Suporte a Links externos e locais: [Documento](./README.md)\n"
-                       "- Dobra de seções com `za`, `zM` (recolher tudo), `zR` (expandir tudo)\n"
-                       "- Barra de comandos: `:w`, `:q`, `:wq`, `:theme` e `:/busca`\n\n"
-                       "## Links Úteis\n"
-                       "- [Google](https://www.google.com)\n"
-                       "- [[Projetos]]\n");
-            fclose(f);
-            rescan_notes();
-        }
-        open_note_by_path(initial_path, true);
+        /* Banco vazio: nao cria nota de exemplo. O editor ja exibe a aba
+         * [Nova Nota] e as instrucoes no painel direito nesse estado. */
+        set_status_msg("Banco de dados vazio. Use [Nova] para criar ou [Importar] para trazer seus .md.");
     }
 }
 
@@ -9420,7 +10107,14 @@ int main(int argc, char **argv) {
         E.focus = FOCUS_RIGHT;
     }
 
-    set_status_msg("Notas Definitivas | Abas & Temas VSCode | Pressione :q para sair");
+    /* A mensagem de estado vazio definida por init_editor() nao pode ser
+     * sobrescrita aqui: ela e o unico aviso de que o banco esta vazio. */
+    int total_no_banco = db_count_notes();
+    if (total_no_banco == 0) {
+        set_status_msg("Banco SQLite vazio. Use [Nova] para criar uma nota ou [\xe2\xac\x87] para importar seus .md");
+    } else {
+        set_status_msg("Notas Definitivas | SQLite: %d nota(s) | Pressione :q para sair", total_no_banco);
+    }
 
     while (!E.quit_requested) {
         /* Dirty-flag: so redesenha quando ha mudanca real de estado, animacao

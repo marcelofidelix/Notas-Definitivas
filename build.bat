@@ -22,7 +22,9 @@ if /I "%~1"=="run" set "DO_RUN=1"
 if /I "%~1"=="clean" goto clean
 
 echo ==^> Compilando para Windows (gcc, %SRC%)
-gcc -O2 -Wall -Wextra "%SRC%" -o notas.exe -lkernel32 -luser32 -lshell32
+REM v6.29.0+: as notas vivem em um banco SQLite (notas.db), entao a
+REM libsqlite3 precisa estar disponivel para o gcc do MinGW.
+gcc -O2 -Wall -Wextra "%SRC%" -o notas.exe -lsqlite3 -lkernel32 -luser32 -lshell32
 if errorlevel 1 (
     echo ERRO: falha na compilacao. Verifique se o gcc ^(MinGW-w64^) esta no PATH.
     exit /b 1

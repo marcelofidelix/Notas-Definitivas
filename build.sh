@@ -27,10 +27,13 @@ fi
 
 CC="${CC:-gcc}"
 MINW="${MINW:-x86_64-w64-mingw32-gcc}"
+MINW_SQLITE_DIR="${MINW_SQLITE_DIR:-$PWD/tools/sqlite3-mingw}"
 
 CFLAGS_COMMON="-O2 -Wall -Wextra"
-LIBS_LINUX="-ldl"
-LIBS_WINDOWS="-lkernel32 -luser32 -lshell32"
+# A partir da v6.29.0 as notas vivem em um banco SQLite (notas.db),
+# entao libsqlite3 e obrigatoria nos dois alvos.
+LIBS_LINUX="-lsqlite3 -ldl"
+LIBS_WINDOWS="-lsqlite3 -lkernel32 -luser32 -lshell32"
 
 OUT_LINUX="notas"
 OUT_WINDOWS="notas.exe"
@@ -53,6 +56,15 @@ build_windows() {
         echo "      (Arch/Omarchy: sudo pacman -S mingw-w64-gcc)" >&2
         exit 1
     fi
+    # O alvo Windows precisa da libsqlite3 compilada para MinGW (nao existe
+    # no repositorio do Arch). Ver tools/BUILD_WINDOWS_SQLITE.md.
+    if [ ! -f "$MINW_SQLITE_DIR/include/sqlite3.h" ]; then
+        echo "ERRO: libsqlite3 para MinGW nao encontrada em $MINW_SQLITE_DIR" >&2
+        echo "      Gere com:  ./tools/build_sqlite_mingw.sh" >&2
+        echo "      (veja tools/BUILD_WINDOWS_SQLITE.md)" >&2
+        exit 1
+    fi
+    LIBS_WINDOWS="$LIBS_WINDOWS -I$MINW_SQLITE_DIR/include -L$MINW_SQLITE_DIR/lib"
     echo "==> Cross-compilando para Windows com $MINW ($SRC)"
     # shellcheck disable=SC2086
     $MINW $CFLAGS_COMMON "$SRC" -o "$OUT_WINDOWS" $LIBS_WINDOWS

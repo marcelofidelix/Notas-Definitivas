@@ -1,6 +1,65 @@
-# Notas Definitivas (v6.27.0 - Bullet Lists em Cores e Negrito + Clipboard Bidirecional y e p no Windows)
+# Notas Definitivas (v6.30.0 - Lista por Prioridade e Correcao dos Filtros de Urgencia)
 
 Editor de texto Markdown em terminal (TUI), minimalista, de arquivo único em C (`notas.c`), com **renderização de bullet lists (* e -) em cor diferenciada e negrito**, **compatibilidade bidirecional total da área de transferência no Windows (copiar com "y" e colar do sistema com "p" e Ctrl+V)**, **cópia para o clipboard assíncrona e instantânea no Windows sem travamentos**, **seleção e cópia no modo inserção com Shift+Setas e Mouse**, **atalho `Ctrl + S` para salvamento instantâneo no modo normal**, **navegação suave e robusta por setas no modo inserção sem caracteres indevidos**, **botões interativos na barra inferior (Quebra de linha, Localizar, Substituir, Renomear e Temas)**, **caixas de marcação de atenção com destaque em cores vibrantes**, **corte de linhas completas com `V + x`**, **fechamento de abas com a tecla `c`**, **salvamento ultra-otimizado**, **gerenciamento completo de notas na barra lateral (`n`, `r`, `d`)**, **sistema completo de abas (tabs) com animação marquee**, **seletor de 8 temas do VS Code**, **cursor em linha vertical piscante no modo inserção**, **auto-alinhamento de tabelas (estilo Vimwiki)**, **quebra de linha visual inteligente (Soft Word Wrap)**, e navegação inspirada no Vim / Vimwiki. Compatível nativamente com **Linux** e **Windows**, sem dependências externas complexas.
+
+---
+
+## 📊 Ordem da Lista por Prioridade (v6.30.0)
+
+- A lista lateral passou a ser exibida em **grupos de prioridade**, nesta ordem:
+  1. **Nível 1** (crítico / vermelho)
+  2. **Nível 2** (médio / laranja)
+  3. **Nível 3** (baixo / amarelo)
+  4. **Sem marcação** (`[ ]`)
+- **Dentro de cada grupo, a nota editada mais recentemente aparece primeiro** — o mesmo critério de data que já existia, agora aplicado por grupo. Ou seja: uma nota sem marcação muito recente **não** passa na frente das marcadas; ela vai para o topo do grupo das sem marcação.
+- Marcar ou desmarcar com **`m`** (ou clicando na caixa da nota) **reorganiza a lista na hora**: a nota sobe/desce para o grupo correspondente e **a seleção acompanha a nota**, sem o cursor pular para outra linha.
+- Vale também com filtro ativo: em `[1]`, as notas de nível 1 aparecem da mais recente para a mais antiga.
+- Desempate por nome, para a ordem não "dançar" entre redesenhos quando duas notas têm a mesma data.
+
+### 🏷️ Rótulos compactos quando o painel é estreito
+
+Os quatro botões ocupam 20 colunas com os rótulos completos (` [Todas] [1] [2] [3]`), mas o painel esquerdo pode chegar a 18 colunas (largura mínima, com `Ctrl + ←`). Nesse caso os rótulos passam a ser compactos:
+
+| Largura do painel | Rótulos | Colunas |
+| :--- | :--- | :--- |
+| 20 ou mais | ` [Todas] [1] [2] [3]` | 20 |
+| menos de 20 | ` [T] [1] [2] [3]` | 16 |
+
+Só o botão "Todas" encolhe (`[Todas]` → `[T]`); `[1]`, `[2]` e `[3]` já são mínimos. Os limites de clique são recalculados a partir do rótulo em uso, então o clique continua correto nos dois modos — verificado por teste nos dois casos.
+
+### 🔧 Correção: botões de filtro `[2]` e `[3]` não respondiam
+
+Os botões `[1]`, `[2]` e `[3]` da barra lateral **deixavam de funcionar quando o painel esquerdo estava estreito** (na largura mínima, alcançável com `Ctrl + ←`): a área clicável estava presa à largura do painel, mas os botões são desenhados um pouco além dela (até a coluna 20). Assim, quanto mais estreito o painel, mais botões ficavam inalcançáveis — primeiro o `[3]`, depois o `[2]`, enquanto `[1]` e `[Todas]` continuavam funcionando. Era exatamente o sintoma observado no Windows, cujo console tinha largura menor. O tratamento do clique dos quatro botões foi movido para fora daquele limite: agora são clicáveis em **qualquer** largura de painel.
+
+---
+
+## 🗄️ Backend SQLite, Importacao e Exportacao de Markdown (v6.29.0)
+
+- **As notas passaram a viver em um banco SQLite (`notas.db`)**, em vez de arquivos `.md` dentro de `data/`:
+  - Sem dependencia de motor externo: o programa abre o banco diretamente (WAL, para leitura/escrita sem travar a interface).
+  - **O banco nasce VAZIO**: na primeira execucao nenhuma nota de exemplo e criada. Use `[➕ Nova]` ou `[⬇ Importar]`.
+  - A pasta `data/` de arquivos `.md` deixou de ser o armazenamento principal: ela agora e apenas origem/destino das rotinas de importacao e exportacao.
+  - Cada nota guarda nome, conteudo, data de modificacao e o nivel de urgencia (`[1]`/`[2]`/`[3]`), antes espalhado no arquivo `data/.attention`. **O nivel de urgencia vive apenas na coluna `attention` do banco** (veja a limitacao na secao de exportacao abaixo).
+  - O `notas.db` fica ao lado do executavel (o programa faz `chdir()` para o diretorio do binario).
+
+- **`[⬇ Importar]` — pasta de `.md`  ➔  banco**:
+  - Clique no botao, informe a pasta e pressione `Enter`. Aceita `.md`, `.markdown`, `.mdown`, `.txt` e `.text` (ignora o resto, como `.pdf`).
+  - Reconhece acentos e emojis (UTF-8 preservado byte a byte).
+  - Reimportar a mesma pasta **atualiza** as notas existentes em vez de duplicar (`UNIQUE` pelo nome).
+  - Caminhos com `~` sao expandidos e aspas coladas sao removidas automaticamente.
+
+- **`[⬆ Exportar]` — banco  ➔  pasta de `.md`**:
+  - Exporta todas as notas como `<nome>.md` na pasta informada (criada se nao existir).
+  - O **texto** da nota faz a ida e volta sem nenhuma alteracao (escrito byte a byte como esta no banco).
+  - Nomes de nota sao higienizados ao virar arquivo (`/ \ : * ? " < > |` viram `_`).
+
+- **⚠️ Limitacao conhecida: as marcacoes de urgencia NAO viajam nos arquivos `.md`**:
+  - O `.md` exportado e markdown puro, sem metadados: nenhum rastro de `[1]`/`[2]`/`[3]` e escrito no arquivo.
+  - Portanto, **exportar e depois importar essa pasta em um banco NOVO faz as notas voltarem sem marcacao alguma** (todas em `[ ]`). Isso vale tambem para migrar de maquina.
+  - Ja a **reimportacao sobre notas que ja existem preserva a marcacao**: nesse caso o conteudo e atualizado e a coluna `attention` fica intocada.
+  - Para nao perder as marcacoes, o caminho seguro hoje e copiar o proprio `notas.db` (e nao os `.md`).
+
+- **Prompts com edicao completa**: os dois campos aceitam setas, `Home`/`End`, `Ctrl+A`/`Ctrl+E`, `Ctrl+←/→`, `Backspace`, `Delete`, `Ctrl+U` e `Ctrl+K`. `Esc` cancela.
 
 ---
 
@@ -412,6 +471,17 @@ O editor conta com resolução nativa de caminhos no Windows e Linux para todos 
 
 ---
 
+## 🗄️ Onde as notas ficam agora (v6.29.0+)
+
+As notas residem em **`notas.db`** (SQLite), ao lado do executavel — **nao**
+mais em `data/*.md`. Isso vale para criacao (`n`), renomeacao (`r`), exclusao
+(`d`) e salvamento. O diretorio `data/` e ignorado; para aproveitar um acervo
+antigo de `.md`, use `[⬇ Importar]` uma vez.
+
+A data de modificacao exibida na lateral vem da coluna `mtime` do banco, e os
+niveis de urgencia (`[1]`/`[2]`/`[3]`) vem da coluna `attention` — o antigo
+arquivo `data/.attention` nao e mais usado.
+
 ## 📂 Gerenciamento Completo de Notas na Barra Lateral
 
 - **`n` (Nova Nota)**: Solicita o nome no rodapé (`📝 Nova nota:`), cria `data/<nome>.md` com cabeçalho `# <nome>` e abre imediatamente em aba no editor.
@@ -449,28 +519,50 @@ O editor conta com resolução nativa de caminhos no Windows e Linux para todos 
 
 ## 🚀 Como Compilar e Executar
 
-### No Windows (com MinGW / GCC)
-Para compilar diretamente no Windows usando o prompt de comando (CMD ou PowerShell) com MinGW instalado:
-```cmd
-gcc -O2 -Wall -Wextra src/notas.c -o notas.exe -lkernel32 -luser32 -lshell32
-```
-Ou simplesmente execute o script em lote fornecido:
-```cmd
-build.bat
-notas.exe
+> **A partir da v6.29.0 a libsqlite3 e obrigatoria** (as notas vivem em `notas.db`).
+
+### O jeito recomendado: os scripts de build
+
+```bash
+./build.sh linux      # -> ./notas
+./build.sh windows    # -> ./notas.exe  (requer mingw-w64 + libsqlite3 p/ MinGW)
+./build.sh all        # os dois
+./build.sh run        # compila e executa
+./build.sh clean      # remove os binarios
 ```
 
-### No Linux
+No Windows: `build.bat` (ou `build.bat run`).
+
+### No Linux, manualmente
+
 ```bash
-chmod +x build.sh
-./build.sh linux
+gcc -O2 -Wall -Wextra notas.c -o notas -lsqlite3 -ldl
 ./notas
 ```
 
-### Cross-compilação para Windows a partir do Linux (usando MinGW-w64)
-```bash
-x86_64-w64-mingw32-gcc -O2 -Wall -Wextra src/notas.c -o notas.exe -lkernel32 -luser32 -lshell32
+A libsqlite3 vem no pacote `sqlite` (o header `sqlite3.h` esta em `/usr/include`).
+No Arch/Omarchy: `sudo pacman -S sqlite`.
+
+### No Windows (MinGW / GCC), manualmente
+
+```cmd
+gcc -O2 -Wall -Wextra notas.c -o notas.exe -lsqlite3 -lkernel32 -luser32 -lshell32
+notas.exe
 ```
+
+### Cross-compilacao a partir do Linux (MinGW-w64)
+
+O repositorio **nao** tem um pacote `mingw-w64-sqlite3` no Arch, entao a
+libsqlite3 para Windows e gerada uma vez a partir da amalgamation oficial e
+versionada em `tools/sqlite3-mingw/` (~1,3 MB). Para regenerar:
+
+```bash
+./tools/build_sqlite_mingw.sh     # baixa, cross-compila e instala
+./build.sh windows                # usa tools/sqlite3-mingw/ e gera notas.exe
+```
+
+A biblioteca entra **estaticamente**: o `notas.exe` fica com ~1,5 MB e nao
+precisa de nenhum DLL ao lado. Detalhes em `tools/BUILD_WINDOWS_SQLITE.md`.
 
 ---
 
@@ -488,6 +580,8 @@ x86_64-w64-mingw32-gcc -O2 -Wall -Wextra src/notas.c -o notas.exe -lkernel32 -lu
 | **`[✏️ Renomear]`** (clique) | **Renomeia a nota atual** |
 | **`[🎨 Tema]`** (clique) | **Cicla tema do VS Code** |
 | **`[🧬 Life]`** (clique) | **Roda o Game of Life sob demanda** (para ao clicar qualquer tecla ou mouse) |
+| **`[⬇ Importar]`** (clique) | **Importa uma pasta de arquivos `.md` para o banco SQLite** (pede a pasta no rodape) |
+| **`[⬆ Exportar]`** (clique) | **Exporta o banco para uma pasta de arquivos `.md`** (pede a pasta no rodape) |
 | **`c`** (no modo normal) | **Fecha a aba atual ativa** |
 | **`V + x`** (no visual linha) | **Corta a linha inteira fazendo a de baixo subir** |
 | **`m`** ou **`!`** (na lista) | **Cicla criticidade em 3 níveis (1=Vermelho, 2=Laranja, 3=Amarelo, Normal)** |
