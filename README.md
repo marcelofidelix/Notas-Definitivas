@@ -4,7 +4,7 @@ Editor de texto Markdown em terminal (TUI), minimalista, de arquivo único em C 
 
 ---
 
-## 📊 Ordem da Lista por Prioridade (v6.31.0)
+## 📊 Ordem da Lista por Prioridade (v6.32.0)
 
 - A lista lateral é exibida em **grupos de prioridade**, nesta ordem:
   1. **Nível 1** (crítico / vermelho)
@@ -12,10 +12,11 @@ Editor de texto Markdown em terminal (TUI), minimalista, de arquivo único em C 
   3. **Nível 3** (baixo / amarelo)
   4. **Nível 4 - [H]** (azul / ciano)
   5. **Nível 5 - [R]** (roxo / violeta)
-  6. **Sem marcação** (`[ ]`)
+  6. **Nível 6 - [O]** (verde)
+  7. **Sem marcação** (`[ ]`)
 - **Dentro de cada grupo, a nota editada mais recentemente aparece primeiro** — o mesmo critério de data que já existia, agora aplicado por grupo.
-- Marcar ou desmarcar com **`m`** ou clicando na caixa da nota (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[ ]`) altera a marcação **no lugar** (*in-place*) e persiste atomicamente no SQLite, sem deslocar a nota instantaneamente sob o cursor. Isso evita cliques acidentais em outras notas ou aberturas indesejadas de abas ao ciclar rápido com o mouse. A reordenação completa acontece ao salvar, recarregar (`:rescan`) ou alternar filtros.
-- Vale também com filtro ativo: em `[1]`, `[2]`, `[3]`, `[H]` ou `[R]`, as notas aparecem da mais recente para a mais antiga.
+- Marcar ou desmarcar com **`m`** ou clicando na caixa da nota (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[O]` ➔ `[ ]`) reorganiza a lista por prioridade para agrupar as notas no topo, persistindo atomicamente no SQLite enquanto a seleção acompanha a nota.
+- Vale também com filtro ativo: em `[1]`, `[2]`, `[3]`, `[H]`, `[R]` ou `[O]`, as notas aparecem da mais recente para a mais antiga.
 - Desempate por nome, para a ordem não "dançar" entre redesenhos quando duas notas têm a mesma data.
 
 ### 🏷️ Rótulos responsivos nos botões de filtro da barra lateral
@@ -24,9 +25,9 @@ Os botões de filtro na base do painel esquerdo adaptam-se automaticamente à la
 
 | Largura do painel | Rótulos | Colunas |
 | :--- | :--- | :--- |
-| 28 ou mais | ` [Todas] [1] [2] [3] [H] [R]` | 28 |
-| 24 a 27 | ` [T] [1] [2] [3] [H] [R]` | 24 |
-| 18 a 23 | ` [T][1][2][3][H][R]` | 19 |
+| 32 ou mais | ` [Todas] [1] [2] [3] [H] [R] [O]` | 32 |
+| 28 a 31 | ` [T] [1] [2] [3] [H] [R] [O]` | 28 |
+| 21 a 27 | `[T][1][2][3][H][R][O]` | 21 |
 
 Os limites de clique do mouse são recalculados dinamicamente a partir do layout em uso e operam de forma independente da largura do painel, garantindo clique preciso em qualquer resolução ou tamanho de janela.
 
@@ -406,19 +407,20 @@ Localizados na barra de status inferior, acessíveis por clique do mouse ou coma
 
 ---
 
-## ⚠️ Marcação de Notas em Cinco Níveis de Criticidade / Urgência
+## ⚠️ Marcação de Notas em Seis Níveis de Criticidade / Urgência
 
-- **Classificação em 5 Níveis de Criticidade**:
+- **Classificação em 6 Níveis de Criticidade**:
   - **Nível 1 (Crítico / Máxima Urgência)**: Marcador **`[1]`** e título em **Vermelho** vibrante em negrito.
   - **Nível 2 (Médio / Atenção Intermediária)**: Marcador **`[2]`** e título em **Laranja** em negrito.
   - **Nível 3 (Baixo / Acompanhamento)**: Marcador **`[3]`** e título em **Amarelo** em negrito.
   - **Nível 4 - [H] (Azul / Ciano)**: Marcador **`[H]`** e título em **Azul / Ciano** em negrito.
   - **Nível 5 - [R] (Roxo / Violeta)**: Marcador **`[R]`** e título em **Roxo / Violeta** em negrito.
+  - **Nível 6 - [O] (Verde)**: Marcador **`[O]`** e título em **Verde** em negrito.
   - **Sem Marcação (Normal)**: Marcador `[ ]` e título na cor padrão da listagem.
 - **Como Alternar**:
-  - Pressione o atalho **`m`** ou **`!`** na barra lateral ou no editor (modo normal) para ciclar: `Normal [ ]` ➔ `Nível 1` ➔ `Nível 2` ➔ `Nível 3` ➔ `[H]` ➔ `[R]` ➔ `Normal [ ]`.
+  - Pressione o atalho **`m`** ou **`!`** na barra lateral ou no editor (modo normal) para ciclar: `Normal [ ]` ➔ `Nível 1` ➔ `Nível 2` ➔ `Nível 3` ➔ `[H]` ➔ `[R]` ➔ `[O]` ➔ `Normal [ ]`.
   - Ou clique com o mouse diretamente sobre a caixa da nota (colunas 1 a 5 da listagem).
-  - Ou execute **`:atencao`** para ciclar, ou defina diretamente com **`:atencao 1`**, **`:atencao 2`**, **`:atencao 3`**, **`:atencao 4`** (ou `h`), **`:atencao 5`** (ou `r`), ou **`:atencao 0`**.
+  - Ou execute **`:atencao`** para ciclar, ou defina diretamente com **`:atencao 1`**, **`:atencao 2`**, **`:atencao 3`**, **`:atencao 4`** (ou `h`), **`:atencao 5`** (ou `r`), **`:atencao 6`** (ou `o`), ou **`:atencao 0`**.
 - **Persistência**: Armazenado diretamente na coluna `attention` do banco SQLite (`notas.db`).
 
 ---
@@ -432,7 +434,8 @@ Localizados na barra de status inferior, acessíveis por clique do mouse ou coma
   - **`[3]` (Amarelo)**: Filtra apenas notas de Criticidade Nível 3.
   - **`[H]` (Azul)**: Filtra apenas notas de Criticidade Nível 4 (`[H]`).
   - **`[R]` (Roxo)**: Filtra apenas notas de Criticidade Nível 5 (`[R]`).
-- **Acionamento**: Clique com o mouse no botão desejado, ou use as teclas **`1`**, **`2`**, **`3`**, **`4`** (ou `h`/`H`), **`5`** (ou `r`/`R`), ou **`0`** com o foco no painel esquerdo, ou os comandos **`:filtro 1/2/3/4/5/h/r/0`**. Clicar novamente no botão ativo desativa o filtro.
+  - **`[O]` (Verde)**: Filtra apenas notas de Criticidade Nível 6 (`[O]`).
+- **Acionamento**: Clique com o mouse no botão desejado, ou use as teclas **`1`**, **`2`**, **`3`**, **`4`** (ou `h`/`H`), **`5`** (ou `r`/`R`), **`6`** (ou `o`/`O`), ou **`0`** com o foco no painel esquerdo, ou os comandos **`:filtro 1/2/3/4/5/6/h/r/o/0`**. Clicar novamente no botão ativo desativa o filtro.
 
 ---
 
@@ -587,9 +590,9 @@ precisa de nenhum DLL ao lado. Detalhes em `tools/BUILD_WINDOWS_SQLITE.md`.
 | **`[⬆ Exportar]`** (clique) | **Exporta o banco para uma pasta de arquivos `.md`** (pede a pasta no rodape) |
 | **`c`** (no modo normal) | **Fecha a aba atual ativa** |
 | **`V + x`** (no visual linha) | **Corta a linha inteira fazendo a de baixo subir** |
-| **`m`** ou **`!`** (na lista / editor) | **Cicla criticidade em 5 níveis (1=Vermelho, 2=Laranja, 3=Amarelo, 4/H=Azul, 5/R=Roxo, Normal)** |
-| **`:atencao [1/2/3/4/5/h/r/0]`** | **Define ou cicla nível de criticidade** |
-| **`:filtro [1/2/3/4/5/h/r/0]`** | **Filtra notas na lista por criticidade** |
+| **`m`** ou **`!`** (na lista / editor) | **Cicla criticidade em 6 níveis (1=Vermelho, 2=Laranja, 3=Amarelo, 4/H=Azul, 5/R=Roxo, 6/O=Verde, Normal)** |
+| **`:atencao [1/2/3/4/5/6/h/r/o/0]`** | **Define ou cicla nível de criticidade** |
+| **`:filtro [1/2/3/4/5/6/h/r/o/0]`** | **Filtra notas na lista por criticidade** |
 | **`:s/antigo/novo/`** | **Substitui string na nota ativa** |
 | **`n`** (na lista) | **Cria nova nota** com prompt de nome |
 | **`r`** (na lista) | **Renomeia nota selecionada** |

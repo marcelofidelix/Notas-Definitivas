@@ -63,13 +63,13 @@ Consequências diretas para quem lê o documento antigo: não existe mais armaze
 - **Quem liga a flag**: qualquer rotina que altere o estado visual chama `g_needs_redraw = 1` (via `set_status_msg()`, digitação, troca de tema/aba, filtros etc.). `refresh_screen()` é o único ponto que **baixa** a flag e reinicia o batimento.
 - **Regra de ouro**: todo efeito novo que dependa de tempo (animações, contadores, expirações) **precisa** entrar como condição em `should_refresh_now()`, senão a tela congela até a próxima tecla. `IDLE_HEARTBEAT_MS` pode ser sobrescrito por `-D` para testes de batimento rápido.
 
-### 2.5 Ordem por Prioridade, Rótulos [H] e [R] e Filtros Responsivos (v6.31.0)
-- **Ordem da lista**: grupos na sequência **nível 1** (crítico/vermelho) ➔ **nível 2** (médio/laranja) ➔ **nível 3** (baixo/amarelo) ➔ **nível 4 - [H]** (azul/ciano) ➔ **nível 5 - [R]** (roxo/violeta) ➔ **sem marcação**; dentro do grupo, a mais recente primeiro; desempate por nome de arquivo.
-- **Alternância de marcação segura e *in-place***: `m` (na lista ou no editor) ou clique do mouse na caixa da nota cicla a criticidade (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[ ]`) e grava atomicamente no SQLite (`db_set_attention`), **sem reordenar a lista instantaneamente sob o cursor**. Isso elimina bugs em que clicar na caixa de uma nota reposicionava a linha e fazia o segundo clique atingir uma nota diferente ou abrir abas indesejadas por detecção errônea de duplo clique. A reordenação completa por prioridade ocorre de forma segura ao salvar (`:w`), recarregar (`:rescan`), pressionar `R` ou alternar filtros.
+### 2.5 Ordem por Prioridade, Rótulos [H], [R] e [O] e Filtros Responsivos (v6.32.0)
+- **Ordem da lista**: grupos na sequência **nível 1** (crítico/vermelho) ➔ **nível 2** (médio/laranja) ➔ **nível 3** (baixo/amarelo) ➔ **nível 4 - [H]** (azul/ciano) ➔ **nível 5 - [R]** (roxo/violeta) ➔ **nível 6 - [O]** (verde) ➔ **sem marcação**; dentro do grupo, a mais recente primeiro; desempate por nome de arquivo.
+- **Alternância de marcação com agrupamento no topo**: `m` (na lista ou no editor) ou clique do mouse na caixa da nota cicla a criticidade (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[O]` ➔ `[ ]`) e grava atomicamente no SQLite (`db_set_attention`), reorganizando a lista por prioridade para agrupar as notas no topo da lista lateral e mantendo a seleção sobre a nota para evitar aberturas involuntárias.
 - **Rótulos responsivos dos filtros**: os botões de filtro na barra inferior adaptam-se dinamicamente à largura do painel:
-  - $\ge$ 28 colunas: rótulos completos espaçados (` [Todas] [1] [2] [3] [H] [R]`).
-  - 24 a 27 colunas: `[Todas]` abreviado para `[T]` espaçado (` [T] [1] [2] [3] [H] [R]`).
-  - 18 a 23 colunas: modo ultracompacto colado (` [T][1][2][3][H][R]`).
+  - $\ge$ 32 colunas: rótulos completos espaçados (` [Todas] [1] [2] [3] [H] [R] [O]`).
+  - 28 a 31 colunas: `[Todas]` abreviado para `[T]` espaçado (` [T] [1] [2] [3] [H] [R] [O]`).
+  - 21 a 27 colunas: modo ultracompacto colado (`[T][1][2][3][H][R][O]`).
   Os limites de clique de cada botão são calculados no desenho e tratados independentemente da largura da lista.
 
 ---
@@ -185,7 +185,7 @@ typedef struct {
     char rel_time[32];       /* Texto formatado (ex: "10m atrás", "09/10/26") */
     char *search_norm;       /* Cache textual normalizado (minúsculas, sem acentos) */
     int search_norm_len;     /* Tamanho do cache de busca */
-    int attention_level;     /* Urgência: 0 = nenhuma, 1 = Crítica, 2 = Média, 3 = Baixa, 4 = [H], 5 = [R] */
+    int attention_level;     /* Urgência: 0 = nenhuma, 1 = Crítica, 2 = Média, 3 = Baixa, 4 = [H], 5 = [R], 6 = [O] */
     bool needs_attention;    /* true se attention_level > 0 */
 } NoteInfo;
 ```
@@ -264,7 +264,7 @@ enum EditorMode {
 Os dois últimos modos são **a faixa de prompts**, e o intervalo `MODE_PROMPT_NEW_NOTE .. MODE_PROMPT_EXPORT_DIR` aparece em quatro lugares: guarda de colagem (`editor_paste_string`), guarda do leitor de teclas (Alt), insulação do mouse e despachante de teclas. Os rótulos desses dois prompts (`PROMPT_IMPORT_LABEL`, `PROMPT_EXPORT_LABEL`) são usados tanto no desenho quanto no cálculo da coluna do cursor — sempre pela mesma macro.
 
 ### 4.2 Foco da Aplicação (`enum EditorFocus`)
-- **`FOCUS_LEFT`**: foco no painel lateral. `j`/`k` e setas navegam na lista, `Enter` ou `l` abre a nota selecionada em aba, `m` cicla a urgência (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[ ]`) *in-place*, `d` pede confirmação de exclusão, `/` ou `Ctrl+F` foca a busca e `1`, `2`, `3`, `4`/`H`, `5`/`R`, `0` ativam os filtros de urgência correspondentes.
+- **`FOCUS_LEFT`**: foco no painel lateral. `j`/`k` e setas navegam na lista, `Enter` ou `l` abre a nota selecionada em aba, `m` cicla a urgência (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[O]` ➔ `[ ]`), `d` pede confirmação de exclusão, `/` ou `Ctrl+F` foca a busca e `1`, `2`, `3`, `4`/`H`, `5`/`R`, `6`/`O`, `0` ativam os filtros de urgência correspondentes.
 - **`FOCUS_RIGHT`**: foco na área de edição, com os atalhos Vim (`hjkl`, `w`, `b`, `gg`, `G`, `x`, `d`, `y`, `p`, `u`, `Ctrl+R`, etc.) e os recursos de produtividade (bullets coloridas, tabelas, wikilinks, dobras, marquee). O atalho `m` ou `!` também cicla a urgência da nota da aba ativa atual.
 
 ### 4.3 Globais de Renderização e Atividade (v6.28.0)
@@ -309,7 +309,7 @@ O desenho só acontece quando `should_refresh_now()` autoriza (seção 2.4). Aut
 1. **Baixa a *dirty-flag***: `g_needs_redraw = 0` e `g_last_heartbeat_draw = get_current_time_ms()` — este é o ponto único que reinicia o batimento de manutenção.
 2. **Recalcula o layout**: redetecta o tamanho da janela; se houve redimensionamento (`g_window_resized`), pede limpeza total; limita `left_width` (mínimo 18, nunca ocupando menos de 15 colunas da área de texto) e fixa `status_bar_lines = 2`.
 3. **Decide limpeza x reposicionamento**: com `g_screen_clear_needed` (ou redimensionamento) emite `\x1b[2J\x1b[3J\x1b[H` e baixa a flag; caso contrário só `\x1b[H`. Em seguida oculta o cursor físico (`\x1b[?25l`).
-4. **Painel Esquerdo (`render_left_panel`)**: título, caixa de busca rápida (`Ctrl+F`), a lista de notas na **ordem de prioridade** (tempo relativo, caixa de urgência colorida por `get_attention_color()`, marcadores de nota aberta `●` e selecionada `▸`) e, na última linha, os botões responsivos de filtro ` [Todas] [1] [2] [3] [H] [R]` (com rótulo abreviado `[T]` ou modo colado conforme a largura).
+4. **Painel Esquerdo (`render_left_panel`)**: título, caixa de busca rápida (`Ctrl+F`), a lista de notas na **ordem de prioridade** (tempo relativo, caixa de urgência colorida por `get_attention_color()`, marcadores de nota aberta `●` e selecionada `▸`) e, na última linha, os botões responsivos de filtro ` [Todas] [1] [2] [3] [H] [R] [O]` (com rótulo abreviado `[T]` ou modo colado conforme a largura).
 5. **Divisória Vertical**: linha separadora entre painel lateral e área de edição, na cor `TH_FG_BORDER`.
 6. **Barra de Abas (`render_tab_bar`, linha 1)**: abas abertas, indicador de modificado, botão de fechar (`x`), botão `[+]`, seletor de tema e animação de marquee para títulos longos.
 7. **Painel Direito de Edição (`render_right_panel`)**: números de linha e indicadores de dobra; cores de H1/H2/H3; bullet lists (`-` amarelo negrito, `*` acento negrito); ocultação de URLs de links e de estilos Markdown no Modo Normal; tabelas alinhadas; fundo de blocos de código; realce de seleção visual e de termos buscados; quebra de linha visual quando `wrap_mode` está ligado.
@@ -765,7 +765,7 @@ Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base at
 
 ### 7.89 `toggle_note_attention_at`
 - **Protótipo**: `static void toggle_note_attention_at(int actual_idx)`
-- **Descrição**: Alterna ciclicamente o nível de urgência da nota selecionada ([ ] ➔ [1] ➔ [2] ➔ [3] ➔ [H] ➔ [R] ➔ [ ]), gravando atomicamente no banco SQLite apenas para aquela nota e atualizando o estado em memória sem deslocar as notas sob o cursor.
+- **Descrição**: Alterna ciclicamente o nível de urgência da nota selecionada ([ ] ➔ [1] ➔ [2] ➔ [3] ➔ [H] ➔ [R] ➔ [O] ➔ [ ]), gravando atomicamente no banco SQLite, reorganizando a lista por prioridade para agrupar as notas no topo e mantendo a seleção sobre a nota.
 - **Retorno**: `static void`
 
 ### 7.91 `rescan_notes` (Linha 2936)
@@ -1075,7 +1075,7 @@ Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base at
 
 ### 7.152 `handle_mouse_event`
 - **Protótipo**: `static void handle_mouse_event(void)`
-- **Descrição**: Trata os eventos de mouse (SGR 1006): insula os modos de prompt contra cliques acidentais; trata a barra de status (incluindo `[Importar]` e `[Exportar]`); a barra de abas; os botões responsivos de filtro `[Todas] [1] [2] [3] [H] [R]`; e a lista lateral, onde o clique sobre a caixa de marcação (`cols 1..5`) cicla a criticidade *in-place* e anula o registro de duplo-clique para evitar abertura involuntária da nota ao clicar rapidamente.
+- **Descrição**: Trata os eventos de mouse (SGR 1006): insula os modos de prompt contra cliques acidentais; trata a barra de status (incluindo `[Importar]` e `[Exportar]`); a barra de abas; os botões responsivos de filtro `[Todas] [1] [2] [3] [H] [R] [O]`; e a lista lateral, onde o clique sobre a caixa de marcação (`cols 1..5`) cicla a criticidade e anula o registro de duplo-clique para evitar abertura involuntária da nota ao clicar rapidamente.
 - **Retorno**: `static void`
 
 ### 7.153 `execute_bottom_command` (Linha 7903)
