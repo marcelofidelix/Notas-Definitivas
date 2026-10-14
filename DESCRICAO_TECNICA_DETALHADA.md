@@ -63,12 +63,14 @@ Consequências diretas para quem lê o documento antigo: não existe mais armaze
 - **Quem liga a flag**: qualquer rotina que altere o estado visual chama `g_needs_redraw = 1` (via `set_status_msg()`, digitação, troca de tema/aba, filtros etc.). `refresh_screen()` é o único ponto que **baixa** a flag e reinicia o batimento.
 - **Regra de ouro**: todo efeito novo que dependa de tempo (animações, contadores, expirações) **precisa** entrar como condição em `should_refresh_now()`, senão a tela congela até a próxima tecla. `IDLE_HEARTBEAT_MS` pode ser sobrescrito por `-D` para testes de batimento rápido.
 
-### 2.5 Ordem por Prioridade, Filtros e Rótulos Compactos (v6.30.0)
-- **Ordem da lista**: grupos na sequência **nível 1** (crítico/vermelho) ➔ **nível 2** (médio/laranja) ➔ **nível 3** (baixo/amarelo) ➔ **sem marcação**; dentro do grupo, a mais recente primeiro; desempate por nome de arquivo, para a ordem não "dançar" entre redesenhos.
-- **Marcar/desmarcar reordena na hora**: `m` na lista (ou clique na caixa) grava no banco, reordena pelo grupo e **a seleção acompanha a nota** (`notes_resort_keep()`), sem o cursor pular para outra linha. Vale também com filtro ativo: em `[1]`, as notas de nível 1 aparecem da mais recente para a mais antiga.
-- **Rótulos compactos no painel estreito**: os quatro botões de filtro ocupam 20 colunas com os rótulos completos (` [Todas] [1] [2] [3]`), mas o painel esquerdo pode chegar a 18 colunas (`Ctrl+←`); abaixo de 20 colunas só o botão "Todas" encolhe, para `[T]` (16 colunas no total). Os limites de clique são gravados a partir do rótulo **realmente usado**, então o clique continua correto nos dois modos.
-- **Correção dos filtros `[2]`/`[3]`**: o tratamento do clique dos quatro botões de filtro estava preso ao guarda `E.mouse_col <= E.left_width`. Como os botões são desenhados até a coluna 20 e o painel pode ter 18, os botões mais à direita ficavam inalcançáveis — primeiro `[3]`, depois `[2]` — enquanto `[Todas]` e `[1]` continuavam funcionando. Sintoma que chegava como "no Windows não filtra", porque lá o console era mais estreito. O clique dos filtros agora é tratado **fora** daquele guarda.
-- **Barra de status compacta**: abaixo de 108 colunas (ou com `:wrapbar`) os rótulos dos botões da barra inferior também encolhem (` [➕ Nova] ` ➔ ` [➕] `, ` [🔍 Buscar] ` ➔ ` [🔍] `, ` [⬇ Importar] ` ➔ ` [⬇] `, etc.).
+### 2.5 Ordem por Prioridade, Rótulos [H] e [R] e Filtros Responsivos (v6.31.0)
+- **Ordem da lista**: grupos na sequência **nível 1** (crítico/vermelho) ➔ **nível 2** (médio/laranja) ➔ **nível 3** (baixo/amarelo) ➔ **nível 4 - [H]** (azul/ciano) ➔ **nível 5 - [R]** (roxo/violeta) ➔ **sem marcação**; dentro do grupo, a mais recente primeiro; desempate por nome de arquivo.
+- **Alternância de marcação segura e *in-place***: `m` (na lista ou no editor) ou clique do mouse na caixa da nota cicla a criticidade (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[ ]`) e grava atomicamente no SQLite (`db_set_attention`), **sem reordenar a lista instantaneamente sob o cursor**. Isso elimina bugs em que clicar na caixa de uma nota reposicionava a linha e fazia o segundo clique atingir uma nota diferente ou abrir abas indesejadas por detecção errônea de duplo clique. A reordenação completa por prioridade ocorre de forma segura ao salvar (`:w`), recarregar (`:rescan`), pressionar `R` ou alternar filtros.
+- **Rótulos responsivos dos filtros**: os botões de filtro na barra inferior adaptam-se dinamicamente à largura do painel:
+  - $\ge$ 28 colunas: rótulos completos espaçados (` [Todas] [1] [2] [3] [H] [R]`).
+  - 24 a 27 colunas: `[Todas]` abreviado para `[T]` espaçado (` [T] [1] [2] [3] [H] [R]`).
+  - 18 a 23 colunas: modo ultracompacto colado (` [T][1][2][3][H][R]`).
+  Os limites de clique de cada botão são calculados no desenho e tratados independentemente da largura da lista.
 
 ---
 
@@ -183,7 +185,7 @@ typedef struct {
     char rel_time[32];       /* Texto formatado (ex: "10m atrás", "09/10/26") */
     char *search_norm;       /* Cache textual normalizado (minúsculas, sem acentos) */
     int search_norm_len;     /* Tamanho do cache de busca */
-    int attention_level;     /* Urgência: 0 = nenhuma, 1 = Crítica, 2 = Média, 3 = Baixa */
+    int attention_level;     /* Urgência: 0 = nenhuma, 1 = Crítica, 2 = Média, 3 = Baixa, 4 = [H], 5 = [R] */
     bool needs_attention;    /* true se attention_level > 0 */
 } NoteInfo;
 ```
@@ -197,7 +199,7 @@ Encapsula o estado completo da aplicação durante o ciclo de execução:
 - **Espelho do buffer ativo**: `cur_filename`, `cur_filepath`, `lines`, `num_lines`, `cursor_*`, `scroll_*`, `visual_start_*`, `has_selection`, pilhas de undo/redo — sincronizados com `tabs[active_tab]` por `tab_save_active()`/`tab_load()`.
 - **Tema**: `current_theme`, `theme_btn_start_col`, `theme_btn_end_col`.
 - **Barra de status e botões** (`_start`/`_end` de cada um): `btn_new`, `btn_rename`, `btn_delete`, `btn_wrap`, `btn_find`, `btn_replace`, `btn_life`, **`btn_import`** (`[Importar]`) e **`btn_export`** (`[Exportar]`), mais `status_bar_lines` e `force_status_bar_wrap` (0 = automático, 1 = sempre compacto, 2 = nunca).
-- **Filtros de urgência**: `filter_urgency` (0 = todas, 1, 2 ou 3) e `btn_filter_all`, `btn_filter_1`, `btn_filter_2`, `btn_filter_3`.
+- **Filtros de urgência**: `filter_urgency` (0 = todas, 1, 2, 3, 4 ou 5) e `btn_filter_all`, `btn_filter_1`, `btn_filter_2`, `btn_filter_3`, `btn_filter_h`, `btn_filter_r`.
 - **Busca e substituição**: `replace_find_buf`, `replace_with_buf`, `search_query`, `search_cursor`, `filtered_indices`, `num_filtered`, `selected_note_idx`, `sidebar_scroll_y`.
 - **Histórico de navegação**: `history[MAX_HISTORY][512]`, `history_count`, `history_idx`.
 - **Prompts e linha de comando**: `prompt_buf`, `prompt_cursor`, `rename_target_path`, `cmd_buf`, `cmd_cursor`, `status_msg`, `status_msg_time`, `last_search_pat`.
@@ -213,7 +215,7 @@ CREATE TABLE IF NOT EXISTS notes (
     name      TEXT    NOT NULL UNIQUE,      -- nome lógico da nota (chave)
     content   TEXT    NOT NULL DEFAULT '',  -- markdown completo, UTF-8 byte a byte
     mtime     INTEGER NOT NULL DEFAULT 0,   -- data de modificação (segundos)
-    attention INTEGER NOT NULL DEFAULT 0    -- 0 = nenhuma, 1, 2 ou 3
+    attention INTEGER NOT NULL DEFAULT 0    -- 0 = nenhuma, 1, 2, 3, 4 (H) ou 5 (R)
 );
 CREATE INDEX IF NOT EXISTS idx_notes_mtime ON notes(mtime DESC);
 PRAGMA user_version = 1;   /* DB_SCHEMA_VERSION */
@@ -262,8 +264,8 @@ enum EditorMode {
 Os dois últimos modos são **a faixa de prompts**, e o intervalo `MODE_PROMPT_NEW_NOTE .. MODE_PROMPT_EXPORT_DIR` aparece em quatro lugares: guarda de colagem (`editor_paste_string`), guarda do leitor de teclas (Alt), insulação do mouse e despachante de teclas. Os rótulos desses dois prompts (`PROMPT_IMPORT_LABEL`, `PROMPT_EXPORT_LABEL`) são usados tanto no desenho quanto no cálculo da coluna do cursor — sempre pela mesma macro.
 
 ### 4.2 Foco da Aplicação (`enum EditorFocus`)
-- **`FOCUS_LEFT`**: foco no painel lateral. `j`/`k` e setas navegam na lista, `Enter` ou `l` abre a nota selecionada em aba, `m` cicla a urgência (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[ ]`) **e reordena a lista na hora**, `d` pede confirmação de exclusão, `/` ou `Ctrl+F` foca a busca e `1`, `2`, `3`, `0` ativam os filtros de urgência.
-- **`FOCUS_RIGHT`**: foco na área de edição, com os atalhos Vim (`hjkl`, `w`, `b`, `gg`, `G`, `x`, `d`, `y`, `p`, `u`, `Ctrl+R`, etc.) e os recursos de produtividade (bullets coloridas, tabelas, wikilinks, dobras, marquee).
+- **`FOCUS_LEFT`**: foco no painel lateral. `j`/`k` e setas navegam na lista, `Enter` ou `l` abre a nota selecionada em aba, `m` cicla a urgência (`[ ]` ➔ `[1]` ➔ `[2]` ➔ `[3]` ➔ `[H]` ➔ `[R]` ➔ `[ ]`) *in-place*, `d` pede confirmação de exclusão, `/` ou `Ctrl+F` foca a busca e `1`, `2`, `3`, `4`/`H`, `5`/`R`, `0` ativam os filtros de urgência correspondentes.
+- **`FOCUS_RIGHT`**: foco na área de edição, com os atalhos Vim (`hjkl`, `w`, `b`, `gg`, `G`, `x`, `d`, `y`, `p`, `u`, `Ctrl+R`, etc.) e os recursos de produtividade (bullets coloridas, tabelas, wikilinks, dobras, marquee). O atalho `m` ou `!` também cicla a urgência da nota da aba ativa atual.
 
 ### 4.3 Globais de Renderização e Atividade (v6.28.0)
 | Global | Papel |
@@ -307,7 +309,7 @@ O desenho só acontece quando `should_refresh_now()` autoriza (seção 2.4). Aut
 1. **Baixa a *dirty-flag***: `g_needs_redraw = 0` e `g_last_heartbeat_draw = get_current_time_ms()` — este é o ponto único que reinicia o batimento de manutenção.
 2. **Recalcula o layout**: redetecta o tamanho da janela; se houve redimensionamento (`g_window_resized`), pede limpeza total; limita `left_width` (mínimo 18, nunca ocupando menos de 15 colunas da área de texto) e fixa `status_bar_lines = 2`.
 3. **Decide limpeza x reposicionamento**: com `g_screen_clear_needed` (ou redimensionamento) emite `\x1b[2J\x1b[3J\x1b[H` e baixa a flag; caso contrário só `\x1b[H`. Em seguida oculta o cursor físico (`\x1b[?25l`).
-4. **Painel Esquerdo (`render_left_panel`)**: título, caixa de busca rápida (`Ctrl+F`), a lista de notas na **ordem de prioridade** (tempo relativo, caixa de urgência colorida por `get_attention_color()`, marcadores de nota aberta `●` e selecionada `▸`) e, na última linha, os botões de filtro ` [Todas] [1] [2] [3]` (compactados para `[T]` abaixo de 20 colunas).
+4. **Painel Esquerdo (`render_left_panel`)**: título, caixa de busca rápida (`Ctrl+F`), a lista de notas na **ordem de prioridade** (tempo relativo, caixa de urgência colorida por `get_attention_color()`, marcadores de nota aberta `●` e selecionada `▸`) e, na última linha, os botões responsivos de filtro ` [Todas] [1] [2] [3] [H] [R]` (com rótulo abreviado `[T]` ou modo colado conforme a largura).
 5. **Divisória Vertical**: linha separadora entre painel lateral e área de edição, na cor `TH_FG_BORDER`.
 6. **Barra de Abas (`render_tab_bar`, linha 1)**: abas abertas, indicador de modificado, botão de fechar (`x`), botão `[+]`, seletor de tema e animação de marquee para títulos longos.
 7. **Painel Direito de Edição (`render_right_panel`)**: números de linha e indicadores de dobra; cores de H1/H2/H3; bullet lists (`-` amarelo negrito, `*` acento negrito); ocultação de URLs de links e de estilos Markdown no Modo Normal; tabelas alinhadas; fundo de blocos de código; realce de seleção visual e de termos buscados; quebra de linha visual quando `wrap_mode` está ligado.
@@ -746,29 +748,24 @@ Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base at
 - **Descrição**: Monta o texto normalizado de busca da nota (nome + título + cabeçalho `#` + conteúdo), lendo o conteúdo por `note_read_content()`. O cache só é descartado quando a nota muda de data de modificação.
 - **Retorno**: `static void`
 
-### 7.86 `get_attention_color` (Linha 2849)
+### 7.86 `get_attention_color`
 - **Protótipo**: `static const char *get_attention_color(int level)`
-- **Descrição**: Retorna a sequência ANSI do nível de urgência, com variante clara e escura conforme o tema atual (1 = vermelho, 2 = laranja, 3 = amarelo); sem marcação devolve a cor de texto principal.
+- **Descrição**: Retorna a sequência ANSI do nível de urgência, com variante clara e escura conforme o tema atual (1 = vermelho, 2 = laranja, 3 = amarelo, 4 = azul/ciano, 5 = roxo/violeta); sem marcação (0) devolve a cor de texto principal.
 - **Retorno**: `static const char *`
 
-### 7.87 `load_attention_flags` (Linha 2866)
+### 7.87 `load_attention_flags`
 - **Protótipo**: `static void load_attention_flags(void)`
 - **Descrição**: Deriva o atalho booleano `needs_attention` a partir de `attention_level`, que já vem carregado da coluna `attention` do banco por `rescan_notes()`. Não lê mais o antigo arquivo `data/.attention`.
 - **Retorno**: `static void`
 
-### 7.88 `save_attention_flags` (Linha 2873)
+### 7.88 `save_attention_flags`
 - **Protótipo**: `static void save_attention_flags(void)`
 - **Descrição**: Persiste no banco o nível de urgência de todas as notas em memória (`db_set_attention` por caminho `db:<id>`).
 - **Retorno**: `static void`
 
-### 7.89 `notes_resort_keep` (Linha 2882)
-- **Protótipo**: `static void notes_resort_keep(const char *keep_path)`
-- **Descrição**: Reordena a lista pela prioridade (`compare_notes_priority`), reaplica filtro/busca (`apply_note_search`) e recoloca a seleção sobre o caminho indicado, recarregando a prévia se o foco estiver na lateral. É o que impede o cursor de "pular" para outra nota quando a ordem muda.
-- **Retorno**: `static void`
-
-### 7.90 `toggle_note_attention_at` (Linha 2900)
+### 7.89 `toggle_note_attention_at`
 - **Protótipo**: `static void toggle_note_attention_at(int actual_idx)`
-- **Descrição**: Alterna ciclicamente o nível de urgência da nota selecionada ([ ] ➔ [1] ➔ [2] ➔ [3] ➔ [ ]), grava no banco e reordena a lista na hora (`notes_resort_keep`), mantendo a seleção sobre a nota remarcada.
+- **Descrição**: Alterna ciclicamente o nível de urgência da nota selecionada ([ ] ➔ [1] ➔ [2] ➔ [3] ➔ [H] ➔ [R] ➔ [ ]), gravando atomicamente no banco SQLite apenas para aquela nota e atualizando o estado em memória sem deslocar as notas sob o cursor.
 - **Retorno**: `static void`
 
 ### 7.91 `rescan_notes` (Linha 2936)
@@ -1076,9 +1073,9 @@ Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base at
 - **Descrição**: Exclui a nota selecionada na lista: apaga a linha do banco (`db_delete_note`, ou o arquivo quando o caminho é real), fecha as abas dessa nota, descarta a prévia se for a nota exibida e refaz a varredura, ajustando a seleção.
 - **Retorno**: `static void`
 
-### 7.152 `handle_mouse_event` (Linha 7461)
+### 7.152 `handle_mouse_event`
 - **Protótipo**: `static void handle_mouse_event(void)`
-- **Descrição**: Trata os eventos de mouse (SGR 1006): insula os modos de prompt contra cliques acidentais, trata a barra de status (incluindo `[Importar]` e `[Exportar]`), a barra de abas, os botões de filtro de urgência — que agora são tratados FORA do guarda de largura do painel esquerdo, para funcionarem com o painel estreito — e as regiões do painel esquerdo e da área de texto.
+- **Descrição**: Trata os eventos de mouse (SGR 1006): insula os modos de prompt contra cliques acidentais; trata a barra de status (incluindo `[Importar]` e `[Exportar]`); a barra de abas; os botões responsivos de filtro `[Todas] [1] [2] [3] [H] [R]`; e a lista lateral, onde o clique sobre a caixa de marcação (`cols 1..5`) cicla a criticidade *in-place* e anula o registro de duplo-clique para evitar abertura involuntária da nota ao clicar rapidamente.
 - **Retorno**: `static void`
 
 ### 7.153 `execute_bottom_command` (Linha 7903)

@@ -543,7 +543,7 @@ typedef struct {
     /* High-Performance In-Memory Search Cache (Normalized: lowercase & accent-folded) */
     char *search_norm;       /* Full normalized search text (filename + title + header + content) */
     int search_norm_len;     /* Length of cached normalized text */
-    int attention_level;     /* Urgency: 0 = none, 1 = Crítica (Vermelho), 2 = Média (Laranja), 3 = Baixa (Amarelo) */
+    int attention_level;     /* Urgency: 0 = none, 1 = Crítica (Vermelho), 2 = Média (Laranja), 3 = Baixa (Amarelo), 4 = H (Azul), 5 = R (Roxo) */
     bool needs_attention;    /* True if attention_level > 0 */
 } NoteInfo;
 
@@ -606,12 +606,14 @@ typedef struct {
     int btn_import_start, btn_import_end;   /* [Importar] - pasta .md -> SQLite */
     int btn_export_start, btn_export_end;   /* [Exportar] - SQLite -> pasta .md */
 
-    /* Urgency / Criticality Filter State (0 = all, 1 = Red, 2 = Orange, 3 = Yellow) */
+    /* Urgency / Criticality Filter State (0 = all, 1 = Red, 2 = Orange, 3 = Yellow, 4 = Blue (H), 5 = Purple (R)) */
     int filter_urgency;
     int btn_filter_all_start, btn_filter_all_end;
     int btn_filter_1_start, btn_filter_1_end;
     int btn_filter_2_start, btn_filter_2_end;
     int btn_filter_3_start, btn_filter_3_end;
+    int btn_filter_h_start, btn_filter_h_end;
+    int btn_filter_r_start, btn_filter_r_end;
 
     /* Search & Replace Buffers */
     char replace_find_buf[256];
@@ -2203,10 +2205,10 @@ static int compare_notes_priority(const void *a, const void *b) {
     const NoteInfo *na = (const NoteInfo *)a;
     const NoteInfo *nb = (const NoteInfo *)b;
 
-    int ra = (na->attention_level >= 1 && na->attention_level <= 3)
-             ? na->attention_level - 1 : 3;
-    int rb = (nb->attention_level >= 1 && nb->attention_level <= 3)
-             ? nb->attention_level - 1 : 3;
+    int ra = (na->attention_level >= 1 && na->attention_level <= 5)
+             ? na->attention_level - 1 : 5;
+    int rb = (nb->attention_level >= 1 && nb->attention_level <= 5)
+             ? nb->attention_level - 1 : 5;
     if (ra != rb) return ra - rb;
 
     int c = compare_notes_mtime(a, b);
@@ -2855,6 +2857,10 @@ static const char *get_attention_color(int level) {
             return dark ? "\x1b[38;2;255;158;100m" : "\x1b[38;2;217;119;6m";
         case 3: /* Nível 3 - Amarelo (Baixo / Acompanhamento) */
             return dark ? "\x1b[38;2;241;250;140m" : "\x1b[38;2;165;110;0m";
+        case 4: /* Nível 4 - Azul (H) */
+            return dark ? "\x1b[38;2;122;162;247m" : "\x1b[38;2;9;105;218m";
+        case 5: /* Nível 5 - Roxo (R) */
+            return dark ? "\x1b[38;2;187;154;247m" : "\x1b[38;2;130;80;223m";
         default:
             return TH_FG_MAIN;
     }
@@ -2877,46 +2883,22 @@ static void save_attention_flags(void) {
     }
 }
 
-/* Reordena a lista pela prioridade e mantem a selecao sobre a nota indicada,
- * para o cursor nao "pular" para outra nota quando a ordem muda. */
-static void notes_resort_keep(const char *keep_path) {
-    if (E.num_notes > 1) {
-        qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_priority);
-    }
-    apply_note_search(E.search_query);
-    if (keep_path && *keep_path) {
-        for (int k = 0; k < E.num_filtered; k++) {
-            if (strcmp(E.notes[E.filtered_indices[k]].filepath, keep_path) == 0) {
-                E.selected_note_idx = k;
-                break;
-            }
-        }
-        if (E.focus == FOCUS_LEFT && E.num_filtered > 0) {
-            load_preview(E.notes[E.filtered_indices[E.selected_note_idx]].filepath);
-        }
-    }
-}
 
 static void toggle_note_attention_at(int actual_idx) {
     if (actual_idx < 0 || actual_idx >= E.num_notes) return;
 
-    /* Guarda identidade e titulo ANTES de reordenar: depois do qsort o indice
-     * actual_idx pode apontar para outra nota. */
-    char keep[512];
-    char titulo[256];
-    safe_strcpy(keep, sizeof(keep), E.notes[actual_idx].filepath);
-    safe_strcpy(titulo, sizeof(titulo), E.notes[actual_idx].title);
-
-    E.notes[actual_idx].attention_level = (E.notes[actual_idx].attention_level + 1) % 4;
+    E.notes[actual_idx].attention_level = (E.notes[actual_idx].attention_level + 1) % 6;
     E.notes[actual_idx].needs_attention = (E.notes[actual_idx].attention_level > 0);
     int nivel = E.notes[actual_idx].attention_level;
-    save_attention_flags();
 
-    /* A lista e exibida por prioridade (1, 2, 3 e depois as demais), entao a
-     * nota marcada muda de grupo imediatamente. */
-    notes_resort_keep(keep);
+    /* Persiste atomicamente no banco exclusivamente esta nota */
+    int id = note_id_from_path(E.notes[actual_idx].filepath);
+    if (id >= 0) db_set_attention(id, nivel);
 
     g_screen_clear_needed = 1;
+    g_needs_redraw = 1;
+    const char *titulo = E.notes[actual_idx].title;
+
     switch (nivel) {
         case 1:
             set_status_msg("🔴 Urgência Nível 1 [Crítica - Vermelho]: %s", titulo);
@@ -2926,6 +2908,12 @@ static void toggle_note_attention_at(int actual_idx) {
             break;
         case 3:
             set_status_msg("🟡 Urgência Nível 3 [Baixa - Amarelo]: %s", titulo);
+            break;
+        case 4:
+            set_status_msg("🔵 Marcação [H - Azul]: %s", titulo);
+            break;
+        case 5:
+            set_status_msg("🟣 Marcação [R - Roxo]: %s", titulo);
             break;
         default:
             set_status_msg("Marcação de urgência removida: %s", titulo);
@@ -3209,6 +3197,12 @@ static void tab_switch(int idx) {
     if (idx < 0 || idx >= E.num_tabs || idx == E.active_tab) return;
     tab_save_active();
     tab_load(idx);
+    for (int i = 0; i < E.num_filtered; i++) {
+        if (strcmp(E.notes[E.filtered_indices[i]].filepath, E.cur_filepath) == 0) {
+            E.selected_note_idx = i;
+            break;
+        }
+    }
     set_status_msg("Aba: %s", E.cur_filename);
 }
 
@@ -3422,6 +3416,12 @@ static void open_note_by_path(const char *path, bool record_history) {
 
     if (record_history) {
         push_history(path);
+    }
+    for (int i = 0; i < E.num_filtered; i++) {
+        if (strcmp(E.notes[E.filtered_indices[i]].filepath, path) == 0) {
+            E.selected_note_idx = i;
+            break;
+        }
     }
     g_screen_clear_needed = 1;
 }
@@ -5366,7 +5366,10 @@ static void render_left_panel(ABuffer *ab, int row) {
             ab_append(ab, TH_BG_SELECT, -1);
             ab_append(ab, get_attention_color(E.filter_urgency), -1);
             ab_append(ab, STYLE_BOLD, -1);
-            const char *lbl = (E.filter_urgency == 1) ? "🔴 NÍVEL 1" : ((E.filter_urgency == 2) ? "🟠 NÍVEL 2" : "🟡 NÍVEL 3");
+            const char *lbl = (E.filter_urgency == 1) ? "🔴 NÍVEL 1" :
+                              ((E.filter_urgency == 2) ? "🟠 NÍVEL 2" :
+                              ((E.filter_urgency == 3) ? "🟡 NÍVEL 3" :
+                              ((E.filter_urgency == 4) ? "🔵 MARCAÇÃO H" : "🟣 MARCAÇÃO R")));
             snprintf(hdr, sizeof(hdr), " %s (%d/%d) ", lbl, E.num_filtered, E.num_notes);
         } else if (E.focus == FOCUS_LEFT) {
             ab_append(ab, TH_BG_SELECT, -1);
@@ -5415,20 +5418,23 @@ static void render_left_panel(ABuffer *ab, int row) {
         int cur_col = 1;
 
         /* Rotulos compactos quando o painel e estreito:
-         *   completo  " [Todas] [1] [2] [3]"   = 20 colunas
-         *   compacto  " [T] [1] [2] [3]"       = 16 colunas
-         * So o botao [Todas] encolhe; [1]/[2]/[3] ja sao minimos. Os limites
-         * (campos _start/_end) sao gravados a partir do rotulo usado, entao o clique
-         * continua correto nos dois modos. */
-        int compacto = (w < 20);
+         *   completo       " [Todas] [1] [2] [3] [H] [R]" = 28 colunas
+         *   compacto       " [T] [1] [2] [3] [H] [R]"     = 24 colunas
+         *   ultra-compacto "[T][1][2][3][H][R]"           = 18 colunas (MIN_LEFT_WIDTH)
+         * Os limites (campos _start/_end) sao gravados a partir do rotulo usado,
+         * entao o clique continua correto em qualquer largura. */
+        int spacing = (w >= 24) ? 1 : 0;
+        int leading = (w >= 24) ? 1 : 0;
+        const char *lbl_all = (w >= 28) ? "[Todas]" : "[T]";
+        int w_all = (w >= 28) ? 7 : 3;
 
-        ab_append(ab, " ", 1);
-        cols_drawn += 1;
-        cur_col += 1;
+        if (leading) {
+            ab_append(ab, " ", 1);
+            cols_drawn += 1;
+            cur_col += 1;
+        }
 
-        /* Button [Todas] / [T] (compacto) */
-        const char *lbl_all = compacto ? "[T]" : "[Todas]";
-        int w_all = compacto ? 3 : 7;
+        /* Button [Todas] / [T] */
         E.btn_filter_all_start = cur_col;
         if (E.filter_urgency == 0) {
             ab_append(ab, TH_BG_SELECT, -1);
@@ -5447,9 +5453,11 @@ static void render_left_panel(ABuffer *ab, int row) {
         cur_col += w_all;
         E.btn_filter_all_end = cur_col;
 
-        ab_append(ab, " ", 1);
-        cols_drawn += 1;
-        cur_col += 1;
+        if (spacing) {
+            ab_append(ab, " ", 1);
+            cols_drawn += 1;
+            cur_col += 1;
+        }
 
         /* Button [1] (Crítico - Vermelho) */
         E.btn_filter_1_start = cur_col;
@@ -5470,9 +5478,11 @@ static void render_left_panel(ABuffer *ab, int row) {
         cur_col += 3;
         E.btn_filter_1_end = cur_col;
 
-        ab_append(ab, " ", 1);
-        cols_drawn += 1;
-        cur_col += 1;
+        if (spacing) {
+            ab_append(ab, " ", 1);
+            cols_drawn += 1;
+            cur_col += 1;
+        }
 
         /* Button [2] (Médio - Laranja) */
         E.btn_filter_2_start = cur_col;
@@ -5493,9 +5503,11 @@ static void render_left_panel(ABuffer *ab, int row) {
         cur_col += 3;
         E.btn_filter_2_end = cur_col;
 
-        ab_append(ab, " ", 1);
-        cols_drawn += 1;
-        cur_col += 1;
+        if (spacing) {
+            ab_append(ab, " ", 1);
+            cols_drawn += 1;
+            cur_col += 1;
+        }
 
         /* Button [3] (Baixo - Amarelo) */
         E.btn_filter_3_start = cur_col;
@@ -5515,6 +5527,56 @@ static void render_left_panel(ABuffer *ab, int row) {
         cols_drawn += 3;
         cur_col += 3;
         E.btn_filter_3_end = cur_col;
+
+        if (spacing) {
+            ab_append(ab, " ", 1);
+            cols_drawn += 1;
+            cur_col += 1;
+        }
+
+        /* Button [H] (Azul) */
+        E.btn_filter_h_start = cur_col;
+        const char *ch = get_attention_color(4);
+        ab_append(ab, ch, -1);
+        ab_append(ab, STYLE_BOLD, -1);
+        if (E.filter_urgency == 4) {
+            ab_append(ab, TH_BG_SELECT, -1);
+            ab_append(ab, "[H]", 3);
+            ab_append(ab, STYLE_RESET, -1);
+            ab_append(ab, TH_BG_SIDEBAR, -1);
+        } else {
+            ab_append(ab, "[H]", 3);
+            ab_append(ab, STYLE_RESET, -1);
+            ab_append(ab, TH_BG_SIDEBAR, -1);
+        }
+        cols_drawn += 3;
+        cur_col += 3;
+        E.btn_filter_h_end = cur_col;
+
+        if (spacing) {
+            ab_append(ab, " ", 1);
+            cols_drawn += 1;
+            cur_col += 1;
+        }
+
+        /* Button [R] (Roxo) */
+        E.btn_filter_r_start = cur_col;
+        const char *cr = get_attention_color(5);
+        ab_append(ab, cr, -1);
+        ab_append(ab, STYLE_BOLD, -1);
+        if (E.filter_urgency == 5) {
+            ab_append(ab, TH_BG_SELECT, -1);
+            ab_append(ab, "[R]", 3);
+            ab_append(ab, STYLE_RESET, -1);
+            ab_append(ab, TH_BG_SIDEBAR, -1);
+        } else {
+            ab_append(ab, "[R]", 3);
+            ab_append(ab, STYLE_RESET, -1);
+            ab_append(ab, TH_BG_SIDEBAR, -1);
+        }
+        cols_drawn += 3;
+        cur_col += 3;
+        E.btn_filter_r_end = cur_col;
 
         while (cols_drawn < w) {
             ab_append(ab, " ", 1);
@@ -5564,7 +5626,12 @@ static void render_left_panel(ABuffer *ab, int row) {
 
         if (n->attention_level > 0) {
             const char *color = get_attention_color(n->attention_level);
-            const char *box = (n->attention_level == 1) ? "[1] " : ((n->attention_level == 2) ? "[2] " : "[3] ");
+            const char *box = "[?] ";
+            if (n->attention_level == 1) box = "[1] ";
+            else if (n->attention_level == 2) box = "[2] ";
+            else if (n->attention_level == 3) box = "[3] ";
+            else if (n->attention_level == 4) box = "[H] ";
+            else if (n->attention_level == 5) box = "[R] ";
             ab_append(ab, color, -1);
             ab_append(ab, STYLE_BOLD, -1);
             ab_append(ab, box, 4);
@@ -7711,6 +7778,24 @@ static void handle_mouse_event(void) {
                     set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
                 return;
             }
+            if (E.mouse_col >= E.btn_filter_h_start && E.mouse_col < E.btn_filter_h_end) {
+                E.filter_urgency = (E.filter_urgency == 4) ? 0 : 4;
+                apply_note_search(E.search_query);
+                if (E.filter_urgency == 4)
+                    set_status_msg("🔵 Filtrando notas com Marcação [H] (Azul): %d encontrada(s)", E.num_filtered);
+                else
+                    set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
+                return;
+            }
+            if (E.mouse_col >= E.btn_filter_r_start && E.mouse_col < E.btn_filter_r_end) {
+                E.filter_urgency = (E.filter_urgency == 5) ? 0 : 5;
+                apply_note_search(E.search_query);
+                if (E.filter_urgency == 5)
+                    set_status_msg("🟣 Filtrando notas com Marcação [R] (Roxo): %d encontrada(s)", E.num_filtered);
+                else
+                    set_status_msg("Filtro de urgência removido (Exibindo todas as %d notas)", E.num_filtered);
+                return;
+            }
             if (E.mouse_col >= E.btn_filter_all_start && E.mouse_col < E.btn_filter_all_end) {
                 E.filter_urgency = 0;
                 apply_note_search(E.search_query);
@@ -7728,28 +7813,31 @@ static void handle_mouse_event(void) {
                 set_status_msg("-- MODO NORMAL --");
             }
             E.focus = FOCUS_LEFT;
-            if (E.mouse_row <= 2) {
-                E.mode = MODE_SEARCH_LEFT;
-                E.search_query[0] = '\0';
-                E.search_cursor = 0;
-                apply_note_search("");
-                if (E.num_filtered > 0) {
-                    int actual = E.filtered_indices[E.selected_note_idx];
-                    load_preview(E.notes[actual].filepath);
-                } else {
-                    free_preview();
+            if (E.mouse_row <= 3) {
+                if (E.mouse_row == 2) {
+                    E.mode = MODE_SEARCH_LEFT;
+                    E.search_query[0] = '\0';
+                    E.search_cursor = 0;
+                    apply_note_search("");
+                    if (E.num_filtered > 0) {
+                        int actual = E.filtered_indices[E.selected_note_idx];
+                        load_preview(E.notes[actual].filepath);
+                    } else {
+                        free_preview();
+                    }
+                    set_status_msg("Busca de notas (digite o termo, Enter para abrir)");
                 }
-                set_status_msg("Busca de notas (digite o termo, Enter para abrir)");
                 return;
             }
-
 
             int clicked_note = (E.mouse_row - 4) + E.sidebar_scroll_y;
             if (clicked_note >= 0 && clicked_note < E.num_filtered) {
                 E.selected_note_idx = clicked_note;
                 int actual = E.filtered_indices[clicked_note];
-                /* Clicked on checkbox [ ] / [!] (cols 1 to 6) */
-                if (E.mouse_col >= 1 && E.mouse_col <= 6) {
+                /* Clicked on checkbox [ ] / [!] / [H] / [R] (cols 1 to 5) */
+                if (E.mouse_col >= 1 && E.mouse_col <= 5) {
+                    g_last_clicked_note_idx = -1;
+                    g_last_note_click_time = 0;
                     toggle_note_attention_at(actual);
                     return;
                 }
@@ -8007,21 +8095,25 @@ static void execute_bottom_command(const char *cmd) {
         rescan_notes();
         set_status_msg("Notas atualizadas (%d encontradas)", E.num_notes);
     } else if (strncmp(cmd, "filter", 6) == 0 || strncmp(cmd, "filtro", 6) == 0) {
-        /* Filter notes by urgency level 1, 2, 3 or 0 (all) */
+        /* Filter notes by urgency level 1, 2, 3, 4(H), 5(R) or 0 (all) */
         const char *arg = strchr(cmd, ' ');
         if (arg) {
             while (*arg == ' ') arg++;
             if (*arg == '1') E.filter_urgency = 1;
             else if (*arg == '2') E.filter_urgency = 2;
             else if (*arg == '3') E.filter_urgency = 3;
+            else if (*arg == '4' || *arg == 'h' || *arg == 'H') E.filter_urgency = 4;
+            else if (*arg == '5' || *arg == 'r' || *arg == 'R') E.filter_urgency = 5;
             else E.filter_urgency = 0;
         } else {
-            E.filter_urgency = (E.filter_urgency + 1) % 4;
+            E.filter_urgency = (E.filter_urgency + 1) % 6;
         }
         apply_note_search(E.search_query);
         if (E.filter_urgency == 1) set_status_msg("🔴 Filtrando Nível 1 (Vermelho): %d nota(s)", E.num_filtered);
         else if (E.filter_urgency == 2) set_status_msg("🟠 Filtrando Nível 2 (Laranja): %d nota(s)", E.num_filtered);
         else if (E.filter_urgency == 3) set_status_msg("🟡 Filtrando Nível 3 (Amarelo): %d nota(s)", E.num_filtered);
+        else if (E.filter_urgency == 4) set_status_msg("🔵 Filtrando Marcação [H] (Azul): %d nota(s)", E.num_filtered);
+        else if (E.filter_urgency == 5) set_status_msg("🟣 Filtrando Marcação [R] (Roxo): %d nota(s)", E.num_filtered);
         else set_status_msg("Filtro removido: exibindo todas as %d notas", E.num_filtered);
     } else if (strncmp(cmd, "atencao", 7) == 0 || strncmp(cmd, "attention", 9) == 0 || strncmp(cmd, "mark", 4) == 0) {
         /* Toggle or set specific attention level for current note */
@@ -8030,6 +8122,8 @@ static void execute_bottom_command(const char *cmd) {
         if (arg) {
             while (*arg == ' ') arg++;
             if (*arg >= '0' && *arg <= '3') target_level = *arg - '0';
+            else if (*arg == '4' || *arg == 'h' || *arg == 'H') target_level = 4;
+            else if (*arg == '5' || *arg == 'r' || *arg == 'R') target_level = 5;
         }
         for (int i = 0; i < E.num_notes; i++) {
             if (strcmp(E.notes[i].filepath, E.cur_filepath) == 0) {
@@ -8042,6 +8136,8 @@ static void execute_bottom_command(const char *cmd) {
                         case 1: set_status_msg("🔴 Urgência Nível 1 [Crítica - Vermelho]: %s", E.notes[i].title); break;
                         case 2: set_status_msg("🟠 Urgência Nível 2 [Média - Laranja]: %s", E.notes[i].title); break;
                         case 3: set_status_msg("🟡 Urgência Nível 3 [Baixa - Amarelo]: %s", E.notes[i].title); break;
+                        case 4: set_status_msg("🔵 Marcação [H - Azul]: %s", E.notes[i].title); break;
+                        case 5: set_status_msg("🟣 Marcação [R - Roxo]: %s", E.notes[i].title); break;
                         default: set_status_msg("Marcação de urgência removida: %s", E.notes[i].title); break;
                     }
                 } else {
@@ -8938,6 +9034,24 @@ static void editor_process_keypress(void) {
                 set_status_msg("Filtro removido: exibindo todas as %d notas", E.num_filtered);
             return;
         }
+        if (c == '4' || c == 'H') {
+            E.filter_urgency = (E.filter_urgency == 4) ? 0 : 4;
+            apply_note_search(E.search_query);
+            if (E.filter_urgency == 4)
+                set_status_msg("🔵 Filtrando notas com Marcação [H] (Azul): %d encontrada(s)", E.num_filtered);
+            else
+                set_status_msg("Filtro removido: exibindo todas as %d notas", E.num_filtered);
+            return;
+        }
+        if (c == '5') {
+            E.filter_urgency = (E.filter_urgency == 5) ? 0 : 5;
+            apply_note_search(E.search_query);
+            if (E.filter_urgency == 5)
+                set_status_msg("🟣 Filtrando notas com Marcação [R] (Roxo): %d encontrada(s)", E.num_filtered);
+            else
+                set_status_msg("Filtro removido: exibindo todas as %d notas", E.num_filtered);
+            return;
+        }
         if (c == '0') {
             E.filter_urgency = 0;
             apply_note_search(E.search_query);
@@ -9740,6 +9854,19 @@ static void editor_process_keypress(void) {
             set_status_msg("-- MODO NORMAL --");
             return;
         }
+    }
+
+    /* Toggle urgency / attention of current note (m or !) */
+    if (c == 'm' || c == '!') {
+        if (E.cur_filepath[0]) {
+            for (int i = 0; i < E.num_notes; i++) {
+                if (strcmp(E.notes[i].filepath, E.cur_filepath) == 0) {
+                    toggle_note_attention_at(i);
+                    break;
+                }
+            }
+        }
+        return;
     }
 
     /* Delete character under cursor (x) or visual selection (x) */
