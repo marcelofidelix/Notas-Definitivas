@@ -74,7 +74,7 @@ Os limites de clique do mouse são recalculados dinamicamente a partir do layout
   - **Colar do Sistema com `p` ou `P`**: Ao copiar textos em navegadores, Word, Bloco de Notas ou qualquer outro programa no Windows com `Ctrl+C`, pressionar **`p`** ou **`P`** no editor cola instantaneamente o conteúdo da área de transferência do Windows para a sua nota.
   - **Fidelidade Total a Acentos (`CF_UNICODETEXT`)**: A leitura do clipboard converte UTF-16 diretamente para UTF-8, garantindo que acentuação em português (`ç`, `ã`, `é`, `ó`, etc.) e caracteres especiais sejam colados perfeitamente.
   - **Colar no Modo Inserção com `Ctrl+V`**: Atalho `Ctrl+V` habilitado diretamente no Modo Inserção para colar da área de transferência do sistema operacional sem precisar voltar ao Modo Normal.
-  - **Substituição em Seleção**: No Modo Visual, pressionar `p` substitui a seleção atual pelo texto do clipboard do sistema.
+  - **Substituição em Seleção com 'y' e 'p'**: Quando um texto estiver selecionado (via Modo Visual, Shift+Setas ou Mouse no Modo Normal), pressionar **`y`** ou **`p`** cola o texto da área de transferência substituindo imediatamente a seleção ativa, sem sobrescrever o clipboard. No Modo Normal sem seleção, `y` ou `yy` continua copiando a linha.
 
 ---
 

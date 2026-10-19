@@ -698,7 +698,9 @@ static void open_link_target(const char *target);
 static void editor_scroll(void);
 static void jump_to_next_link(void);
 static void yank_visual_selection(bool linewise);
+static void delete_visual_selection_ex(bool do_yank);
 static void delete_visual_selection(void);
+static void paste_replace_selection(void);
 static void table_align_all(void);
 static bool table_align_at(int line_idx);
 static void table_jump_next_cell(bool create_if_at_end);
@@ -1830,6 +1832,16 @@ static void editor_paste_string(const char *text, int len) {
         E.prompt_buf[plen] = '\0';
         return;
     }
+
+    if (E.num_lines <= 0) {
+        buf_insert_line(0, "", 0);
+        E.cursor_y = 0;
+        E.cursor_x = 0;
+    }
+    if (E.cursor_y >= E.num_lines) E.cursor_y = E.num_lines - 1;
+    if (E.cursor_y < 0) E.cursor_y = 0;
+    if (E.cursor_x > E.lines[E.cursor_y].len) E.cursor_x = E.lines[E.cursor_y].len;
+    if (E.cursor_x < 0) E.cursor_x = 0;
 
     save_undo();
 
@@ -4194,12 +4206,14 @@ static void yank_visual_selection(bool linewise) {
     copy_to_system_clipboard(E.yank_buf, yb.len);
 }
 
-static void delete_visual_selection(void) {
+static void delete_visual_selection_ex(bool do_yank) {
     if (E.num_lines <= 0) return;
     bool linewise = (E.mode == MODE_VISUAL_LINE);
 
-    /* 1. Yank selection first so it is copied to E.yank_buf and clipboard */
-    yank_visual_selection(linewise);
+    /* 1. Yank selection first only if requested (e.g. cut/delete, but not paste-replace) */
+    if (do_yank) {
+        yank_visual_selection(linewise);
+    }
 
     /* 2. Save undo snapshot */
     save_undo();
@@ -4303,6 +4317,58 @@ static void delete_visual_selection(void) {
     if (E.mode != MODE_INSERT) {
         E.mode = MODE_NORMAL;
     }
+}
+
+static void delete_visual_selection(void) {
+    delete_visual_selection_ex(true);
+}
+
+/* Pastes text from clipboard/yank buffer directly replacing the active selection */
+static void paste_replace_selection(void) {
+    /* 1. Try to read fresh content from system clipboard */
+    int clip_len = 0;
+    char *clip_text = get_system_clipboard(&clip_len);
+    const char *source_text = NULL;
+
+    if (clip_text && clip_len > 0) {
+        source_text = clip_text;
+    } else if (E.yank_buf && *E.yank_buf) {
+        source_text = E.yank_buf;
+    }
+
+    if (!source_text || !*source_text) {
+        if (clip_text) free(clip_text);
+        set_status_msg("Área de transferência vazia para colar.");
+        return;
+    }
+
+    /* Keep a dedicated copy to paste so buffer modifications are safe */
+    char *paste_copy = strdup(source_text);
+    if (clip_text) free(clip_text);
+
+    if (!paste_copy) {
+        set_status_msg("Erro de memória ao colar.");
+        return;
+    }
+
+    /* Keep E.yank_buf synchronized */
+    if (!E.yank_buf || strcmp(E.yank_buf, paste_copy) != 0) {
+        if (E.yank_buf) free(E.yank_buf);
+        E.yank_buf = strdup(paste_copy);
+        E.yank_is_linewise = (strchr(paste_copy, '\n') != NULL);
+    }
+
+    /* 2. Delete selection without overwriting clipboard/yank buffer */
+    delete_visual_selection_ex(false);
+    E.mode = MODE_NORMAL;
+    E.has_selection = false;
+
+    /* 3. Paste at cursor position (where deleted selection was) */
+    editor_paste_string(paste_copy, (int)strlen(paste_copy));
+    free(paste_copy);
+
+    editor_scroll();
+    set_status_msg("Texto colado sobre a seleção com 'y'.");
 }
 
 static void jump_to_next_link(void) {
@@ -8036,17 +8102,15 @@ static void handle_mouse_event(void) {
         }
     }
 
-    /* Mouse Release: Finish selection & copy to clipboard */
+    /* Mouse Release: Finish selection */
     if (E.mouse_released) {
         if (E.mode == MODE_VISUAL_CHAR) {
             if (E.visual_start_y != E.cursor_y || E.visual_start_x != E.cursor_x) {
-                yank_visual_selection(false);
-                set_status_msg("Texto selecionado e copiado! (y: copiar | d/x: recortar/excluir | Esc: cancelar)");
+                set_status_msg("Texto selecionado! (y/p: colar e substituir | Ctrl+C: copiar | d/x: excluir | Esc: cancelar)");
             }
         } else if (E.mode == MODE_INSERT && E.has_selection) {
             if (E.visual_start_y != E.cursor_y || E.visual_start_x != E.cursor_x) {
-                yank_visual_selection(false);
-                set_status_msg("Texto selecionado e copiado para a área de transferência! (Modo Inserção)");
+                set_status_msg("Texto selecionado! (Ctrl+V: colar e substituir | Ctrl+C: copiar | Esc: cancelar)");
             }
         }
         return;
@@ -9226,16 +9290,16 @@ static void editor_process_keypress(void) {
 
         /* Ctrl+V (22): Paste from system clipboard in Insert Mode */
         if (c == 22) {
-            if (E.has_selection) {
-                delete_visual_selection();
-                E.has_selection = false;
-            }
             int clip_len = 0;
             char *clip_text = get_system_clipboard(&clip_len);
             if (clip_text && clip_len > 0) {
                 if (E.yank_buf) free(E.yank_buf);
                 E.yank_buf = clip_text;
                 E.yank_is_linewise = (strchr(clip_text, '\n') != NULL);
+            }
+            if (E.has_selection) {
+                delete_visual_selection_ex(false);
+                E.has_selection = false;
             }
             if (E.yank_buf && *E.yank_buf) {
                 editor_paste_string(E.yank_buf, (int)strlen(E.yank_buf));
@@ -9990,15 +10054,13 @@ static void editor_process_keypress(void) {
         return;
     }
 
-    /* Yank (y, yy or Y) - System Clipboard Sharing (Requirement 23) */
+    /* Yank / Paste Replace with 'y' or 'Y' */
     if (c == 'y' || c == 'Y') {
-        if (E.mode == MODE_VISUAL_LINE || E.mode == MODE_VISUAL_CHAR) {
-            yank_visual_selection(E.mode == MODE_VISUAL_LINE);
-            E.mode = MODE_NORMAL;
-            set_status_msg("Seleção copiada para a área de transferência");
+        if (E.mode == MODE_VISUAL_LINE || E.mode == MODE_VISUAL_CHAR || E.has_selection) {
+            paste_replace_selection();
             return;
         }
-        /* In Normal mode, pressing 'y' or 'Y' copies the current line immediately.
+        /* In Normal mode without selection, pressing 'y' or 'Y' copies the current line immediately.
          * If the user types 'yy', the first 'y' copies the line,
          * and the second 'y' also confirms copying without waiting or blocking! */
         if (E.cursor_y >= 0 && E.cursor_y < E.num_lines) {
@@ -10013,9 +10075,9 @@ static void editor_process_keypress(void) {
 
     /* Paste (p or P) - System Clipboard Synchronized (Requirement 23 & Windows compatibility) */
     if (c == 'p' || c == 'P') {
-        if (E.mode == MODE_VISUAL_CHAR || E.mode == MODE_VISUAL_LINE) {
-            delete_visual_selection();
-            E.mode = MODE_NORMAL;
+        if (E.mode == MODE_VISUAL_CHAR || E.mode == MODE_VISUAL_LINE || E.has_selection) {
+            paste_replace_selection();
+            return;
         }
 
         /* 1. Try to read fresh content from system clipboard */

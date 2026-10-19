@@ -908,9 +908,14 @@ Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base at
 - **Descrição**: Copia (yank) o texto selecionado no Modo Visual para a área de transferência do editor e do sistema.
 - **Retorno**: `static void`
 
-### 7.119 `delete_visual_selection` (Linha 4164)
-- **Protótipo**: `static void delete_visual_selection(void)`
-- **Descrição**: Remove o texto selecionado no Modo Visual e o envia para o buffer de corte.
+### 7.119 `delete_visual_selection` e `delete_visual_selection_ex`
+- **Protótipo**: `static void delete_visual_selection(void)` / `static void delete_visual_selection_ex(bool do_yank)`
+- **Descrição**: Remove o texto selecionado no Modo Visual. O parâmetro `do_yank` define se a seleção removida deve sobrescrever o buffer de cópia (para operações de corte/delete) ou preservá-lo intacto (para operações de colagem/substituição).
+- **Retorno**: `static void`
+
+### 7.119b `paste_replace_selection`
+- **Protótipo**: `static void paste_replace_selection(void)`
+- **Descrição**: Substitui a seleção ativa (Modo Visual, Shift+Setas ou Mouse no Modo Normal) pelo conteúdo da área de transferência com os atalhos `'y'` ou `'p'`, sem perda do texto a ser colado.
 - **Retorno**: `static void`
 
 ### 7.120 `jump_to_next_link` (Linha 4275)
