@@ -4368,7 +4368,7 @@ static void paste_replace_selection(void) {
     free(paste_copy);
 
     editor_scroll();
-    set_status_msg("Texto colado sobre a seleção com 'y'.");
+    set_status_msg("Texto colado sobre a seleção com 'p'.");
 }
 
 static void jump_to_next_link(void) {
@@ -8106,7 +8106,7 @@ static void handle_mouse_event(void) {
     if (E.mouse_released) {
         if (E.mode == MODE_VISUAL_CHAR) {
             if (E.visual_start_y != E.cursor_y || E.visual_start_x != E.cursor_x) {
-                set_status_msg("Texto selecionado! (y/p: colar e substituir | Ctrl+C: copiar | d/x: excluir | Esc: cancelar)");
+                set_status_msg("Texto selecionado! (y: copiar | p: colar/substituir | x: recortar | Esc: cancelar)");
             }
         } else if (E.mode == MODE_INSERT && E.has_selection) {
             if (E.visual_start_y != E.cursor_y || E.visual_start_x != E.cursor_x) {
@@ -10018,17 +10018,36 @@ static void editor_process_keypress(void) {
         return;
     }
 
-    /* Delete character under cursor (x) or visual selection (x) */
+    /* Cut character under cursor (x) or visual selection (x) - like Neovim */
     if (c == 'x') {
-        if (E.mode == MODE_VISUAL_LINE || E.mode == MODE_VISUAL_CHAR) {
+        if (E.mode == MODE_VISUAL_LINE || E.mode == MODE_VISUAL_CHAR || E.has_selection) {
             delete_visual_selection();
+            E.mode = MODE_NORMAL;
+            E.has_selection = false;
+            set_status_msg("Texto selecionado recortado para a área de transferência! (x)");
             return;
         }
         Line *cur = &E.lines[E.cursor_y];
-        if (cur->len > 0) {
+        if (cur->len > 0 && E.cursor_x < cur->len) {
             save_undo();
+            int bytes_under_cursor = 1;
+            utf8_decode_codepoint(&cur->chars[E.cursor_x], &bytes_under_cursor);
+            if (bytes_under_cursor <= 0) bytes_under_cursor = 1;
+            if (E.cursor_x + bytes_under_cursor > cur->len) bytes_under_cursor = cur->len - E.cursor_x;
+
+            /* Cut character to yank_buf and system clipboard */
+            if (E.yank_buf) free(E.yank_buf);
+            E.yank_buf = (char *)malloc(bytes_under_cursor + 1);
+            if (E.yank_buf) {
+                memcpy(E.yank_buf, &cur->chars[E.cursor_x], bytes_under_cursor);
+                E.yank_buf[bytes_under_cursor] = '\0';
+                E.yank_is_linewise = false;
+                copy_to_system_clipboard(E.yank_buf, bytes_under_cursor);
+            }
+
             line_delete_char(cur, E.cursor_x);
             if (E.cursor_x >= cur->len && E.cursor_x > 0) E.cursor_x--;
+            set_status_msg("Caractere recortado para a área de transferência (x)");
         }
         return;
     }
@@ -10054,10 +10073,13 @@ static void editor_process_keypress(void) {
         return;
     }
 
-    /* Yank / Paste Replace with 'y' or 'Y' */
+    /* Yank (y, yy or Y) - System Clipboard Sharing (like Neovim) */
     if (c == 'y' || c == 'Y') {
         if (E.mode == MODE_VISUAL_LINE || E.mode == MODE_VISUAL_CHAR || E.has_selection) {
-            paste_replace_selection();
+            yank_visual_selection(E.mode == MODE_VISUAL_LINE);
+            E.mode = MODE_NORMAL;
+            E.has_selection = false;
+            set_status_msg("Texto selecionado copiado para a área de transferência! (y)");
             return;
         }
         /* In Normal mode without selection, pressing 'y' or 'Y' copies the current line immediately.
@@ -10068,7 +10090,7 @@ static void editor_process_keypress(void) {
             E.yank_buf = strdup(E.lines[E.cursor_y].chars ? E.lines[E.cursor_y].chars : "");
             E.yank_is_linewise = true;
             copy_to_system_clipboard(E.yank_buf, (int)strlen(E.yank_buf));
-            set_status_msg("1 linha copiada para a área de transferência");
+            set_status_msg("1 linha copiada para a área de transferência (y)");
         }
         return;
     }
