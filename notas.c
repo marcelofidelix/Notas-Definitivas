@@ -1719,8 +1719,11 @@ static void mark_modified(void) {
 static void buf_insert_line(int at, const char *s, int len) {
     if (at < 0 || at > E.num_lines) return;
     if (E.num_lines + 1 > E.cap_lines) {
-        E.cap_lines = E.cap_lines ? E.cap_lines * 2 : 32;
-        E.lines = (Line *)realloc(E.lines, sizeof(Line) * E.cap_lines);
+        int new_cap = E.cap_lines ? E.cap_lines * 2 : 32;
+        Line *new_lines = (Line *)realloc(E.lines, sizeof(Line) * new_cap);
+        if (!new_lines) return;
+        E.lines = new_lines;
+        E.cap_lines = new_cap;
     }
     memmove(&E.lines[at + 1], &E.lines[at], sizeof(Line) * (E.num_lines - at));
     line_init(&E.lines[at], s, len);
@@ -1743,7 +1746,9 @@ static void buf_delete_line(int at) {
 
 static void line_insert_char(Line *l, int at, char c) {
     if (at < 0 || at > l->len) at = l->len;
-    l->chars = (char *)realloc(l->chars, l->len + 2);
+    char *nc = (char *)realloc(l->chars, l->len + 2);
+    if (!nc) return;
+    l->chars = nc;
     memmove(&l->chars[at + 1], &l->chars[at], l->len - at + 1);
     l->chars[at] = c;
     l->len++;
@@ -1766,7 +1771,9 @@ static void line_replace_range(Line *l, int at, int del_len, const char *new_str
     if (at + del_len > l->len) del_len = l->len - at;
     int diff = new_len - del_len;
     if (diff > 0) {
-        l->chars = (char *)realloc(l->chars, l->len + diff + 1);
+        char *nc = (char *)realloc(l->chars, l->len + diff + 1);
+        if (!nc) return;
+        l->chars = nc;
     }
     memmove(&l->chars[at + new_len], &l->chars[at + del_len], l->len - (at + del_len) + 1);
     if (new_len > 0 && new_str) {
@@ -1774,7 +1781,8 @@ static void line_replace_range(Line *l, int at, int del_len, const char *new_str
     }
     l->len += diff;
     if (diff < 0) {
-        l->chars = (char *)realloc(l->chars, l->len + 1);
+        char *nc = (char *)realloc(l->chars, l->len + 1);
+        if (nc) l->chars = nc;
     }
     l->chars[l->len] = '\0';
     detect_heading(l);
@@ -1783,7 +1791,9 @@ static void line_replace_range(Line *l, int at, int del_len, const char *new_str
 
 static void line_append_string(Line *l, const char *s, int len) {
     if (len <= 0) return;
-    l->chars = (char *)realloc(l->chars, l->len + len + 1);
+    char *nc = (char *)realloc(l->chars, l->len + len + 1);
+    if (!nc) return;
+    l->chars = nc;
     memcpy(&l->chars[l->len], s, len);
     l->len += len;
     l->chars[l->len] = '\0';
@@ -1855,7 +1865,9 @@ static void editor_paste_string(const char *text, int len) {
 
         if (chunk_len > 0) {
             Line *cur = &E.lines[E.cursor_y];
-            cur->chars = (char *)realloc(cur->chars, cur->len + chunk_len + 1);
+            char *nc = (char *)realloc(cur->chars, cur->len + chunk_len + 1);
+            if (!nc) break;
+            cur->chars = nc;
             memmove(&cur->chars[E.cursor_x + chunk_len], &cur->chars[E.cursor_x], cur->len - E.cursor_x + 1);
             memcpy(&cur->chars[E.cursor_x], &text[start], chunk_len);
             cur->len += chunk_len;
@@ -2994,8 +3006,11 @@ static void rescan_notes(void) {
                 if (!nm || !*nm) continue;
 
                 if (E.num_notes >= cap) {
-                    cap *= 2;
-                    E.notes = (NoteInfo *)realloc(E.notes, sizeof(NoteInfo) * cap);
+                    int new_cap = cap * 2;
+                    NoteInfo *new_notes = (NoteInfo *)realloc(E.notes, sizeof(NoteInfo) * new_cap);
+                    if (!new_notes) break;
+                    E.notes = new_notes;
+                    cap = new_cap;
                 }
                 NoteInfo *n = &E.notes[E.num_notes++];
                 memset(n, 0, sizeof(NoteInfo));
@@ -3167,8 +3182,11 @@ static void load_preview(const char *path) {
         int linelen = nl ? (int)(nl - p) : (int)strlen(p);
         while (linelen > 0 && p[linelen - 1] == '\r') linelen--;
         if (g_preview.num_lines >= g_preview.cap_lines) {
-            g_preview.cap_lines = g_preview.cap_lines ? g_preview.cap_lines * 2 : 32;
-            g_preview.lines = (Line *)realloc(g_preview.lines, sizeof(Line) * g_preview.cap_lines);
+            int new_cap = g_preview.cap_lines ? g_preview.cap_lines * 2 : 32;
+            Line *new_lines = (Line *)realloc(g_preview.lines, sizeof(Line) * new_cap);
+            if (!new_lines) break;
+            g_preview.lines = new_lines;
+            g_preview.cap_lines = new_cap;
         }
         Line *l = &g_preview.lines[g_preview.num_lines++];
         line_init(l, p, linelen);
@@ -3396,8 +3414,11 @@ static void open_note_by_path(const char *path, bool record_history) {
     tab_save_active();
 
     if (E.num_tabs >= E.cap_tabs) {
-        E.cap_tabs = E.cap_tabs ? E.cap_tabs * 2 : 8;
-        E.tabs = (Tab *)realloc(E.tabs, sizeof(Tab) * E.cap_tabs);
+        int new_cap = E.cap_tabs ? E.cap_tabs * 2 : 8;
+        Tab *new_tabs = (Tab *)realloc(E.tabs, sizeof(Tab) * new_cap);
+        if (!new_tabs) return;
+        E.tabs = new_tabs;
+        E.cap_tabs = new_cap;
     }
     int new_idx = E.num_tabs++;
     Tab *nt = &E.tabs[new_idx];
@@ -4586,73 +4607,67 @@ static void align_table_lines(Line *lines, int start_y, int end_y) {
     }
 
     for (int r = 0; r < num_rows; r++) {
-        char buf[2048];
-        int bpos = 0;
+        ABuffer row_ab;
+        ab_init(&row_ab);
 
-        for (int i = 0; i < base_indent && bpos < 2000; i++) {
-            buf[bpos++] = ' ';
+        for (int i = 0; i < base_indent && i < 2000; i++) {
+            ab_append(&row_ab, " ", 1);
         }
 
         if (rows[r].is_delim) {
             for (int c = 0; c < max_cols; c++) {
-                buf[bpos++] = '|';
-                buf[bpos++] = ' ';
+                ab_append(&row_ab, "| ", 2);
                 int w = col_widths[c];
                 enum ColAlign al = col_aligns[c];
                 if (al == ALIGN_CENTER) {
-                    buf[bpos++] = ':';
-                    for (int k = 0; k < w - 2; k++) buf[bpos++] = '-';
-                    buf[bpos++] = ':';
+                    ab_append(&row_ab, ":", 1);
+                    for (int k = 0; k < w - 2; k++) ab_append(&row_ab, "-", 1);
+                    ab_append(&row_ab, ":", 1);
                 } else if (al == ALIGN_RIGHT) {
-                    for (int k = 0; k < w - 1; k++) buf[bpos++] = '-';
-                    buf[bpos++] = ':';
+                    for (int k = 0; k < w - 1; k++) ab_append(&row_ab, "-", 1);
+                    ab_append(&row_ab, ":", 1);
                 } else if (al == ALIGN_LEFT) {
-                    buf[bpos++] = ':';
-                    for (int k = 0; k < w - 1; k++) buf[bpos++] = '-';
+                    ab_append(&row_ab, ":", 1);
+                    for (int k = 0; k < w - 1; k++) ab_append(&row_ab, "-", 1);
                 } else {
-                    for (int k = 0; k < w; k++) buf[bpos++] = '-';
+                    for (int k = 0; k < w; k++) ab_append(&row_ab, "-", 1);
                 }
-                buf[bpos++] = ' ';
+                ab_append(&row_ab, " ", 1);
             }
-            buf[bpos++] = '|';
+            ab_append(&row_ab, "|", 1);
         } else {
             for (int c = 0; c < max_cols; c++) {
-                buf[bpos++] = '|';
-                buf[bpos++] = ' ';
+                ab_append(&row_ab, "| ", 2);
                 const char *cell_text = (c < rows[r].num_cells) ? rows[r].cells[c] : "";
                 int w = utf8_width(cell_text);
                 int pad = col_widths[c] - w;
                 if (pad < 0) pad = 0;
+                int tlen = (int)strlen(cell_text);
 
                 enum ColAlign al = col_aligns[c];
                 if (al == ALIGN_RIGHT) {
-                    for (int k = 0; k < pad; k++) buf[bpos++] = ' ';
-                    int tlen = (int)strlen(cell_text);
-                    memcpy(&buf[bpos], cell_text, tlen);
-                    bpos += tlen;
+                    for (int k = 0; k < pad; k++) ab_append(&row_ab, " ", 1);
+                    if (tlen > 0) ab_append(&row_ab, cell_text, tlen);
                 } else if (al == ALIGN_CENTER) {
                     int pad_left = pad / 2;
                     int pad_right = pad - pad_left;
-                    for (int k = 0; k < pad_left; k++) buf[bpos++] = ' ';
-                    int tlen = (int)strlen(cell_text);
-                    memcpy(&buf[bpos], cell_text, tlen);
-                    bpos += tlen;
-                    for (int k = 0; k < pad_right; k++) buf[bpos++] = ' ';
+                    for (int k = 0; k < pad_left; k++) ab_append(&row_ab, " ", 1);
+                    if (tlen > 0) ab_append(&row_ab, cell_text, tlen);
+                    for (int k = 0; k < pad_right; k++) ab_append(&row_ab, " ", 1);
                 } else {
-                    int tlen = (int)strlen(cell_text);
-                    memcpy(&buf[bpos], cell_text, tlen);
-                    bpos += tlen;
-                    for (int k = 0; k < pad; k++) buf[bpos++] = ' ';
+                    if (tlen > 0) ab_append(&row_ab, cell_text, tlen);
+                    for (int k = 0; k < pad; k++) ab_append(&row_ab, " ", 1);
                 }
-                buf[bpos++] = ' ';
+                ab_append(&row_ab, " ", 1);
             }
-            buf[bpos++] = '|';
+            ab_append(&row_ab, "|", 1);
         }
-        buf[bpos] = '\0';
 
-        free(lines[start_y + r].chars);
-        lines[start_y + r].chars = strdup(buf);
-        lines[start_y + r].len = bpos;
+        if (row_ab.b) {
+            free(lines[start_y + r].chars);
+            lines[start_y + r].chars = row_ab.b;
+            lines[start_y + r].len = row_ab.len;
+        }
     }
 
     for (int r = 0; r < num_rows; r++) {
@@ -7441,6 +7456,7 @@ static int editor_read_key(void) {
                         /* Start of Bracketed Paste */
                         int cap = 8192;
                         char *pbuf = (char *)malloc(cap);
+                        if (!pbuf) return -1;
                         int plen = 0;
                         while (1) {
                             int b = read_raw_byte(200);
@@ -7455,7 +7471,13 @@ static int editor_read_key(void) {
                                     if (b2 == '2' && b3 == '0' && b4 == '1' && b5 == '~') {
                                         break; /* End of Bracketed Paste */
                                     }
-                                    if (plen + 6 >= cap) { cap *= 2; pbuf = (char *)realloc(pbuf, cap); }
+                                    if (plen + 6 >= cap) {
+                                        int new_cap = cap * 2;
+                                        char *np = (char *)realloc(pbuf, new_cap);
+                                        if (!np) break;
+                                        pbuf = np;
+                                        cap = new_cap;
+                                    }
                                     pbuf[plen++] = '\x1b';
                                     if (b1 != -1) pbuf[plen++] = (char)b1;
                                     if (b2 != -1) pbuf[plen++] = (char)b2;
@@ -7464,15 +7486,24 @@ static int editor_read_key(void) {
                                     if (b5 != -1) pbuf[plen++] = (char)b5;
                                     continue;
                                 } else if (b1 != -1) {
-                                    if (plen + 2 >= cap) { cap *= 2; pbuf = (char *)realloc(pbuf, cap); }
+                                    if (plen + 2 >= cap) {
+                                        int new_cap = cap * 2;
+                                        char *np = (char *)realloc(pbuf, new_cap);
+                                        if (!np) break;
+                                        pbuf = np;
+                                        cap = new_cap;
+                                    }
                                     pbuf[plen++] = '\x1b';
                                     pbuf[plen++] = (char)b1;
                                     continue;
                                 }
                             }
                             if (plen + 2 >= cap) {
-                                cap *= 2;
-                                pbuf = (char *)realloc(pbuf, cap);
+                                int new_cap = cap * 2;
+                                char *np = (char *)realloc(pbuf, new_cap);
+                                if (!np) break;
+                                pbuf = np;
+                                cap = new_cap;
                             }
                             pbuf[plen++] = (char)b;
                         }
@@ -9296,6 +9327,8 @@ static void editor_process_keypress(void) {
                 if (E.yank_buf) free(E.yank_buf);
                 E.yank_buf = clip_text;
                 E.yank_is_linewise = (strchr(clip_text, '\n') != NULL);
+            } else if (clip_text) {
+                free(clip_text);
             }
             if (E.has_selection) {
                 delete_visual_selection_ex(false);
@@ -10109,6 +10142,8 @@ static void editor_process_keypress(void) {
             if (E.yank_buf) free(E.yank_buf);
             E.yank_buf = clip_text;
             E.yank_is_linewise = (strchr(clip_text, '\n') != NULL);
+        } else if (clip_text) {
+            free(clip_text);
         }
 
         /* 2. Paste yank_buf if available */
