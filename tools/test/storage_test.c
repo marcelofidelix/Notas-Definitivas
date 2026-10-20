@@ -45,6 +45,31 @@ int main(int argc, char **argv) {
     }), "");
     chk("id extraido do caminho virtual", note_id_from_path("db:42") == 42, "");
     chk("caminho real nao e confundido com virtual", note_id_from_path("data/x.md") < 0, "");
+    chk("id 0/invalido e rejeitado", note_id_from_path("db:0") < 0, "");
+    chk("id com lixo e rejeitado", note_id_from_path("db:12lixo") < 0, "");
+    chk("id negativo e rejeitado", note_id_from_path("db:-1") < 0, "");
+
+    {
+        char *b64a = base64_encode((const unsigned char *)"a", 1);
+        char *b64ab = base64_encode((const unsigned char *)"ab", 2);
+        char *b64abc = base64_encode((const unsigned char *)"abc", 3);
+        chk("base64 de 1 byte tem padding correto", b64a && strcmp(b64a, "YQ==") == 0, b64a ? b64a : "(nulo)");
+        chk("base64 de 2 bytes tem padding correto", b64ab && strcmp(b64ab, "YWI=") == 0, b64ab ? b64ab : "(nulo)");
+        chk("base64 de 3 bytes nao tem padding", b64abc && strcmp(b64abc, "YWJj") == 0, b64abc ? b64abc : "(nulo)");
+        free(b64a); free(b64ab); free(b64abc);
+    }
+
+    {
+        const char *tmpname = "atomic_write_test.txt";
+        const char *payload = "linha 1\nlinha 2\n";
+        chk("escrita atomica de arquivo", write_file_atomic(tmpname, payload, (long)strlen(payload)), "");
+        long rlen = 0;
+        char *rd = read_entire_file(tmpname, &rlen);
+        chk("conteudo gravado de forma atomica", rd && rlen == (long)strlen(payload) &&
+            strcmp(rd, payload) == 0, rd ? rd : "(nulo)");
+        if (rd) free(rd);
+        unlink_utf8(tmpname);
+    }
 
     /* ---------------- importacao ---------------- */
     int added = 0, updated = 0;

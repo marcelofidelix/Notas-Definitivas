@@ -1,8 +1,8 @@
-# Arquitetura e Manual Técnico — Notas Definitivas (v6.30.0)
+# Arquitetura e Manual Técnico — Notas Definitivas (pós-v6.33.0)
 > **Documento de Engenharia de Software e Especificação Técnica Integral**  
-> **Base descrita**: `notas.c` — **10.135 linhas** de C99 em arquivo único, versão `v6.30.0`  
+> **Base descrita**: `notas.c` — **11.195 linhas** de C99 em arquivo único, estado de trabalho posterior à v6.33.0
 > **Dependência externa**: `libsqlite3` (obrigatória desde a v6.29.0)  
-> **Escopo**: descreve a base de código atual e, na seção 1.2, o que mudou nos ciclos **v6.28.0**, **v6.29.0** e **v6.30.0** em relação ao documento anterior, que era restrito à v6.27.0.
+> **Escopo**: descreve a base de código atual, o que mudou nos ciclos **v6.28.0**, **v6.29.0**, **v6.30.0** e **v6.33.0**, e a rodada de **robustez/desempenho** documentada na seção 9.
 
 ---
 
@@ -31,6 +31,7 @@ O **Notas Definitivas** é um editor pessoal de notas em Markdown voltado para t
 | **v6.29.0** | Backend **SQLite**: as notas saíram de `data/*.md` para a tabela `notes` de `notas.db`; identidade de nota passou a ser o caminho virtual `"db:<id>"`; entraram a camada de acesso ao banco, as rotinas de importação/exportação e os botões `[Importar]`/`[Exportar]` com os modos `MODE_PROMPT_IMPORT_DIR`/`MODE_PROMPT_EXPORT_DIR`. |
 | **v6.30.0** | Lista lateral ordenada por **prioridade e depois data** (`compare_notes_priority()`, `notes_resort_keep()`); filtro de urgência efetivamente aplicado em `apply_note_search()`; correção do clique dos filtros `[2]`/`[3]` com painel estreito; rótulos compactos nos controles que não cabem. |
 | **v6.33.0** | Robustez, UTF-8 e CLI: exclusão atômica de caracteres multibyte UTF-8 (`line_delete_char`) e inserção atômica; tolerância a BOM UTF-8 (`\xEF\xBB\xBF`); criação de pastas com suporte a Unicode no Windows (`mkdir_utf8` / `CreateDirectoryW`); transações em lote SQLite na importação (`BEGIN TRANSACTION`); novos comandos `:import [dir]` e `:export [dir]`; proteção contra reescrita na exclusão de notas abertas em abas; resolução do título real em prévias virtuais `db:<id>`; correção na renomeação de notas do banco em abas inativas. |
+| **Pós-v6.33.0** | Rodada de endurecimento (seção 9): escrita atômica de arquivos, validação estrita de IDs, transações de importação com COMMIT/ROLLBACK verificados, correção do Base64/OSC 52, eliminação de estouro de pilha em tabelas, renderização incremental (`RenderCursor`), undo coalescido para digitação, timers de 64 bits, saída de terminal com escrita completa e proteção de abas na saída. |
 
 Consequências diretas para quem lê o documento antigo: não existe mais armazenamento em `data/`, não existe mais `data/.attention`, a ordenação não é apenas por data de modificação, e o pipeline de renderização não é mais acionado por tempo fixo. Este documento substitui aquele — e, para não envelhecer de novo, **não carrega mais a versão no nome do arquivo**.
 
@@ -150,6 +151,7 @@ typedef struct {
     int cursor_x;  /* Posição horizontal do cursor */
 } UndoState;
 ```
+Cada nível continua sendo um snapshot completo das linhas. A diferença da rodada atual é a **coalescência de digitação**: `save_undo_for_typing()` reaproveita o snapshot quando teclas de caractere consecutivas ocorrem na mesma nota/linha/posição esperada dentro de `TYPING_UNDO_COALESCE_MS` (800 ms). Enter, Backspace, Delete, colar, tabela, troca de aba, undo/redo e demais edições chamam `save_undo()` e encerram o agrupamento. Assim, digitar uma frase consome um nível de undo, não um por tecla.
 
 ### 3.5 `Tab` — Estado Isolado por Aba
 Até `MAX_TABS` = 32 abas simultâneas:
@@ -162,7 +164,7 @@ typedef struct {
     int num_lines;                 /* Quantidade de linhas ativas */
     int cap_lines;                 /* Capacidade alocada do array */
     bool modified;                 /* Flag de modificação não salva */
-    long first_unsaved_time;       /* Timestamp da primeira alteração não salva */
+    int64_t first_unsaved_time;    /* Timestamp monotônico (ms) da primeira alteração não salva */
     int cursor_y, cursor_x;        /* Coordenadas do cursor no texto */
     int scroll_y, scroll_x;        /* Deslocamentos de rolagem */
     int visual_start_y, visual_start_x; /* Início de seleção visual */
@@ -216,14 +218,16 @@ CREATE TABLE IF NOT EXISTS notes (
     name      TEXT    NOT NULL UNIQUE,      -- nome lógico da nota (chave)
     content   TEXT    NOT NULL DEFAULT '',  -- markdown completo, UTF-8 byte a byte
     mtime     INTEGER NOT NULL DEFAULT 0,   -- data de modificação (segundos)
-    attention INTEGER NOT NULL DEFAULT 0    -- 0 = nenhuma, 1, 2, 3, 4 (H) ou 5 (R)
+    attention INTEGER NOT NULL DEFAULT 0    -- 0 = nenhuma, 1, 2, 3, 4 (H), 5 (R) ou 6 (O)
 );
 CREATE INDEX IF NOT EXISTS idx_notes_mtime ON notes(mtime DESC);
 PRAGMA user_version = 1;   /* DB_SCHEMA_VERSION */
 ```
-Ajustes aplicados na abertura (`db_open()`): `busy_timeout` de 3000 ms, `journal_mode=WAL` e `synchronous=NORMAL`. Em modo WAL aparecem os arquivos satélites `notas.db-wal` e `notas.db-shm` ao lado do executável.
+Ajustes aplicados na abertura (`db_open()`): `busy_timeout` de 3000 ms, `journal_mode=WAL`, `synchronous=NORMAL` e `foreign_keys=ON`. Em modo WAL aparecem os arquivos satélites `notas.db-wal` e `notas.db-shm` ao lado do executável. Se o filesystem não suportar WAL, a SQLite mantém o journal padrão e o editor continua funcionando.
 
-Ao acrescentar uma coluna: atualize o `CREATE TABLE` de `db_open()`, incremente `DB_SCHEMA_VERSION` / `PRAGMA user_version`, adicione o CRUD `db_*` correspondente, monte o campo em `rescan_notes()` (que traduz linhas do banco em `NoteInfo`) e trate a persistência por nota como fazem `db_set_attention()` / `save_attention_flags()`.
+`db_open()` agora lê `PRAGMA user_version` antes de qualquer gravação: versão maior que `DB_SCHEMA_VERSION` é recusada; versão menor é migrada para a v1. Qualquer falha de `CREATE TABLE`, índice ou versão fecha o handle com `sqlite3_close_v2()` e devolve `false`, em vez de deixar um banco meio-aberto. Níveis de `attention` são validados no CRUD e ao ler o banco (0..6); valores corrompidos viram 0.
+
+Ao acrescentar uma coluna: atualize o `CREATE TABLE` de `db_open()`, incremente `DB_SCHEMA_VERSION` / `PRAGMA user_version`, adicione o CRUD `db_*` correspondente, monte o campo em `rescan_notes()` (que traduz linhas do banco em `NoteInfo`) e trate a persistência por nota como fazem `db_set_attention()` / `db_insert_note()`.
 
 ### 3.9 Identidade de Nota e o Caminho Virtual `"db:<id>"`
 
@@ -232,12 +236,12 @@ Este é o ponto arquitetural que permitiu trocar o backend sem reescrever a inte
 | Operação | Regra |
 | :--- | :--- |
 | Criar caminho | `note_path_from_id(id, out, sz)` → `"db:<id>"` |
-| Ler o id | `note_id_from_path(path)` → id, ou **-1** se não for caminho virtual |
+| Ler o id | `note_id_from_path(path)` → id > 0, ou **-1** se ausente, não numérico, com lixo, negativo ou 0 |
 | Ler conteúdo | `note_read_content(path, &len)` — banco (`db_get_content`) **ou** arquivo real (`read_entire_file`) |
-| Gravar conteúdo | `note_write_content(path, data, len)` — banco (`db_update_content`) **ou** arquivo real |
+| Gravar conteúdo | `note_write_content(path, data, len)` — banco (`db_update_content`) **ou** arquivo real com escrita atômica |
 | Nome de exibição | `db_get_name(id)` → `cur_filename = "<nome>.md"` |
 
-O *fallback* para arquivo real mantém funcionando o argumento de linha de comando (`./notas algum.md`), a prévia de um `.md` avulso e as rotinas de importação/exportação — sem que nenhuma verificação de igualdade de caminho precise ser alterada.
+O *fallback* para arquivo real mantém funcionando o argumento de linha de comando (`./notas algum.md`), a prévia de um `.md` avulso e as rotinas de importação/exportação — sem que nenhuma verificação de igualdade de caminho precise ser alterada. `note_id_from_path()` usa `strtol` com checagem de `ERANGE`/caracteres restantes: `db:abc`, `db:12lixo`, `db:-1` e `db:0` são rejeitados em vez de virarem IDs válidos por acidente.
 
 ---
 
@@ -298,8 +302,8 @@ O código compila nativamente em Linux e Windows sem emuladores adicionais. A ta
 | **Varredura de Diretório** | `opendir()`, `readdir()`, `closedir()` (importação) | `FindFirstFileW`, `FindNextFileW`, `FindClose` (importação) |
 | **Cópia p/ Clipboard** | Thread `pthread` detachável: `wl-copy` (Wayland), `xclip`/`xsel` (X11), `clip.exe` (host Windows); + OSC 52 Base64 | Thread `CreateThread` gravando `CF_UNICODETEXT`; OSC 52 apenas em sessão SSH |
 | **Colagem do Clipboard** | `wl-paste`, `xclip`/`xsel`, ou `powershell Get-Clipboard` (WSL/Git Bash) | `GetClipboardData(CF_UNICODETEXT)` ➔ UTF-8, com fallback ANSI (`CF_TEXT`) |
-| **Abertura de Links** | `xdg-open` / `open` via `fork`/`exec` | `ShellExecuteA(NULL, "open", target, ...)` |
-| **Diretório de Trabalho** | `chdir()` para o diretório do executável (via `/proc/self/exe`) | `SetCurrentDirectoryA` para o diretório do executável (via `GetModuleFileNameA`) |
+| **Abertura de Links** | `xdg-open -- <alvo>` via `fork`/`exec` (sem shell, sem injeção) | `ShellExecuteW(NULL, "open", wurl, ...)` com URL convertida para UTF-16 e validada |
+| **Diretório de Trabalho** | `chdir()` para o diretório do executável (via `/proc/self/exe`, buffer de 4096) | `SetCurrentDirectoryW` com `GetModuleFileNameW` (caminho Unicode, buffer de 32768 WCHAR) |
 
 ---
 
@@ -313,16 +317,16 @@ O desenho só acontece quando `should_refresh_now()` autoriza (seção 2.4). Aut
 4. **Painel Esquerdo (`render_left_panel`)**: título, caixa de busca rápida (`Ctrl+F`), a lista de notas na **ordem de prioridade** (tempo relativo, caixa de urgência colorida por `get_attention_color()`, marcadores de nota aberta `●` e selecionada `▸`) e, na última linha, os botões responsivos de filtro ` [Todas] [1] [2] [3] [H] [R] [O]` (com rótulo abreviado `[T]` ou modo colado conforme a largura).
 5. **Divisória Vertical**: linha separadora entre painel lateral e área de edição, na cor `TH_FG_BORDER`.
 6. **Barra de Abas (`render_tab_bar`, linha 1)**: abas abertas, indicador de modificado, botão de fechar (`x`), botão `[+]`, seletor de tema e animação de marquee para títulos longos.
-7. **Painel Direito de Edição (`render_right_panel`)**: números de linha e indicadores de dobra; cores de H1/H2/H3; bullet lists (`-` amarelo negrito, `*` acento negrito); ocultação de URLs de links e de estilos Markdown no Modo Normal; tabelas alinhadas; fundo de blocos de código; realce de seleção visual e de termos buscados; quebra de linha visual quando `wrap_mode` está ligado.
+7. **Painel Direito de Edição (`render_right_panel`)**: números de linha e indicadores de dobra; cores de H1/H2/H3; bullet lists (`-` amarelo negrito, `*` acento negrito); ocultação de URLs de links e de estilos Markdown no Modo Normal; tabelas alinhadas; fundo de blocos de código; realce de seleção visual e de termos buscados; quebra de linha visual quando `wrap_mode` está ligado. O mapeamento linha visual ➔ linha/segmento é feito pelo `RenderCursor` incremental (seção 9.3), resetado a cada quadro.
 8. **Barra de Status (`render_status_bar`, duas linhas)**: badge do modo com fundo colorido (NORMAL, INSERT, `INSERT [SEL]`, VISUAL, V-LINE, COMMAND, SEARCH, DELETE?, NEW NOTE, RENAME) + nome da nota ativa (ou `[Prévia] nome`) + `[+]` de modificado + posição do cursor/linhas na primeira linha; na segunda, os botões centralizados e clicáveis — `[➕ Nova]`, `[✏️ Renomear]`, `[🗑️ Excluir]`, `[Wrap]`, `[🔍 Buscar]`, `[🔄 Subst]`, `[🎨 Tema]`, `[🧬 Life]`, `[⬇ Importar]`, `[⬆ Exportar]` — com rótulos compactos abaixo de 108 colunas.
 9. **Linha de Comando e Prompts (`render_command_line`)**: comando `:` do Vim ou o campo de digitação do diálogo ativo, incluindo os prompts de importação/exportação.
-10. **Descarga Atômica**: posiciona o cursor físico na coluna calculada (considerando a largura do rótulo do prompt em uso), reexibe a visibilidade do cursor e emite todo o bloco acumulado com `write()` ou `WriteConsoleA()`.
+10. **Descarga Atômica**: posiciona o cursor físico na coluna calculada (considerando a largura do rótulo do prompt em uso), reexibe a visibilidade do cursor e emite todo o bloco acumulado com `write()`/`WriteFile()` em laço, tratando escritas parciais e `EINTR`. Se `ABuffer` falhar, o quadro não é emitido e a limpeza/redesenho é reagendada.
 
 ---
 
-## 7. Catálogo Completo das 161 Funções da Base Atual
+## 7. Catálogo das Funções da Base v6.30.0
 
-Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base atual (v6.30.0), em ordem de aparição no arquivo e com o número de linha efetivo no fonte. `get_system_clipboard` aparece duas vezes porque tem implementações mutuamente exclusivas (Win32 e POSIX). As funções que não existiam na v6.27.0 vieram dos três ciclos descritos na seção 1.2 — principalmente a camada de armazenamento SQLite (v6.29.0), o gate de renderização `should_refresh_now()` (v6.28.0) e a ordenação por prioridade (v6.30.0).
+Abaixo estão catalogadas as **161** funções que existiam em `notas.c` na base v6.30.0, em ordem de aparição e com o número de linha daquela versão. `get_system_clipboard` aparece duas vezes porque tem implementações mutuamente exclusivas (Win32 e POSIX). As funções novas da rodada de endurecimento (`utf8_to_wide_alloc`, `write_file_atomic`, `save_undo_for_typing`, `RenderCursor`, `table_insert_blank_row`, `any_tab_modified`, `save_all_modified_tabs`, entre outras) estão descritas na seção 9. Os números de linha do catálogo abaixo ficaram defasados após esta rodada; use-os como referência histórica, não como localização atual.
 
 ### 7.1 `safe_strcpy` (Linha 61)
 - **Protótipo**: `static void safe_strcpy(char *dest, size_t dest_sz, const char *src)`
@@ -1203,9 +1207,83 @@ cd /mnt/SSDInterno/PROJETOS/Notas_Definitivas
 
 - `status_bar_lines` é forçado a 2 em `refresh_screen()`: o `:wrapbar` documentado (barra em 1 linha) hoje só alterna a compactação dos botões — meia-verdade.
 - O `README.md` e este documento agora descrevem a base correta; a antiga `DESCRICAO_TECNICA_DETALHADA_V6.27.0.md` (base v6.27.0, redesenho a 150 ms, armazenamento em `data/`) foi substituída por este arquivo.
-- Não há `:import`/`:export` por comando — importar e exportar existem apenas pelos dois botões. (Atualizado na v6.33.0: suporte a `:import [dir]` e `:export [dir]` via linha de comandos `:` implementado, com fallback para prompt interativo).
+- `:import [dir]` e `:export [dir]` existem desde a v6.33.0, com fallback para prompt interativo quando o diretório é omitido. Os botões `[Importar]`/`[Exportar]` continuam sendo o caminho mais descoberto na interface.
 - Sem assinatura de código: o `notas.exe` pode cair no SmartScreen (Propriedades ➔ Desbloquear).
 
 ---
 
-*Documento atualizado para a base **v6.30.0** (`notas.c`, 10.135 linhas). Substitui o documento restrito à v6.27.0 e não carrega mais a versão no nome do arquivo, para não envelhecer a cada ciclo.*
+## 9. Rodada de Endurecimento (pós-v6.33.0)
+
+Esta seção documenta as mudanças feitas para tornar o editor mais resistente a falhas de memória, disco, terminal e dados corrompidos, além das otimizações de renderização e undo.
+
+### 9.1 Persistência e Integridade
+
+| Função / área | Antes | Agora |
+| :--- | :--- | :--- |
+| `write_file_atomic()` (nova) | `fopen("wb")` truncava o destino antes da escrita; falha no meio deixava arquivo parcial. | Grava em `<arquivo>.tmp.<pid>`, confere `fwrite`/`fflush`, chama `fsync`/`_commit`, fecha e só então substitui via `rename`/`MoveFileExW`. |
+| `rename_utf8()` | `_wrename` falhava se o destino existisse. | `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, necessário para a troca atômica. |
+| `db_open()` | Falha de schema deixava `g_db` aberto; `PRAGMA user_version` era sempre sobrescrito. | Lê a versão antes, recusa banco mais novo, fecha o handle em qualquer falha (`sqlite3_close_v2`) e só grava a versão após criar tabela/índice. |
+| `note_id_from_path()` | `atoi("db:abc")` virava 0; `db:12lixo` virava 12. | `strtol` com `ERANGE`, resto da string e faixa `1..INT_MAX`; `note_path_from_id()` rejeita id <= 0. |
+| `db_set_attention()` / `db_insert_note()` / `rescan_notes()` | Níveis fora de 0..6 podiam entrar no banco/UI. | Clamp 0..6 na escrita e na leitura; valor corrompido vira 0. |
+| `toggle_note_attention_at()` / comando `:atencao` | UI mudava mesmo se o `UPDATE` falhasse. | Persiste primeiro; em erro, mostra mensagem e não reordena nem altera o nível em memória. |
+| `import_notes_from_dir()` | `BEGIN`/`COMMIT` não verificados; falha de conversão de caminho no Windows saía sem `ROLLBACK`; buffers fixos de 1024/2048 bytes. | Verifica `BEGIN`, faz `ROLLBACK` em todos os caminhos de erro, só confirma com `COMMIT` verificado, usa caminhos dinâmicos (`join_path_alloc`, `utf8_to_wide_alloc`) e rejeita nomes que não cabem em vez de truncar/colidir. |
+| `export_notes_to_dir()` | `mkdir` e `fwrite` ignorados; retornava contagem mesmo com todas as gravações falhando. | Verifica criação da pasta, largura do caminho, escrita/fechamento e retorna `-1` se nada foi exportado; exporta com escrita atômica. |
+| `execute_delete_selected_note()` | Ignorava falha de exclusão e seguia fechando abas/anunciando sucesso. | Só prossegue se `db_delete_note()`/`unlink_utf8()` retornarem sucesso. |
+
+### 9.2 Memória, Buffers e UTF-8
+
+- **Tabelas Markdown**: as três rotinas que criavam linha nova usavam `char new_row[512]` e calculavam `4 * colunas` sem limite. Uma linha com muitos `|` estourava a pilha. Agora `table_insert_blank_row()` monta a linha em `ABuffer`, e o número de colunas é limitado a `MAX_TABLE_COLS` (32). `align_table_lines()` **aborta sem alterar nada** quando uma linha tem mais de 32 colunas, em vez de reconstruí-la sem as colunas extras.
+- **`line_replace_range()`**: detecta quando `new_str` aponta para dentro da própria linha (o `realloc` invalidaria o ponteiro), copia antes e valida `del_len`/`new_len`/overflow. Isso elimina use-after-realloc em substituições in-place.
+- **`ABuffer`**: ganhou a flag `failed`; `ab_append()` checa overflow de `int` e falha de `realloc`, mantendo o conteúdo íntegro. `lines_to_content()` e a renderização usam essa flag para abortar em vez de salvar/desenhar dados truncados.
+- **`table_trim_copy()`**: alocação verificada; em OOM o alinhamento é abortado sem liberar células pela metade.
+- **Clipboard**: `base64_encode()` foi reescrito. O cálculo antigo de padding gerava `YQ`/`YWI` em vez de `YQ==`/`YWI=`, então o OSC 52 de textos de 1 ou 2 bytes era rejeitado por terminais. A leitura Win32 agora limita a conversão ao `GlobalSize()` do handle, sem confiar em NUL terminador.
+- **Conversão UTF-8 ➔ UTF-16**: `utf8_to_wide_alloc()` substitui buffers fixos de 1024/4096 WCHAR em `fopen_utf8`, `unlink_utf8`, `rename_utf8`, `mkdir_utf8`, `stat_cross` e na abertura de URL. Caminhos com acentos e comprimento maior deixam de falhar ou passar buffers não inicializados ao `ShellExecuteW`.
+
+### 9.3 Desempenho
+
+**Renderização (`RenderCursor`)** — o problema mais custoso: `render_right_panel()` chamava `find_visual_row()` uma vez por linha visível, e `find_visual_row()` percorria o documento **inteiro** para calcular o total, mesmo sem solicitá-lo. Para uma nota de 20.000 linhas e 40 linhas visíveis, eram 800 varreduras completas por quadro. O `RenderCursor` (global, resetado a cada `refresh_screen`) localiza o scroll uma vez e avança um segmento por chamada; `find_visual_row()` também passou a retornar assim que encontra a linha quando o total não é pedido.
+
+Medição em harness isolado (Windows/MinGW, `-O2`, 20.000 linhas de 159 caracteres, 40 linhas visíveis, 20 quadros):
+
+| Implementação | Tempo |
+| :--- | ---: |
+| `find_visual_row()` por linha (antes) | ~6.262 ms |
+| `RenderCursor` sequencial (depois) | ~0,1 ms |
+
+`editor_scroll()` também deixou de varrer o documento inteiro para descobrir o total: conta apenas as linhas visuais a partir do scroll atual e só limita quando a tela realmente termina antes.
+
+**Undo** — `save_undo_for_typing()` agrupa teclas de caractere consecutivas na mesma linha/posição dentro de 800 ms. Antes, cada tecla copiava todas as linhas do documento e consumia um dos 100 níveis; agora uma frase inteira ocupa um nível. Edições estruturais continuam gerando snapshots independentes.
+
+**Substituição (`:s/...`)** — `replace_in_current_note()` usa `strstr()` para localizar blocos e anexa trechos inteiros ao `ABuffer`, em vez de chamar `ab_append()` byte a byte. Também só cria o snapshot de undo quando encontra a primeira ocorrência, preservando o redo em buscas sem resultado.
+
+### 9.4 Terminal, Tempo e Plataforma
+
+- `write_stdout_all()` substitui `WriteFile`/`write` de uma tacada: trata escrita parcial, `EINTR` e buffer nulo. O quadro só é emitido se o `ABuffer` estiver completo; caso contrário, limpeza e redesenho são reagendados.
+- `get_current_time_ms()` retorna `int64_t`; no Windows usa `GetTickCount64()` e não sofre mais o wrap de ~49,7 dias. `first_unsaved_time`, deadlines de undo, timers de clique/marquee e autosave acompanham o tipo.
+- `disable_raw_mode()` é idempotente (`g_terminal_shutdown_done`), evitando liberar o editor duas vezes por causa do `atexit`.
+- `main()` configura o code page em `enable_raw_mode()` (que guarda os valores anteriores) e usa `GetModuleFileNameW`/`SetCurrentDirectoryW`; uma pasta de instalação com acentos deixa de quebrar a descoberta do executável.
+- No POSIX, `open_link_target()` troca `system("xdg-open ...")` por `fork`/`exec` com `xdg-open -- <alvo>`; o conteúdo de uma nota não pode mais injetar comandos de shell. `read_entire_file()` usa `fseeko`/`ftello` e rejeita leitura curta/arquivo > `LONG_MAX`.
+
+### 9.5 Abas, Saída e Sem Perda de Dados
+
+- `:q`/`:qa` verificam `any_tab_modified()`, não apenas `E.modified` da aba ativa.
+- `:wq`/`:x`/`:wqa` usam `save_all_modified_tabs()`: salvam todas as abas e só saem se todas gravarem.
+- `tab_close()` cancela o fechamento se a aba modificada não puder ser salva.
+- `close_all_tabs()` salva todas as abas antes de liberar qualquer uma e retorna `false` no primeiro erro, mantendo o workspace intacto.
+- `:tabnew` cria uma nota real no SQLite (`create_new_note("Nova_Nota_N")`); antes abria um caminho em `data/` que podia não existir e falhava no primeiro `:w`.
+- O fallback de renomeação de arquivo real agora renomeia **no mesmo diretório**, em vez de mover para `data/`.
+
+### 9.6 Testes e Validação
+
+`tools/test/storage_test.c` foi ampliado para 32 verificações, incluindo:
+
+- `note_id_from_path("db:0")`, `"db:12lixo"` e `"db:-1"` rejeitados;
+- Base64 de 1, 2 e 3 bytes com padding correto;
+- escrita atômica seguida de leitura e comparação byte a byte;
+- importação/reexportação e CRUD já existentes.
+
+Validação local desta rodada: compilação Windows/MinGW com `-Wall -Wextra -Wpedantic` sem warnings; `-fanalyzer` e `cppcheck` sem achados; suíte de armazenamento e harness de funções centrais (tabela >32 colunas, aliasing de `line_replace_range`, coalescência de undo, `RenderCursor`, clamp de scroll) verdes. O ramo POSIX foi revisado, mas não executado nesta máquina por não haver toolchain Linux/WSL disponível.
+
+---
+
+*Documento atualizado para o estado pós-v6.33.0 (`notas.c`, 11.195 linhas). O catálogo da seção 7 preserva os números de linha da v6.30.0; a seção 9 descreve a rodada atual e as funções novas.*

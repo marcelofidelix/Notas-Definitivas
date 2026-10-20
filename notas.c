@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -30,6 +31,7 @@
   #include <shellapi.h>
   #include <direct.h>
   #include <io.h>
+  #include <wchar.h>
   #define PATH_SEP '\\'
   #define mkdir_cross(dir) mkdir_utf8(dir)
 
@@ -53,6 +55,9 @@
   #include <dirent.h>
   #include <sys/select.h>
   #include <sys/time.h>
+  #include <sys/types.h>
+  #include <sys/wait.h>
+  #include <fcntl.h>
   #include <pthread.h>
   #define PATH_SEP '/'
   #define mkdir_cross(dir) mkdir_utf8(dir)
@@ -387,6 +392,12 @@ static const Theme themes[NUM_THEMES] = {
 #define MAX_HISTORY 64
 #define MAX_UNDO 100
 #define MAX_TABS 32
+#define NOTE_ID_MAX 2147483647
+/* Janela para agrupar digitacao continua em um unico passo de undo. Sem isso,
+ * cada tecla copiava o documento inteiro e consumia um dos 100 niveis. */
+#ifndef TYPING_UNDO_COALESCE_MS
+#define TYPING_UNDO_COALESCE_MS 800
+#endif
 #ifndef AUTOSAVE_DELAY_MS
 #define AUTOSAVE_DELAY_MS 60000
 #endif
@@ -450,36 +461,54 @@ typedef struct {
     char *b;
     int len;
     int cap;
+    bool failed;  /* true se uma alocacao/limite falhou; o buffer fica consistente */
 } ABuffer;
 
 static void ab_init(ABuffer *ab) {
+    if (!ab) return;
     ab->b = NULL;
     ab->len = 0;
     ab->cap = 0;
+    ab->failed = false;
 }
 
+/* Acrescenta bytes ao buffer. Em caso de falha de memoria ou overflow de int,
+ * marca ab->failed e mantem o conteudo ja acumulado intacto: o chamador pode
+ * abortar a operacao em vez de gravar/desenhar um resultado truncado. */
 static void ab_append(ABuffer *ab, const char *s, int len) {
-    if (!s) return;
-    if (len < 0) len = (int)strlen(s);
+    if (!ab || ab->failed || !s) return;
+    if (len < 0) {
+        size_t slen = strlen(s);
+        if (slen > (size_t)INT_MAX) { ab->failed = true; return; }
+        len = (int)slen;
+    }
     if (len <= 0) return;
-    if (ab->len + len + 1 > ab->cap) {
-        int ncap = ab->cap ? ab->cap * 2 : 1024;
-        while (ab->len + len + 1 > ncap) ncap *= 2;
-        char *nb = (char *)realloc(ab->b, ncap);
-        if (!nb) return;
+    if (ab->len > INT_MAX - len - 1) { ab->failed = true; return; }
+
+    int needed = ab->len + len + 1;
+    if (needed > ab->cap) {
+        int ncap = ab->cap > 0 ? ab->cap : 1024;
+        while (ncap < needed) {
+            if (ncap > INT_MAX / 2) { ncap = needed; break; }
+            ncap *= 2;
+        }
+        char *nb = (char *)realloc(ab->b, (size_t)ncap);
+        if (!nb) { ab->failed = true; return; }
         ab->b = nb;
         ab->cap = ncap;
     }
-    memcpy(ab->b + ab->len, s, len);
+    memcpy(ab->b + ab->len, s, (size_t)len);
     ab->len += len;
     ab->b[ab->len] = '\0';
 }
 
 static void ab_free(ABuffer *ab) {
+    if (!ab) return;
     if (ab->b) free(ab->b);
     ab->b = NULL;
     ab->len = 0;
     ab->cap = 0;
+    ab->failed = false;
 }
 
 /* Line representation */
@@ -510,7 +539,7 @@ typedef struct {
     int num_lines;
     int cap_lines;
     bool modified;
-    long first_unsaved_time;
+    int64_t first_unsaved_time;
 
     int cursor_y;
     int cursor_x;
@@ -572,7 +601,7 @@ typedef struct {
     int num_lines;
     int cap_lines;
     bool modified;
-    long first_unsaved_time;
+    int64_t first_unsaved_time;
 
     int cursor_y;
     int cursor_x;
@@ -711,12 +740,11 @@ static void run_game_of_life(void);
 static void tab_save_active(void);
 static void tab_load(int idx);
 static void tab_close(int idx);
-static void close_all_tabs(void);
+static bool close_all_tabs(void);
 static void create_new_note(const char *raw_name);
 static bool rename_note(const char *old_path, const char *raw_new_name);
 static void replace_in_current_note(const char *find_str, const char *rep_str);
 static void load_attention_flags(void);
-static void save_attention_flags(void);
 static void toggle_note_attention_at(int actual_idx);
 static void free_editor(void);
 static void mark_modified(void);
@@ -729,57 +757,93 @@ static void check_autosave(void);
  * ========================================================================= */
 
 
-static FILE *fopen_utf8(const char *path, const char *mode) {
 #ifdef _WIN32
-    WCHAR wpath[1024];
-    WCHAR wmode[32];
-    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) > 0 &&
-        MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, 32) > 0) {
-        return _wfopen(wpath, wmode);
+/* Converte UTF-8 para UTF-16 sem limite arbitrario de 1024 bytes. O chamador
+ * recebe um bloco alocado (ou NULL se o caminho for invalido/sem memoria). */
+static WCHAR *utf8_to_wide_alloc(const char *s) {
+    if (!s) return NULL;
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    WCHAR *out = (WCHAR *)malloc((size_t)n * sizeof(WCHAR));
+    if (!out) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, out, n) != n) {
+        free(out);
+        return NULL;
     }
-    return fopen(path, mode);
+    return out;
+}
+#endif
+
+static FILE *fopen_utf8(const char *path, const char *mode) {
+    if (!path || !mode) return NULL;
+#ifdef _WIN32
+    WCHAR *wpath = utf8_to_wide_alloc(path);
+    WCHAR *wmode = utf8_to_wide_alloc(mode);
+    bool converted = (wpath != NULL && wmode != NULL);
+    FILE *f = converted ? _wfopen(wpath, wmode) : NULL;
+    free(wpath);
+    free(wmode);
+    return converted ? f : fopen(path, mode);
 #else
     return fopen(path, mode);
 #endif
 }
 
 static int unlink_utf8(const char *path) {
+    if (!path) return -1;
 #ifdef _WIN32
-    WCHAR wpath[1024];
-    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) > 0) {
-        return _wremove(wpath);
-    }
-    return remove(path);
+    WCHAR *wpath = utf8_to_wide_alloc(path);
+    if (!wpath) return remove(path);
+    int rc = DeleteFileW(wpath) ? 0 : -1;
+    free(wpath);
+    return rc;
 #else
     return unlink(path);
 #endif
 }
 
 static int rename_utf8(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -1;
 #ifdef _WIN32
-    WCHAR wold[1024], wnew[1024];
-    if (MultiByteToWideChar(CP_UTF8, 0, oldpath, -1, wold, 1024) > 0 &&
-        MultiByteToWideChar(CP_UTF8, 0, newpath, -1, wnew, 1024) > 0) {
-        return _wrename(wold, wnew);
+    WCHAR *wold = utf8_to_wide_alloc(oldpath);
+    WCHAR *wnew = utf8_to_wide_alloc(newpath);
+    int rc = -1;
+    if (wold && wnew) {
+        /* _wrename/MoveFileW falham quando o destino existe; a escrita atomica
+         * depende de substituir o arquivo antigo no mesmo diretorio. */
+        rc = MoveFileExW(wold, wnew, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+    } else {
+        rc = rename(oldpath, newpath);
     }
-    return rename(oldpath, newpath);
+    free(wold);
+    free(wnew);
+    return rc;
 #else
     return rename(oldpath, newpath);
 #endif
 }
 
 static int mkdir_utf8(const char *dir) {
+    if (!dir || !*dir) return -1;
 #ifdef _WIN32
-    WCHAR wdir[1024];
-    if (MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1024) > 0) {
-        if (CreateDirectoryW(wdir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
-            return 0;
-        }
-        return -1;
+    WCHAR *wdir = utf8_to_wide_alloc(dir);
+    if (!wdir) return _mkdir(dir);
+    if (CreateDirectoryW(wdir, NULL)) { free(wdir); return 0; }
+    DWORD err = GetLastError();
+    int rc = -1;
+    if (err == ERROR_ALREADY_EXISTS) {
+        DWORD attrs = GetFileAttributesW(wdir);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) rc = 0;
     }
-    return _mkdir(dir);
+    free(wdir);
+    return rc;
 #else
-    return mkdir(dir, 0755);
+    if (mkdir(dir, 0755) == 0) return 0;
+    if (errno == EEXIST) {
+        struct stat st;
+        if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+    }
+    return -1;
 #endif
 }
 
@@ -794,27 +858,82 @@ static inline time_t filetime_to_timet(const FILETIME *ft) {
 #endif
 
 static int stat_cross(const char *path, struct stat *st) {
+    if (!path) return -1;
 #ifdef _WIN32
-    WCHAR wpath[1024];
-    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) > 0) {
-        WIN32_FILE_ATTRIBUTE_DATA data;
-        if (GetFileAttributesExW(wpath, GetFileExInfoStandard, &data)) {
-            if (st) {
-                memset(st, 0, sizeof(struct stat));
-                st->st_mtime = filetime_to_timet(&data.ftLastWriteTime);
-                st->st_size = ((int64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow;
-                st->st_mode = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? S_IFDIR : S_IFREG;
-            }
-            return 0;
+    WCHAR *wpath = utf8_to_wide_alloc(path);
+    if (!wpath) return -1;
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    int rc = -1;
+    if (GetFileAttributesExW(wpath, GetFileExInfoStandard, &data)) {
+        if (st) {
+            memset(st, 0, sizeof(struct stat));
+            st->st_mtime = filetime_to_timet(&data.ftLastWriteTime);
+            st->st_size = ((int64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+            st->st_mode = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? S_IFDIR : S_IFREG;
         }
+        rc = 0;
     }
-    return -1;
+    free(wpath);
+    return rc;
 #else
     return stat(path, st);
 #endif
 }
 
+/* Escrita atomica para arquivos reais (fallback legado e exportacao):
+ * grava em um temporario no mesmo diretorio, sincroniza e so entao substitui
+ * o destino. Assim uma falha de disco/energia nao deixa a nota truncada. */
+static bool write_file_atomic(const char *path, const char *data, long len) {
+    if (!path || !*path || len < 0 || (len > 0 && !data)) return false;
+
+#ifdef _WIN32
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    size_t tmp_sz = strlen(path) + 40;
+    char *tmp = (char *)malloc(tmp_sz);
+    if (!tmp) return false;
+    snprintf(tmp, tmp_sz, "%s.tmp.%lu", path, pid);
+
+    FILE *f = fopen_utf8(tmp, "wb");
+    if (!f) { free(tmp); return false; }
+
+    bool ok = true;
+    if (len > 0 && fwrite(data, 1, (size_t)len, f) != (size_t)len) ok = false;
+    if (ok && fflush(f) != 0) ok = false;
+    if (ok) {
+#ifdef _WIN32
+        if (_commit(_fileno(f)) != 0) ok = false;
+#else
+        if (fsync(fileno(f)) != 0) ok = false;
+#endif
+    }
+    if (fclose(f) != 0) ok = false;
+
+    if (!ok) {
+        unlink_utf8(tmp);
+        free(tmp);
+        return false;
+    }
+    if (rename_utf8(tmp, path) != 0) {
+        unlink_utf8(tmp);
+        free(tmp);
+        return false;
+    }
+    free(tmp);
+    return true;
+}
+
+static bool g_terminal_shutdown_done = false;
+
 static void disable_raw_mode(void) {
+    /* disable_raw_mode() e registrada em atexit e tambem pode ser chamada
+     * explicitamente (erro de inicializacao/saida normal). O guarda evita
+     * restaurar o terminal e liberar o estado duas vezes. */
+    if (g_terminal_shutdown_done) return;
+    g_terminal_shutdown_done = true;
+
     /* Disable SGR mouse tracking, show cursor, restore screen buffer */
     printf("\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[0 q\x1b[?25h\x1b[?1049l" STYLE_RESET);
     fflush(stdout);
@@ -855,8 +974,8 @@ static volatile sig_atomic_t g_screen_clear_needed = 1;
  * ========================================================================= */
 static volatile sig_atomic_t g_needs_redraw = 1; /* 1 = estado visual mudou, precisa redesenhar */
 static bool g_marquee_active = false;            /* true = algum titulo longo esta rolando na barra de abas */
-static long g_last_marquee_tick = -1;            /* ultimo tick (now_ms/300) ja desenhado no marquee */
-static long g_last_heartbeat_draw = 0;           /* instante do ultimo redesenho de manutencao */
+static int64_t g_last_marquee_tick = -1;         /* ultimo tick (now_ms/300) ja desenhado no marquee */
+static int64_t g_last_heartbeat_draw = 0;        /* instante do ultimo redesenho de manutencao */
 
 /* Intervalo do batimento de manutencao: mantem o relogio relativo da barra
  * lateral ("now", "5m", "2h") atualizado mesmo com o editor ocioso. A maior
@@ -1225,13 +1344,15 @@ static void utf8_marquee_slice(const char *title, int step, int avail_w, char *o
     free(doubled);
 }
 
-static long get_current_time_ms(void) {
+static int64_t get_current_time_ms(void) {
 #ifdef _WIN32
-    return (long)GetTickCount();
+    /* GetTickCount() retorna 32 bits e da a volta em ~49,7 dias, quebrando
+     * autosave/animacoes em sessoes longas. GetTickCount64 nao tem esse limite. */
+    return (int64_t)GetTickCount64();
 #else
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 #endif
 }
 
@@ -1241,21 +1362,23 @@ static long get_current_time_ms(void) {
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static char *base64_encode(const unsigned char *data, size_t input_len) {
+    if (input_len > (SIZE_MAX / 4) * 3) return NULL;
     size_t output_len = 4 * ((input_len + 2) / 3);
+    if (output_len == SIZE_MAX) return NULL;
     char *encoded = (char *)malloc(output_len + 1);
     if (!encoded) return NULL;
 
-    size_t i, j;
-    for (i = 0, j = 0; i < input_len;) {
-        uint32_t oct_a = i < input_len ? data[i++] : 0;
-        uint32_t oct_b = i < input_len ? data[i++] : 0;
-        uint32_t oct_c = i < input_len ? data[i++] : 0;
-        uint32_t triple = (oct_a << 16) + (oct_b << 8) + oct_c;
+    size_t j = 0;
+    for (size_t i = 0; i < input_len; i += 3) {
+        uint32_t oct_a = data[i];
+        uint32_t oct_b = (i + 1 < input_len) ? data[i + 1] : 0;
+        uint32_t oct_c = (i + 2 < input_len) ? data[i + 2] : 0;
+        uint32_t triple = (oct_a << 16) | (oct_b << 8) | oct_c;
 
         encoded[j++] = b64_table[(triple >> 18) & 0x3F];
         encoded[j++] = b64_table[(triple >> 12) & 0x3F];
-        encoded[j++] = (i > input_len + 1) ? '=' : b64_table[(triple >> 6) & 0x3F];
-        encoded[j++] = (i > input_len) ? '=' : b64_table[triple & 0x3F];
+        encoded[j++] = (i + 1 < input_len) ? b64_table[(triple >> 6) & 0x3F] : '=';
+        encoded[j++] = (i + 2 < input_len) ? b64_table[triple & 0x3F] : '=';
     }
     encoded[output_len] = '\0';
     return encoded;
@@ -1438,15 +1561,26 @@ static char *get_system_clipboard(int *out_len) {
     if (hData) {
         WCHAR *pw = (WCHAR *)GlobalLock(hData);
         if (pw) {
-            int utf8_len = WideCharToMultiByte(CP_UTF8, 0, pw, -1, NULL, 0, NULL, NULL);
-            if (utf8_len > 1) {
-                char *res = (char *)malloc(utf8_len);
-                if (res) {
-                    WideCharToMultiByte(CP_UTF8, 0, pw, -1, res, utf8_len, NULL, NULL);
-                    GlobalUnlock(hData);
-                    CloseClipboard();
-                    if (out_len) *out_len = utf8_len - 1;
-                    return res;
+            /* O conteudo do clipboard nao e obrigado a terminar em NUL dentro
+             * do bloco alocado; limita a leitura ao tamanho real do handle. */
+            SIZE_T bytes = GlobalSize(hData);
+            size_t max_wchars = (bytes >= sizeof(WCHAR)) ? (size_t)(bytes / sizeof(WCHAR)) : 0;
+            size_t wlen = 0;
+            while (wlen < max_wchars && pw[wlen] != L'\0') wlen++;
+            if (wlen > 0 && wlen <= (size_t)INT_MAX) {
+                int utf8_len = WideCharToMultiByte(CP_UTF8, 0, pw, (int)wlen,
+                                                   NULL, 0, NULL, NULL);
+                if (utf8_len > 0) {
+                    char *res = (char *)malloc((size_t)utf8_len + 1);
+                    if (res) {
+                        WideCharToMultiByte(CP_UTF8, 0, pw, (int)wlen,
+                                            res, utf8_len, NULL, NULL);
+                        res[utf8_len] = '\0';
+                        GlobalUnlock(hData);
+                        CloseClipboard();
+                        if (out_len) *out_len = utf8_len;
+                        return res;
+                    }
                 }
             }
             GlobalUnlock(hData);
@@ -1566,9 +1700,13 @@ static void open_link_target(const char *raw_target) {
             safe_strcpy(url_buf, sizeof(url_buf), target);
         }
         set_status_msg("Abrindo no navegador: %s", url_buf);
-        WCHAR wurl[4096];
-        MultiByteToWideChar(CP_UTF8, 0, url_buf, -1, wurl, 4096);
+        WCHAR *wurl = utf8_to_wide_alloc(url_buf);
+        if (!wurl) {
+            set_status_msg("URL longa demais/invalida: %s", url_buf);
+            return;
+        }
         HINSTANCE h = ShellExecuteW(NULL, L"open", wurl, NULL, NULL, SW_SHOWNORMAL);
+        free(wurl);
         if ((INT_PTR)h <= 32) {
             set_status_msg("Erro ao abrir navegador para: %s", url_buf);
         }
@@ -1678,9 +1816,28 @@ static void open_link_target(const char *raw_target) {
     }
 #else
     set_status_msg("Abrindo: %s", target);
-    char cmd[4096 + 64];
-    snprintf(cmd, sizeof(cmd), "xdg-open \"%s\" >/dev/null 2>&1 &", target);
-    system(cmd);
+    /* fork+exec em vez de system(): o alvo vem do conteudo da nota e nao pode
+     * ser interpretado pelo shell (evita injecao de comandos via link). */
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        pid_t pid2 = fork();
+        if (pid2 == 0) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
+            execlp("xdg-open", "xdg-open", "--", target, (char *)NULL);
+            _exit(127);
+        }
+        _exit(0);
+    } else if (pid > 0) {
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) { /* retry */ }
+    } else {
+        set_status_msg("Nao foi possivel abrir o link: %s", target);
+    }
 #endif
 }
 
@@ -1718,7 +1875,7 @@ static void line_free(Line *l) {
 }
 
 static void mark_modified(void) {
-    long now = get_current_time_ms();
+    int64_t now = get_current_time_ms();
     if (!E.modified || E.first_unsaved_time == 0) {
         E.first_unsaved_time = now;
     }
@@ -1773,24 +1930,46 @@ static void line_insert_char(Line *l, int at, char c) {
 }
 
 static void line_replace_range(Line *l, int at, int del_len, const char *new_str, int new_len) {
-    if (at < 0 || at > l->len) return;
-    if (at + del_len > l->len) del_len = l->len - at;
+    if (!l || !l->chars || at < 0 || at > l->len) return;
+    if (del_len < 0) del_len = 0;
+    if (new_len < 0) new_len = 0;
+    if (new_str == NULL) new_len = 0;
+    if (del_len > l->len - at) del_len = l->len - at;
+
     int diff = new_len - del_len;
+    if (diff > 0 && l->len > INT_MAX - diff - 1) return;
+    if (at > INT_MAX - new_len - 1) return;
+
+    /* new_str pode apontar para dentro da propria linha (ex.: substituir um
+     * trecho por outro dela). O realloc invalidaria esse ponteiro. */
+    char *alias_copy = NULL;
+    uintptr_t src = (uintptr_t)(const void *)new_str;
+    uintptr_t begin = (uintptr_t)(void *)l->chars;
+    uintptr_t end = begin + (uintptr_t)l->len;
+    if (new_len > 0 && src >= begin && src < end) {
+        alias_copy = (char *)malloc((size_t)new_len);
+        if (!alias_copy) return;
+        memcpy(alias_copy, new_str, (size_t)new_len);
+        new_str = alias_copy;
+    }
+
     if (diff > 0) {
-        char *nc = (char *)realloc(l->chars, l->len + diff + 1);
-        if (!nc) return;
+        char *nc = (char *)realloc(l->chars, (size_t)l->len + (size_t)diff + 1);
+        if (!nc) { free(alias_copy); return; }
         l->chars = nc;
     }
-    memmove(&l->chars[at + new_len], &l->chars[at + del_len], l->len - (at + del_len) + 1);
-    if (new_len > 0 && new_str) {
-        memcpy(&l->chars[at], new_str, new_len);
+    memmove(&l->chars[at + new_len], &l->chars[at + del_len],
+            (size_t)(l->len - (at + del_len)) + 1);
+    if (new_len > 0) {
+        memcpy(&l->chars[at], new_str, (size_t)new_len);
     }
     l->len += diff;
     if (diff < 0) {
-        char *nc = (char *)realloc(l->chars, l->len + 1);
+        char *nc = (char *)realloc(l->chars, (size_t)l->len + 1);
         if (nc) l->chars = nc;
     }
     l->chars[l->len] = '\0';
+    free(alias_copy);
     detect_heading(l);
     mark_modified();
 }
@@ -2034,7 +2213,26 @@ static void free_undo_state(UndoState *us) {
     us->num_lines = 0;
 }
 
+/* Estado da coalescencia de digitacao: uma sequencia continua de caracteres
+ * gera um unico snapshot de undo em vez de um por tecla. Qualquer outra edicao
+ * (Enter, Backspace, colar, tabela, troca de aba) chama save_undo() e invalida
+ * este estado, preservando a granularidade dos demais comandos. */
+static bool g_typing_undo_valid = false;
+static int64_t g_typing_undo_deadline = 0;
+static int g_typing_undo_line = -1;
+static int g_typing_undo_expect_x = -1;
+static char g_typing_undo_path[512];
+
+static void invalidate_typing_undo(void) {
+    g_typing_undo_valid = false;
+    g_typing_undo_line = -1;
+    g_typing_undo_expect_x = -1;
+    g_typing_undo_deadline = 0;
+    g_typing_undo_path[0] = '\0';
+}
+
 static void save_undo(void) {
+    invalidate_typing_undo();
     if (E.undo_count >= MAX_UNDO) {
         free_undo_state(&E.undo_stack[0]);
         memmove(&E.undo_stack[0], &E.undo_stack[1], sizeof(UndoState) * (MAX_UNDO - 1));
@@ -2061,7 +2259,29 @@ static void save_undo(void) {
     E.redo_count = 0;
 }
 
+/* Antes de inserir um caractere. Se a tecla anterior foi outro caractere, na
+ * mesma linha/posicao esperada, dentro da janela e na mesma nota, reaproveita o
+ * snapshot: um "burst" de digitacao vira um unico passo de undo. */
+static void save_undo_for_typing(int line, int at, int bytes) {
+    int64_t now = get_current_time_ms();
+    if (g_typing_undo_valid && now <= g_typing_undo_deadline &&
+        g_typing_undo_line == line && g_typing_undo_expect_x == at &&
+        strcmp(g_typing_undo_path, E.cur_filepath) == 0) {
+        g_typing_undo_expect_x = at + bytes;
+        g_typing_undo_deadline = now + TYPING_UNDO_COALESCE_MS;
+        return;
+    }
+
+    save_undo();
+    g_typing_undo_valid = true;
+    g_typing_undo_line = line;
+    g_typing_undo_expect_x = at + bytes;
+    g_typing_undo_deadline = now + TYPING_UNDO_COALESCE_MS;
+    safe_strcpy(g_typing_undo_path, sizeof(g_typing_undo_path), E.cur_filepath);
+}
+
 static void apply_undo(void) {
+    invalidate_typing_undo();
     if (E.undo_count <= 0) {
         set_status_msg("Já está na alteração mais antiga");
         return;
@@ -2103,6 +2323,7 @@ static void apply_undo(void) {
 }
 
 static void apply_redo(void) {
+    invalidate_typing_undo();
     if (E.redo_count <= 0) {
         set_status_msg("Já está na alteração mais recente");
         return;
@@ -2282,16 +2503,32 @@ static char *read_entire_file(const char *path, long *out_len) {
     if (out_len) *out_len = 0;
     FILE *f = fopen_utf8(path, "rb");
     if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long len = ftell(f);
-    if (len < 0) { fclose(f); return NULL; }
-    fseek(f, 0, SEEK_SET);
+
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    __int64 len64 = _ftelli64(f);
+    if (len64 < 0 || len64 > (__int64)LONG_MAX) { fclose(f); return NULL; }
+    long len = (long)len64;
+    if (_fseeki64(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    off_t len64 = ftello(f);
+    if (len64 < 0 || (uintmax_t)len64 > (uintmax_t)LONG_MAX) { fclose(f); return NULL; }
+    long len = (long)len64;
+    if (fseeko(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+#endif
+
     char *buf = (char *)malloc((size_t)len + 1);
-    if (buf) {
-        size_t bytes_read = fread(buf, 1, (size_t)len, f);
-        buf[bytes_read] = '\0';
-        if (out_len) *out_len = (long)bytes_read;
+    if (!buf) { fclose(f); return NULL; }
+    size_t bytes_read = fread(buf, 1, (size_t)len, f);
+    bool short_read = (bytes_read != (size_t)len);
+    if (short_read) {
+        free(buf);
+        fclose(f);
+        return NULL;
     }
+    buf[bytes_read] = '\0';
+    if (out_len) *out_len = (long)bytes_read;
     fclose(f);
     return buf;
 }
@@ -2319,10 +2556,13 @@ static sqlite3 *g_db = NULL;
 static inline bool db_is_open(void) { return g_db != NULL; }
 
 static void db_close(void) {
-    if (g_db) {
-        sqlite3_close(g_db);
-        g_db = NULL;
-    }
+    sqlite3 *db = g_db;
+    g_db = NULL;
+    if (!db) return;
+    /* close_v2 nunca devolve SQLITE_BUSY: se algum statement ainda existir,
+     * o handle e liberado quando ele for finalizado. Evita vazar o banco no
+     * encerramento caso uma rotina tenha falhado no meio. */
+    sqlite3_close_v2(db);
 }
 
 static bool db_exec(const char *sql) {
@@ -2335,8 +2575,21 @@ static bool db_exec(const char *sql) {
     return true;
 }
 
+static int db_user_version(void) {
+    if (!g_db) return -1;
+    sqlite3_stmt *st = NULL;
+    int version = -1;
+    if (sqlite3_prepare_v2(g_db, "PRAGMA user_version;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        version = sqlite3_column_int(st, 0);
+    }
+    if (st) sqlite3_finalize(st);
+    return version;
+}
+
 /* Abre (criando se necessario) o banco e garante o schema. O banco nasce
- * VAZIO: nenhuma nota de exemplo e criada. */
+ * VAZIO: nenhuma nota de exemplo e criada. Em qualquer falha o handle e
+ * fechado, para que uma tentativa seguinte nao receba um banco meio-aberto. */
 static bool db_open(void) {
     if (g_db) return true;
 
@@ -2348,9 +2601,11 @@ static bool db_open(void) {
 
     /* WAL permite leitura e escrita concorrentes sem travar o loop da
      * interface; synchronous=NORMAL e o ajuste recomendado pela propria SQLite
-     * para o modo WAL. */
+     * para o modo WAL. Se o filesystem nao suportar WAL, a SQLite mantem o
+     * journal padrao: o programa continua funcionando, apenas sem esse modo. */
     db_exec("PRAGMA journal_mode=WAL;");
     db_exec("PRAGMA synchronous=NORMAL;");
+    db_exec("PRAGMA foreign_keys=ON;");
 
     if (!db_exec("CREATE TABLE IF NOT EXISTS notes ("
                  "id        INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -2358,13 +2613,24 @@ static bool db_open(void) {
                  "content   TEXT    NOT NULL DEFAULT '',"
                  "mtime     INTEGER NOT NULL DEFAULT 0,"
                  "attention INTEGER NOT NULL DEFAULT 0);")) {
-        return false;
+        goto fail;
     }
     if (!db_exec("CREATE INDEX IF NOT EXISTS idx_notes_mtime ON notes(mtime DESC);")) {
-        return false;
+        goto fail;
     }
-    db_exec("PRAGMA user_version=1;");
+
+    int version = db_user_version();
+    if (version < 0 || version > DB_SCHEMA_VERSION) goto fail;
+    if (version < DB_SCHEMA_VERSION) {
+        /* Schema v1 e o inicial. Versoes futuras devem aplicar migracoes
+         * incrementais aqui, em vez de sobrescrever um banco mais novo. */
+        if (!db_exec("PRAGMA user_version=1;")) goto fail;
+    }
     return true;
+
+fail:
+    db_close();
+    return false;
 }
 
 /* -------------------------------------------------------------------------
@@ -2372,10 +2638,22 @@ static bool db_open(void) {
  * ------------------------------------------------------------------------- */
 static int note_id_from_path(const char *path) {
     if (!path || strncmp(path, "db:", 3) != 0) return -1;
-    return atoi(path + 3);
+    const char *p = path + 3;
+    if (!*p) return -1;
+    /* strtol rejeita "db:abc" (que atoi convertia em 0) e "db:12lixo". */
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(p, &end, 10);
+    if (errno == ERANGE || end == p || *end != '\0' ||
+        value <= 0 || value > NOTE_ID_MAX) {
+        return -1;
+    }
+    return (int)value;
 }
 
 static void note_path_from_id(int id, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    if (id <= 0) { out[0] = '\0'; return; }
     snprintf(out, out_sz, "db:%d", id);
 }
 
@@ -2398,6 +2676,8 @@ static int db_find_id_by_name(const char *name) {
 
 static int db_insert_note(const char *name, const char *content, time_t mtime, int attention) {
     if (!g_db || !name || !*name) return -1;
+    if (attention < 0) attention = 0;
+    if (attention > 6) attention = 6;
     sqlite3_stmt *st = NULL;
     int id = -1;
     if (sqlite3_prepare_v2(g_db,
@@ -2461,7 +2741,9 @@ static bool db_delete_note(int id) {
 }
 
 static bool db_set_attention(int id, int level) {
-    if (!g_db || id < 0) return false;
+    if (!g_db || id <= 0) return false;
+    if (level < 0) level = 0;
+    if (level > 6) level = 6;
     sqlite3_stmt *st = NULL;
     bool ok = false;
     if (sqlite3_prepare_v2(g_db, "UPDATE notes SET attention=?1 WHERE id=?2;",
@@ -2540,27 +2822,28 @@ static char *note_read_content(const char *path, long *out_len) {
 static bool note_write_content(const char *path, const char *data, long len) {
     int id = note_id_from_path(path);
     if (id >= 0) return db_update_content(id, data, time(NULL));
-
-    FILE *f = fopen_utf8(path, "wb");
-    if (!f) return false;
-    if (data && len > 0) fwrite(data, 1, (size_t)len, f);
-    fclose(f);
-    return true;
+    return write_file_atomic(path, data, len);
 }
 
-/* Serializa o buffer de linhas do editor no formato markdown em disco. */
+/* Serializa o buffer de linhas do editor no formato markdown em disco.
+ * Devolve NULL se o buffer de saida falhar, para que o chamador reporte erro
+ * em vez de salvar silenciosamente um arquivo truncado. */
 static char *lines_to_content(Line *lines, int num_lines, long *out_len) {
+    if (out_len) *out_len = 0;
     ABuffer ab;
     ab_init(&ab);
     for (int i = 0; i < num_lines; i++) {
         if (lines[i].chars && lines[i].len > 0) ab_append(&ab, lines[i].chars, lines[i].len);
         ab_append(&ab, "\n", 1);
     }
+    if (ab.failed) {
+        ab_free(&ab);
+        return NULL;
+    }
     if (!ab.b) {
         ab.b = (char *)malloc(1);
-        if (ab.b) ab.b[0] = '\0';
-        if (out_len) *out_len = 0;
-        return ab.b;
+        if (!ab.b) return NULL;
+        ab.b[0] = '\0';
     }
     if (out_len) *out_len = ab.len;
     return ab.b; /* posse transferida para o chamador (nao usar ab_free aqui) */
@@ -2629,6 +2912,38 @@ static void expand_user_path(const char *in, char *out, size_t out_sz) {
 /* -------------------------------------------------------------------------
  * Importacao: pasta com arquivos .md  ->  banco
  * ------------------------------------------------------------------------- */
+static char *join_path_alloc(const char *dir, const char *name) {
+    if (!dir || !name) return NULL;
+    size_t need = strlen(dir) + strlen(name) + 2;
+    char *out = (char *)malloc(need);
+    if (!out) return NULL;
+    snprintf(out, need, "%s%c%s", dir, PATH_SEP, name);
+    return out;
+}
+
+/* Extrai o nome logico (sem extensao) de um arquivo. Devolve false quando o
+ * nome nao cabe no buffer, evitando que dois arquivos longos colidam por
+ * truncamento silencioso. */
+static bool note_name_from_filename(const char *fname, char *out, size_t out_sz) {
+    if (!fname || !out || out_sz == 0) return false;
+    const char *dot = strrchr(fname, '.');
+    size_t len = dot ? (size_t)(dot - fname) : strlen(fname);
+    if (len == 0 || len >= out_sz) return false;
+    memcpy(out, fname, len);
+    out[len] = '\0';
+    return true;
+}
+
+static void import_one_note(const char *name, const char *content, time_t mtime,
+                            int *added, int *updated) {
+    int existing = db_find_id_by_name(name);
+    if (existing > 0) {
+        if (db_update_content(existing, content, mtime)) (*updated)++;
+    } else if (db_insert_note(name, content, mtime, 0) > 0) {
+        (*added)++;
+    }
+}
+
 static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_updated,
                                  char *errbuf, size_t errsz) {
     if (out_added) *out_added = 0;
@@ -2647,20 +2962,29 @@ static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_u
     int added = 0, updated = 0;
     bool dir_found = false;
 
-    db_exec("BEGIN TRANSACTION;");
-
-#ifdef _WIN32
-    WCHAR wdir[1024];
-    if (MultiByteToWideChar(CP_UTF8, 0, dirpath, -1, wdir, 1024) <= 0) {
-        if (errbuf && errsz) snprintf(errbuf, errsz, "caminho invalido");
+    if (!db_exec("BEGIN TRANSACTION;")) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "nao foi possivel iniciar a transacao");
         return -1;
     }
-    WCHAR pattern[1024];
-    wcsncpy(pattern, wdir, 1000);
-    pattern[1000] = L'\0';
+
+#ifdef _WIN32
+    WCHAR *wdir = utf8_to_wide_alloc(dirpath);
+    size_t wlen = wdir ? wcslen(wdir) : 0;
+    WCHAR *pattern = wdir ? (WCHAR *)malloc((wlen + 3) * sizeof(WCHAR)) : NULL;
+    if (!wdir || !pattern) {
+        free(wdir);
+        free(pattern);
+        db_exec("ROLLBACK;");
+        if (errbuf && errsz) snprintf(errbuf, errsz, "caminho invalido ou sem memoria");
+        return -1;
+    }
+    wcscpy(pattern, wdir);
     wcscat(pattern, L"\\*");
+    free(wdir);
+
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW(pattern, &fd);
+    free(pattern);
     if (hFind != INVALID_HANDLE_VALUE) {
         dir_found = true;
         do {
@@ -2668,25 +2992,20 @@ static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_u
             char fname[512];
             if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, fname, sizeof(fname), NULL, NULL) <= 0) continue;
             if (fname[0] == '.' || !is_markdown_ext(fname)) continue;
-            char full[2048];
-            snprintf(full, sizeof(full), "%s\\%s", dirpath, fname);
+
+            char name[256];
+            if (!note_name_from_filename(fname, name, sizeof(name))) continue;
+
+            char *full = join_path_alloc(dirpath, fname);
+            if (!full) continue;
             long clen = 0;
             char *content = read_entire_file(full, &clen);
+            free(full);
             if (!content) continue;
-            char name[256];
-            safe_strcpy(name, sizeof(name), fname);
-            char *dot = strrchr(name, '.');
-            if (dot) *dot = '\0';
-            if (name[0]) {
-                time_t mt = filetime_to_timet(&fd.ftLastWriteTime);
-                if (mt <= 0) mt = time(NULL);
-                int existing = db_find_id_by_name(name);
-                if (existing >= 0) {
-                    if (db_update_content(existing, content, mt)) updated++;
-                } else if (db_insert_note(name, content, mt, 0) >= 0) {
-                    added++;
-                }
-            }
+
+            time_t mt = filetime_to_timet(&fd.ftLastWriteTime);
+            if (mt <= 0) mt = time(NULL);
+            import_one_note(name, content, mt, &added, &updated);
             free(content);
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
@@ -2700,28 +3019,21 @@ static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_u
             if (ent->d_name[0] == '.') continue;
             if (!is_markdown_ext(ent->d_name)) continue;
 
-            char full[2048];
-            snprintf(full, sizeof(full), "%s/%s", dirpath, ent->d_name);
+            char name[256];
+            if (!note_name_from_filename(ent->d_name, name, sizeof(name))) continue;
+
+            char *full = join_path_alloc(dirpath, ent->d_name);
+            if (!full) continue;
             struct stat st;
-            if (stat(full, &st) != 0 || S_ISDIR(st.st_mode)) continue;
+            if (stat(full, &st) != 0 || S_ISDIR(st.st_mode)) { free(full); continue; }
 
             long clen = 0;
             char *content = read_entire_file(full, &clen);
+            free(full);
             if (!content) continue;
 
-            char name[256];
-            safe_strcpy(name, sizeof(name), ent->d_name);
-            char *dot = strrchr(name, '.');
-            if (dot) *dot = '\0';
-            if (name[0]) {
-                time_t mt = (st.st_mtime > 0) ? st.st_mtime : time(NULL);
-                int existing = db_find_id_by_name(name);
-                if (existing >= 0) {
-                    if (db_update_content(existing, content, mt)) updated++;
-                } else if (db_insert_note(name, content, mt, 0) >= 0) {
-                    added++;
-                }
-            }
+            time_t mt = (st.st_mtime > 0) ? st.st_mtime : time(NULL);
+            import_one_note(name, content, mt, &added, &updated);
             free(content);
         }
         closedir(d);
@@ -2730,10 +3042,14 @@ static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_u
 
     if (!dir_found) {
         db_exec("ROLLBACK;");
-        if (errbuf && errsz) snprintf(errbuf, errsz, "pasta nao encontrada: %s", dirpath);
+        if (errbuf && errsz) snprintf(errbuf, errsz, "pasta nao encontrada: %.200s", dirpath);
         return -1;
     }
-    db_exec("COMMIT;");
+    if (!db_exec("COMMIT;")) {
+        db_exec("ROLLBACK;");
+        if (errbuf && errsz) snprintf(errbuf, errsz, "falha ao confirmar a importacao");
+        return -1;
+    }
     if (out_added) *out_added = added;
     if (out_updated) *out_updated = updated;
     return added + updated;
@@ -2754,9 +3070,12 @@ static int export_notes_to_dir(const char *dirpath, char *errbuf, size_t errsz) 
         return -1;
     }
 
-    /* Cria a pasta de destino se ainda nao existir (o mkdir falhar por ja
-     * existir nao e erro). */
-    mkdir_utf8(dirpath);
+    /* Cria a pasta de destino se ainda nao existir (mkdir_utf8 devolve 0
+     * tambem quando ja existe e e um diretorio). */
+    if (mkdir_utf8(dirpath) != 0) {
+        if (errbuf && errsz) snprintf(errbuf, errsz, "nao foi possivel criar a pasta: %.200s", dirpath);
+        return -1;
+    }
 
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(g_db, "SELECT name, content FROM notes ORDER BY mtime DESC;",
@@ -2766,27 +3085,35 @@ static int export_notes_to_dir(const char *dirpath, char *errbuf, size_t errsz) 
     }
 
     int written = 0;
+    int failed = 0;
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *name = (const char *)sqlite3_column_text(st, 0);
         const char *content = (const char *)sqlite3_column_text(st, 1);
         int clen = sqlite3_column_bytes(st, 1);
-        if (!name || !*name) continue;
+        if (!name || !*name) { failed++; continue; }
 
         char safe[256];
         sanitize_note_name(name, safe, sizeof(safe));
-        if (!safe[0]) continue;
+        if (!safe[0]) { failed++; continue; }
 
         char fname[2048];
-        snprintf(fname, sizeof(fname), "%s%c%s.md", dirpath, PATH_SEP, safe);
+        int n = snprintf(fname, sizeof(fname), "%s%c%s.md", dirpath, PATH_SEP, safe);
+        if (n < 0 || n >= (int)sizeof(fname)) { failed++; continue; }
 
-        FILE *f = fopen_utf8(fname, "wb");
-        if (!f) continue;
-        if (content && clen > 0) fwrite(content, 1, (size_t)clen, f);
-        fclose(f);
+        if (!write_file_atomic(fname, content ? content : "", (long)clen)) {
+            failed++;
+            continue;
+        }
         written++;
     }
     sqlite3_finalize(st);
 
+    if (failed > 0) {
+        if (errbuf && errsz) {
+            snprintf(errbuf, errsz, "%d nota(s) nao puderam ser exportadas", failed);
+        }
+        if (written == 0) return -1;
+    }
     return written;
 }
 
@@ -2944,14 +3271,6 @@ static void load_attention_flags(void) {
     }
 }
 
-/* Persiste no banco o nivel de urgencia de cada nota em memoria. */
-static void save_attention_flags(void) {
-    for (int i = 0; i < E.num_notes; i++) {
-        int id = note_id_from_path(E.notes[i].filepath);
-        if (id >= 0) db_set_attention(id, E.notes[i].attention_level);
-    }
-}
-
 /* Reordena a lista pela prioridade e mantem a selecao sobre a nota indicada,
  * para o cursor nao "pular" para outra nota quando a ordem muda. */
 static void notes_resort_keep(const char *keep_path) {
@@ -2981,13 +3300,18 @@ static void toggle_note_attention_at(int actual_idx) {
     safe_strcpy(keep, sizeof(keep), E.notes[actual_idx].filepath);
     safe_strcpy(titulo, sizeof(titulo), E.notes[actual_idx].title);
 
-    E.notes[actual_idx].attention_level = (E.notes[actual_idx].attention_level + 1) % 7;
-    E.notes[actual_idx].needs_attention = (E.notes[actual_idx].attention_level > 0);
-    int nivel = E.notes[actual_idx].attention_level;
+    int nivel = (E.notes[actual_idx].attention_level + 1) % 7;
 
-    /* Persiste atomicamente no banco exclusivamente esta nota */
+    /* Persiste no banco ANTES de alterar a UI. Se a gravacao falhar, o nivel
+     * em memoria nao muda e a lista nao mente sobre o que esta salvo. */
     int id = note_id_from_path(E.notes[actual_idx].filepath);
-    if (id >= 0) db_set_attention(id, nivel);
+    if (id > 0 && !db_set_attention(id, nivel)) {
+        set_status_msg("Falha ao gravar a marcacao de urgencia no banco.");
+        return;
+    }
+
+    E.notes[actual_idx].attention_level = nivel;
+    E.notes[actual_idx].needs_attention = (nivel > 0);
 
     /* Reordena a lista por prioridade para agrupar as notas marcadas no topo */
     notes_resort_keep(keep);
@@ -3037,6 +3361,14 @@ static void rescan_notes(void) {
             }
             free(old_notes);
         }
+        if (E.filtered_indices) {
+            free(E.filtered_indices);
+            E.filtered_indices = NULL;
+        }
+        E.num_filtered = 0;
+        E.selected_note_idx = 0;
+        free_preview();
+        set_status_msg("Memoria insuficiente para recarregar as notas.");
         return;
     }
 
@@ -3069,8 +3401,8 @@ static void rescan_notes(void) {
                 note_path_from_id(nid, n->filepath, sizeof(n->filepath));
 
                 n->mtime = (mt > 0) ? mt : now;
-                n->attention_level = att;
-                n->needs_attention = (att > 0);
+                n->attention_level = (att >= 0 && att <= 6) ? att : 0;
+                n->needs_attention = (n->attention_level > 0);
                 format_rel_time(n->mtime, now, n->rel_time, sizeof(n->rel_time));
 
                 /* reaproveita o cache de busca se a nota nao mudou de data */
@@ -3113,6 +3445,13 @@ static void rescan_notes(void) {
 
     if (E.filtered_indices) free(E.filtered_indices);
     E.filtered_indices = (int *)malloc(sizeof(int) * (E.num_notes > 0 ? E.num_notes : 1));
+    if (!E.filtered_indices) {
+        E.num_filtered = 0;
+        E.selected_note_idx = 0;
+        free_preview();
+        set_status_msg("Memoria insuficiente para indexar as notas.");
+        return;
+    }
 
     apply_note_search(E.search_query);
 }
@@ -3172,7 +3511,7 @@ static void apply_note_search(const char *query) {
         E.filtered_indices[E.num_filtered++] = i;
     }
 
-    if (E.selected_note_idx >= E.num_filtered) {
+    if (E.selected_note_idx < 0 || E.selected_note_idx >= E.num_filtered) {
         E.selected_note_idx = 0;
         E.sidebar_scroll_y = 0;
     }
@@ -3289,6 +3628,7 @@ static void tab_save_active(void) {
 
 static void tab_load(int idx) {
     if (idx < 0 || idx >= E.num_tabs) return;
+    invalidate_typing_undo();
     E.active_tab = idx;
     Tab *t = &E.tabs[idx];
     snprintf(E.cur_filename, sizeof(E.cur_filename), "%s", t->cur_filename);
@@ -3344,7 +3684,11 @@ static void tab_close(int idx) {
 
     Tab *t = &E.tabs[idx];
     if (t->modified) {
-        save_tab_by_idx(idx);
+        if (!save_tab_by_idx(idx)) {
+            set_status_msg("Aba nao fechada: falha ao salvar as alteracoes");
+            return;
+        }
+        t = &E.tabs[idx];
     }
     if (t->lines) {
         for (int i = 0; i < t->num_lines; i++) line_free(&t->lines[i]);
@@ -3393,13 +3737,21 @@ static void tab_close(int idx) {
     g_screen_clear_needed = 1;
 }
 
-static void close_all_tabs(void) {
+static bool close_all_tabs(void) {
     tab_save_active();
+
+    /* Salva TODAS as abas antes de liberar qualquer uma. Se uma gravacao
+     * falhar, nada e fechado e o usuario nao perde o que ainda nao foi salvo. */
+    for (int i = 0; i < E.num_tabs; i++) {
+        if (E.tabs[i].modified && !save_tab_by_idx(i)) {
+            set_status_msg("Nao foi possivel salvar '%s'; abas mantidas abertas",
+                           E.tabs[i].cur_filename);
+            return false;
+        }
+    }
+
     for (int i = 0; i < E.num_tabs; i++) {
         Tab *t = &E.tabs[i];
-        if (t->modified) {
-            save_tab_by_idx(i);
-        }
         if (t->lines) {
             for (int l = 0; l < t->num_lines; l++) line_free(&t->lines[l]);
             free(t->lines);
@@ -3425,8 +3777,10 @@ static void close_all_tabs(void) {
     E.visual_start_x = 0;
     E.undo_count = 0;
     E.redo_count = 0;
+    invalidate_typing_undo();
     g_screen_clear_needed = 1;
     set_status_msg("Todas as abas foram fechadas. Clique na aba [➕ Nova Nota] para começar.");
+    return true;
 }
 
 /* Note History Management (Requirement 19) */
@@ -3458,6 +3812,7 @@ static void navigate_history(int steps) {
 
 static void open_note_by_path(const char *path, bool record_history) {
     if (!path || !*path) return;
+    invalidate_typing_undo();
 
     for (int i = 0; i < E.num_tabs; i++) {
         if (strcmp(E.tabs[i].cur_filepath, path) == 0) {
@@ -3620,8 +3975,28 @@ static bool save_tab_by_idx(int t_idx) {
     return true;
 }
 
+/* Ha alguma aba com alteracao nao salva? tab_save_active() garante que o
+ * buffer ativo esteja refletido na estrutura Tab antes da checagem. */
+static bool any_tab_modified(void) {
+    tab_save_active();
+    for (int i = 0; i < E.num_tabs; i++) {
+        if (E.tabs[i].modified) return true;
+    }
+    return false;
+}
+
+/* Salva todas as abas modificadas. Devolve false no primeiro erro, sem
+ * fechar nada; usado por :wq e por :q quando ha mais de uma aba. */
+static bool save_all_modified_tabs(void) {
+    tab_save_active();
+    for (int i = 0; i < E.num_tabs; i++) {
+        if (E.tabs[i].modified && !save_tab_by_idx(i)) return false;
+    }
+    return true;
+}
+
 static void check_autosave(void) {
-    long now = get_current_time_ms();
+    int64_t now = get_current_time_ms();
 
     /* Safety synchronization for active buffer */
     if (E.modified && E.first_unsaved_time == 0) {
@@ -3769,48 +4144,76 @@ static void create_new_note(const char *raw_name) {
 
 static void replace_in_current_note(const char *find_str, const char *rep_str) {
     if (!find_str || !*find_str || !rep_str || E.num_lines <= 0) return;
-    save_undo();
 
     int find_len = (int)strlen(find_str);
     int rep_len = (int)strlen(rep_str);
     int count = 0;
+    bool undo_saved = false;
+    bool oom = false;
 
     for (int i = 0; i < E.num_lines; i++) {
         Line *l = &E.lines[i];
         if (!l->chars || l->len < find_len) continue;
+        if (!strstr(l->chars, find_str)) continue;
 
         ABuffer nb;
         ab_init(&nb);
-        int j = 0;
-        bool line_changed = false;
+        int consumed = 0;
+        int line_hits = 0;
 
-        while (j <= l->len - find_len) {
-            if (strncmp(&l->chars[j], find_str, find_len) == 0) {
-                ab_append(&nb, rep_str, rep_len);
-                j += find_len;
-                count++;
-                line_changed = true;
-            } else {
-                ab_append(&nb, &l->chars[j], 1);
-                j++;
+        /* strstr encontra o proximo bloco de uma vez; antes o loop chamava
+         * ab_append byte a byte, o que dominava o custo em notas grandes. */
+        while (consumed <= l->len - find_len) {
+            const char *hit = strstr(l->chars + consumed, find_str);
+            if (!hit) break;
+            int idx = (int)(hit - l->chars);
+            if (idx > l->len - find_len) break;
+            ab_append(&nb, l->chars + consumed, idx - consumed);
+            ab_append(&nb, rep_str, rep_len);
+            if (nb.failed) break;
+            consumed = idx + find_len;
+            line_hits++;
+        }
+        if (!nb.failed && consumed < l->len) {
+            ab_append(&nb, l->chars + consumed, l->len - consumed);
+        }
+        if (nb.failed) {
+            ab_free(&nb);
+            oom = true;
+            break;
+        }
+
+        if (line_hits > 0) {
+            if (!undo_saved) {
+                /* Snapshot antes da primeira linha alterada: assim um comando
+                 * sem nenhuma ocorrencia nao consome undo nem apaga o redo. */
+                save_undo();
+                undo_saved = true;
             }
-        }
-        if (j < l->len) {
-            ab_append(&nb, &l->chars[j], l->len - j);
-        }
-
-        if (line_changed) {
             line_free(l);
             line_init(l, nb.b ? nb.b : "", nb.len);
             mark_modified();
+            count += line_hits;
         }
-        if (nb.b) free(nb.b);
+        ab_free(&nb);
     }
 
-    tab_save_active();
-    update_folding();
-    g_screen_clear_needed = 1;
-    set_status_msg("Substituição: %d ocorrência(s) de '%s' substituída(s)", count, find_str);
+    if (count > 0) {
+        if (E.cursor_y >= E.num_lines) E.cursor_y = E.num_lines - 1;
+        if (E.cursor_y < 0) E.cursor_y = 0;
+        if (E.cursor_x > E.lines[E.cursor_y].len) E.cursor_x = E.lines[E.cursor_y].len;
+        tab_save_active();
+        update_folding();
+        g_screen_clear_needed = 1;
+    }
+
+    if (oom) {
+        set_status_msg("Substituicao interrompida: memoria insuficiente (%d feitas)", count);
+    } else if (count == 0) {
+        set_status_msg("Nenhuma ocorrencia de '%s' encontrada", find_str);
+    } else {
+        set_status_msg("Substituição: %d ocorrência(s) de '%s' substituída(s)", count, find_str);
+    }
 }
 
 static bool rename_note(const char *old_path, const char *raw_new_name) {
@@ -3856,8 +4259,19 @@ static bool rename_note(const char *old_path, const char *raw_new_name) {
 
     if (rid < 0) {
         /* Fallback legado: nota aberta diretamente de um arquivo real
-         * (ex.: passar um caminho .md na linha de comando). */
-        snprintf(new_filepath, sizeof(new_filepath), "%s%c%s", DATA_DIR, PATH_SEP, new_filename);
+         * (ex.: passar um caminho .md na linha de comando). Renomeia no MESMO
+         * diretorio; antes o arquivo era movido para data/, que desde o
+         * backend SQLite pode nem existir. */
+        const char *last_sep = strrchr(old_path, PATH_SEP);
+        if (!last_sep) last_sep = strrchr(old_path, '/');
+        if (!last_sep) last_sep = strrchr(old_path, '\\');
+        if (last_sep) {
+            int dir_len = (int)(last_sep - old_path);
+            snprintf(new_filepath, sizeof(new_filepath), "%.*s%c%s",
+                     dir_len, old_path, PATH_SEP, new_filename);
+        } else {
+            safe_strcpy(new_filepath, sizeof(new_filepath), new_filename);
+        }
 
         if (strcmp(old_path, new_filepath) == 0) {
             set_status_msg("O nome da nota permanece o mesmo.");
@@ -4537,8 +4951,9 @@ static char *table_trim_copy(const char *src, int len) {
     while (start < end && (*start == ' ' || *start == '\t')) start++;
     while (end > start && (*(end - 1) == ' ' || *(end - 1) == '\t')) end--;
     int clen = (int)(end - start);
-    char *dst = (char *)malloc(clen + 1);
-    if (clen > 0) memcpy(dst, start, clen);
+    char *dst = (char *)malloc((size_t)clen + 1);
+    if (!dst) return NULL;
+    if (clen > 0) memcpy(dst, start, (size_t)clen);
     dst[clen] = '\0';
     return dst;
 }
@@ -4565,6 +4980,7 @@ static void align_table_lines(Line *lines, int start_y, int end_y) {
     enum ColAlign col_aligns[MAX_TABLE_COLS];
     for (int c = 0; c < MAX_TABLE_COLS; c++) col_aligns[c] = ALIGN_LEFT;
     int base_indent = -1;
+    int parsed_rows = 0;
 
     for (int r = 0; r < num_rows; r++) {
         Line *l = &lines[start_y + r];
@@ -4578,14 +4994,22 @@ static void align_table_lines(Line *lines, int start_y, int end_y) {
         rows[r].indent = indent;
         rows[r].num_cells = 0;
         rows[r].is_delim = false;
+        parsed_rows = r + 1;
 
         if (*p == '|') p++;
         bool all_delim = true;
+        bool truncated = false;
 
         while (*p && rows[r].num_cells < MAX_TABLE_COLS) {
             const char *next_bar = strchr(p, '|');
             int clen = next_bar ? (int)(next_bar - p) : (int)strlen(p);
             char *trimmed = table_trim_copy(p, clen);
+            if (!trimmed) {
+                for (int rr = 0; rr < parsed_rows; rr++) {
+                    for (int cc = 0; cc < rows[rr].num_cells; cc++) free(rows[rr].cells[cc]);
+                }
+                return; /* memoria insuficiente: nao altera nenhuma linha */
+            }
             int cell_idx = rows[r].num_cells++;
             rows[r].cells[cell_idx] = trimmed;
 
@@ -4593,11 +5017,25 @@ static void align_table_lines(Line *lines, int start_y, int end_y) {
                 all_delim = false;
             }
 
-            if (!next_bar) break;
+            if (!next_bar) { p = NULL; break; }
             p = next_bar + 1;
             const char *check = p;
             while (*check == ' ' || *check == '\t') check++;
-            if (!*check) break;
+            if (!*check) { p = NULL; break; }
+        }
+
+        /* Se ainda sobrou conteudo depois da 32a coluna, o alinhador nao
+         * consegue representar a linha: aborta sem perder as colunas extras. */
+        if (p) {
+            const char *rest = p;
+            while (*rest == ' ' || *rest == '\t') rest++;
+            if (*rest) truncated = true;
+        }
+        if (truncated) {
+            for (int rr = 0; rr < parsed_rows; rr++) {
+                for (int cc = 0; cc < rows[rr].num_cells; cc++) free(rows[rr].cells[cc]);
+            }
+            return;
         }
 
         if (rows[r].num_cells > 0 && all_delim) {
@@ -4739,6 +5177,19 @@ static bool table_align_at(int line_idx) {
 }
 
 static void table_align_all(void) {
+    bool has_complete_table = false;
+    for (int y = 0; y < E.num_lines; y++) {
+        if (!is_table_line(&E.lines[y])) continue;
+        int end = y;
+        while (end + 1 < E.num_lines && is_table_line(&E.lines[end + 1])) end++;
+        if (end > y) { has_complete_table = true; break; }
+        y = end;
+    }
+    if (!has_complete_table) {
+        set_status_msg("Nenhuma tabela com 2+ linhas encontrada nesta nota");
+        return;
+    }
+
     int aligned_count = 0;
     save_undo();
     for (int y = 0; y < E.num_lines; y++) {
@@ -4760,6 +5211,41 @@ static void table_align_all(void) {
     } else {
         set_status_msg("Nenhuma tabela encontrada nesta nota");
     }
+}
+
+static int table_count_columns(const Line *l) {
+    if (!l || !l->chars || l->len <= 0) return 2;
+    int start = 0, end = l->len;
+    while (start < end && (l->chars[start] == ' ' || l->chars[start] == '\t')) start++;
+    while (end > start && (l->chars[end - 1] == ' ' || l->chars[end - 1] == '\t')) end--;
+    if (start < end && l->chars[start] == '|') start++;
+    if (end > start && l->chars[end - 1] == '|') end--;
+
+    int bars = 0;
+    for (int i = start; i < end; i++) {
+        if (l->chars[i] == '|') bars++;
+    }
+    return bars + 1;
+}
+
+/* Insere uma linha vazia de tabela. Antes esta linha era montada em um buffer
+ * fixo de 512 bytes: uma linha com muitos '|' estourava a pilha. O ABuffer
+ * elimina o limite e o numero de colunas e limitado ao que o alinhador aceita. */
+static bool table_insert_blank_row(int at, int max_cols) {
+    if (max_cols <= 0) max_cols = 2;
+    if (max_cols > MAX_TABLE_COLS) return false;
+
+    ABuffer row;
+    ab_init(&row);
+    ab_append(&row, "|", 1);
+    for (int c = 0; c < max_cols; c++) ab_append(&row, "   |", 4);
+    if (row.failed || !row.b) {
+        ab_free(&row);
+        return false;
+    }
+    buf_insert_line(at, row.b, row.len);
+    ab_free(&row);
+    return true;
 }
 
 static void table_jump_next_cell(bool create_if_at_end) {
@@ -4797,22 +5283,8 @@ static void table_jump_next_cell(bool create_if_at_end) {
                 E.cursor_y++;
                 next_l = &E.lines[E.cursor_y];
             } else if (create_if_at_end) {
-                int max_cols = 0;
-                for (int c = 0; c < cur->len; c++) if (cur->chars[c] == '|') max_cols++;
-                if (max_cols > 0) max_cols--;
-                if (max_cols <= 0) max_cols = 2;
-
-                char new_row[512];
-                int bpos = 0;
-                new_row[bpos++] = '|';
-                for (int c = 0; c < max_cols; c++) {
-                    new_row[bpos++] = ' ';
-                    new_row[bpos++] = ' ';
-                    new_row[bpos++] = ' ';
-                    new_row[bpos++] = '|';
-                }
-                new_row[bpos] = '\0';
-                buf_insert_line(E.cursor_y + 1, new_row, bpos);
+                int max_cols = table_count_columns(cur);
+                if (!table_insert_blank_row(E.cursor_y + 1, max_cols)) return;
                 align_table_lines(E.lines, start_y, end_y + 1);
                 E.cursor_y++;
                 next_l = &E.lines[E.cursor_y];
@@ -4832,22 +5304,8 @@ static void table_jump_next_cell(bool create_if_at_end) {
     }
 
     if (create_if_at_end) {
-        int max_cols = 0;
-        for (int c = 0; c < cur->len; c++) if (cur->chars[c] == '|') max_cols++;
-        if (max_cols > 0) max_cols--;
-        if (max_cols <= 0) max_cols = 2;
-
-        char new_row[512];
-        int bpos = 0;
-        new_row[bpos++] = '|';
-        for (int c = 0; c < max_cols; c++) {
-            new_row[bpos++] = ' ';
-            new_row[bpos++] = ' ';
-            new_row[bpos++] = ' ';
-            new_row[bpos++] = '|';
-        }
-        new_row[bpos] = '\0';
-        buf_insert_line(E.cursor_y + 1, new_row, bpos);
+        int max_cols = table_count_columns(cur);
+        if (!table_insert_blank_row(E.cursor_y + 1, max_cols)) return;
         align_table_lines(E.lines, start_y, end_y + 1);
         E.cursor_y++;
         Line *new_l = &E.lines[E.cursor_y];
@@ -4876,23 +5334,9 @@ static bool table_insert_row_and_advance(void) {
     mark_modified();
 
     Line *cur = &E.lines[E.cursor_y];
-    int max_cols = 0;
-    for (int c = 0; c < cur->len; c++) if (cur->chars[c] == '|') max_cols++;
-    if (max_cols > 0) max_cols--;
-    if (max_cols <= 0) max_cols = 2;
+    int max_cols = table_count_columns(cur);
 
-    char new_row[512];
-    int bpos = 0;
-    new_row[bpos++] = '|';
-    for (int c = 0; c < max_cols; c++) {
-        new_row[bpos++] = ' ';
-        new_row[bpos++] = ' ';
-        new_row[bpos++] = ' ';
-        new_row[bpos++] = '|';
-    }
-    new_row[bpos] = '\0';
-
-    buf_insert_line(E.cursor_y + 1, new_row, bpos);
+    if (!table_insert_blank_row(E.cursor_y + 1, max_cols)) return false;
     align_table_lines(E.lines, start_y, end_y + 1);
 
     E.cursor_y++;
@@ -5220,6 +5664,8 @@ static bool find_visual_row(bool in_preview, int target_vrow, int avail_w,
             if (out_sub_idx) *out_sub_idx = sub;
             if (out_seg) *out_seg = segs[sub];
             found = true;
+            /* Sem total solicitado, nao ha motivo para continuar ate o fim. */
+            if (!out_total_vrows) return true;
         }
         current_vrow += nsegs;
     }
@@ -5932,7 +6378,7 @@ static void render_tab_bar(ABuffer *ab) {
     if (tab_w < min_tab_w) tab_w = min_tab_w;
 
     int cols_drawn = 0;
-    long now_ms = get_current_time_ms();
+    int64_t now_ms = get_current_time_ms();
     int cur_screen_col = E.left_width + 2;
 
     int max_visible = (bar_width - 1) / min_tab_w;
@@ -6253,6 +6699,144 @@ static bool is_bullet_list_line(const Line *l, int *bullet_pos, char *bullet_cha
     return false;
 }
 
+/* Cursor de renderizacao por quadro.
+ *
+ * render_right_panel() e chamado uma vez por linha visivel. Antes, cada chamada
+ * refazia find_visual_row() desde a linha 0, ou seja O(linhas) por linha da
+ * tela (O(linhas * altura) por quadro). Este cursor guarda a linha/segmento
+ * atual e avanca um segmento por chamada; o custo cai para O(linhas + altura)
+ * por quadro. E resetado no inicio de cada refresh_screen(), entao nao ha
+ * cache entre quadros nem risco de dados obsoletos. */
+typedef struct {
+    bool valid;
+    bool at_end;
+    bool preview;
+    const Line *lines;
+    int num_lines;
+    int avail_w;
+    int line_idx;
+    int line_vrow;
+    int sub_idx;
+    int nsegs;
+    int total_vrows;  /* valido quando a ultima busca chegou ao fim do buffer */
+    LineSegment segs[128];
+} RenderCursor;
+
+static RenderCursor g_render_cursor;
+
+static void render_cursor_reset(void) {
+    memset(&g_render_cursor, 0, sizeof(g_render_cursor));
+}
+
+static int build_render_segments(const Line *l, int avail_w, bool in_preview,
+                                 LineSegment *segs, int max_segs) {
+    if (E.wrap_mode && !l->is_code_fence && !is_table_line(l)) {
+        return get_line_segments(l, avail_w, segs, max_segs,
+                                 should_hide_links(in_preview),
+                                 should_hide_markdown_styles(in_preview));
+    }
+    if (max_segs > 0) {
+        segs[0].byte_offset = 0;
+        segs[0].byte_len = l->len;
+        return 1;
+    }
+    return 0;
+}
+
+static bool render_cursor_advance(void) {
+    RenderCursor *c = &g_render_cursor;
+    if (!c->valid) return false;
+
+    if (c->sub_idx + 1 < c->nsegs) {
+        c->sub_idx++;
+        return true;
+    }
+
+    int next = c->line_idx + 1;
+    while (next < c->num_lines && c->lines[next].hidden) next++;
+    if (next >= c->num_lines) {
+        c->at_end = true;
+        c->valid = false;
+        c->total_vrows = c->line_vrow + c->nsegs;
+        return false;
+    }
+
+    c->line_vrow += c->nsegs;
+    c->line_idx = next;
+    c->sub_idx = 0;
+    c->nsegs = build_render_segments(&c->lines[next], c->avail_w, c->preview,
+                                     c->segs, (int)(sizeof(c->segs) / sizeof(c->segs[0])));
+    if (c->nsegs <= 0) {
+        c->at_end = true;
+        c->valid = false;
+        return false;
+    }
+    return true;
+}
+
+static bool render_cursor_locate(bool in_preview, int target_vrow, int avail_w) {
+    RenderCursor *c = &g_render_cursor;
+    Line *lines = in_preview ? g_preview.lines : E.lines;
+    int num_lines = in_preview ? g_preview.num_lines : E.num_lines;
+
+    c->valid = false;
+    c->at_end = false;
+    c->preview = in_preview;
+    c->lines = lines;
+    c->num_lines = num_lines;
+    c->avail_w = avail_w;
+    c->line_idx = -1;
+    c->line_vrow = 0;
+    c->total_vrows = -1;
+
+    int vrow = 0;
+    for (int i = 0; i < num_lines; i++) {
+        if (lines[i].hidden) continue;
+        int nsegs = build_render_segments(&lines[i], avail_w, in_preview,
+                                          c->segs, (int)(sizeof(c->segs) / sizeof(c->segs[0])));
+        if (nsegs <= 0) continue;
+        if (target_vrow < vrow + nsegs) {
+            c->valid = true;
+            c->line_idx = i;
+            c->line_vrow = vrow;
+            c->sub_idx = target_vrow - vrow;
+            c->nsegs = nsegs;
+            return true;
+        }
+        vrow += nsegs;
+    }
+
+    c->at_end = true;
+    c->valid = false;
+    c->total_vrows = vrow;
+    return false;
+}
+
+static bool render_cursor_get(bool in_preview, int target_vrow, int avail_w,
+                              int *out_line_idx, int *out_sub_idx, LineSegment *out_seg) {
+    RenderCursor *c = &g_render_cursor;
+    Line *lines = in_preview ? g_preview.lines : E.lines;
+    int num_lines = in_preview ? g_preview.num_lines : E.num_lines;
+
+    bool same_context = c->lines == lines && c->num_lines == num_lines &&
+                        c->preview == in_preview && c->avail_w == avail_w;
+    int current = c->line_vrow + c->sub_idx;
+
+    if (!same_context || !c->valid || c->at_end || target_vrow < current) {
+        if (!render_cursor_locate(in_preview, target_vrow, avail_w)) return false;
+    } else {
+        while (c->line_vrow + c->sub_idx < target_vrow) {
+            if (!render_cursor_advance()) return false;
+        }
+    }
+
+    if (!c->valid || c->line_vrow + c->sub_idx != target_vrow) return false;
+    if (out_line_idx) *out_line_idx = c->line_idx;
+    if (out_sub_idx) *out_sub_idx = c->sub_idx;
+    if (out_seg) *out_seg = c->segs[c->sub_idx];
+    return true;
+}
+
 /* Render editor content row with visual soft wrap */
 
 static void render_right_panel(ABuffer *ab, int screen_row) {
@@ -6304,8 +6888,8 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
     int visible_line_idx = -1;
     int sub_idx = -1;
     LineSegment seg;
-    int total_vrows = 0;
-    bool found = find_visual_row(in_preview, target_vrow, avail_text_w, &visible_line_idx, &sub_idx, &seg, &total_vrows);
+    bool found = render_cursor_get(in_preview, target_vrow, avail_text_w,
+                                   &visible_line_idx, &sub_idx, &seg);
 
     ab_append(ab, TH_BG_MAIN, -1);
 
@@ -6992,11 +7576,26 @@ static void editor_scroll(void) {
     int cur_vrow = 0, cur_vcol = 0;
     get_cursor_visual_pos(avail_text_w, &cur_vrow, &cur_vcol);
 
-    int total_vrows = 0;
-    find_visual_row(false, 0, avail_text_w, NULL, NULL, NULL, &total_vrows);
+    if (E.scroll_y < 0) E.scroll_y = 0;
 
-    /* Clamp scroll_y if window expanded or text re-wrapped so we never stay in blank space */
-    if (total_vrows > 0) {
+    /* Clamp scroll_y sem varrer o documento inteiro: conta apenas as linhas
+     * visuais a partir do scroll atual. Se a tela enche, nao ha o que limitar;
+     * se o documento termina antes, o total e conhecido. */
+    int total_vrows = -1;
+    {
+        render_cursor_reset();
+        int probe = E.scroll_y;
+        int counted = 0;
+        LineSegment probe_seg;
+        int probe_line = -1, probe_sub = -1;
+        while (counted < visible_rows &&
+               render_cursor_get(false, probe, avail_text_w, &probe_line, &probe_sub, &probe_seg)) {
+            counted++;
+            probe++;
+        }
+        if (counted < visible_rows) total_vrows = g_render_cursor.total_vrows;
+    }
+    if (total_vrows >= 0) {
         int max_scroll = total_vrows - visible_rows;
         if (max_scroll < 0) max_scroll = 0;
         if (E.scroll_y > max_scroll) {
@@ -7014,10 +7613,19 @@ static void editor_scroll(void) {
 
     /* Clamp preview scroll_y as well */
     if (E.focus == FOCUS_LEFT && g_preview.lines) {
-        int prev_total = 0;
-        find_visual_row(true, 0, avail_text_w, NULL, NULL, NULL, &prev_total);
-        if (prev_total > 0) {
-            int max_pscroll = prev_total - visible_rows;
+        if (g_preview.scroll_y < 0) g_preview.scroll_y = 0;
+        render_cursor_reset();
+        int probe = g_preview.scroll_y;
+        int counted = 0;
+        LineSegment probe_seg;
+        int probe_line = -1, probe_sub = -1;
+        while (counted < visible_rows &&
+               render_cursor_get(true, probe, avail_text_w, &probe_line, &probe_sub, &probe_seg)) {
+            counted++;
+            probe++;
+        }
+        if (counted < visible_rows && g_render_cursor.total_vrows >= 0) {
+            int max_pscroll = g_render_cursor.total_vrows - visible_rows;
             if (max_pscroll < 0) max_pscroll = 0;
             if (g_preview.scroll_y > max_pscroll) {
                 g_preview.scroll_y = max_pscroll;
@@ -7038,6 +7646,35 @@ static void editor_scroll(void) {
         E.sidebar_scroll_y = E.num_filtered - max_sidebar_visible;
     }
     if (E.sidebar_scroll_y < 0) E.sidebar_scroll_y = 0;
+}
+
+/* Escrita completa no stdout. write()/WriteFile() podem aceitar apenas parte
+ * do buffer (console, pipe, sinal); ignorar o retorno deixava o quadro pela
+ * metade. Este laco trata EINTR e escribas parciais. */
+static bool write_stdout_all(const char *data, int len) {
+    if (!data || len <= 0) return true;
+    int off = 0;
+    while (off < len) {
+        int chunk = len - off;
+        if (chunk > 32768) chunk = 32768;
+#ifdef _WIN32
+        DWORD written = 0;
+        if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), data + off, (DWORD)chunk,
+                       &written, NULL) || written == 0) {
+            return false;
+        }
+        off += (int)written;
+#else
+        ssize_t n = write(STDOUT_FILENO, data + off, (size_t)chunk);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        off += (int)n;
+#endif
+    }
+    return true;
 }
 
 static void refresh_screen(void) {
@@ -7086,6 +7723,7 @@ static void refresh_screen(void) {
 
     ab_append(&ab, "\x1b[?25l", 6);
 
+    render_cursor_reset();
     int editor_rows = E.screen_rows - (1 + E.status_bar_lines);
 
     for (int r = 0; r < editor_rows; r++) {
@@ -7221,12 +7859,14 @@ static void refresh_screen(void) {
         ab_append(&ab, cpos, (int)strlen(cpos));
     }
 
-#ifdef _WIN32
-    DWORD written;
-    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), ab.b, ab.len, &written, NULL);
-#else
-    write(STDOUT_FILENO, ab.b, ab.len);
-#endif
+    if (ab.failed || !ab.b) {
+        /* Nunca emite um quadro truncado: agenda uma nova tentativa completa. */
+        g_screen_clear_needed = 1;
+        g_needs_redraw = 1;
+    } else if (!write_stdout_all(ab.b, ab.len)) {
+        g_screen_clear_needed = 1;
+        g_needs_redraw = 1;
+    }
     ab_free(&ab);
 }
 
@@ -7249,7 +7889,7 @@ static int g_unget_byte = -1;
 static unsigned char g_input_queue[512];
 static int g_input_q_head = 0;
 static int g_input_q_tail = 0;
-static long g_last_typing_time = 0;
+static int64_t g_last_typing_time = 0;
 
 static void queue_input_byte(unsigned char b) {
     if (g_input_q_tail < (int)sizeof(g_input_queue)) {
@@ -7675,17 +8315,26 @@ static int editor_read_key(void) {
 }
 
 static void execute_delete_selected_note(void) {
-    if (E.num_filtered > 0 && E.selected_note_idx < E.num_filtered) {
+    if (E.num_filtered > 0 && E.selected_note_idx >= 0 &&
+        E.selected_note_idx < E.num_filtered) {
         int actual = E.filtered_indices[E.selected_note_idx];
         char target_path[512];
         safe_strcpy(target_path, sizeof(target_path), E.notes[actual].filepath);
 
-        /* Remove a nota do banco (ou o arquivo, se for caminho real) */
+        /* Remove a nota do banco (ou o arquivo, se for caminho real). Se a
+         * exclusao falhar, mantem tudo como esta em vez de fechar as abas e
+         * anunciar sucesso. */
         int did = note_id_from_path(target_path);
-        if (did >= 0) {
-            db_delete_note(did);
+        if (did > 0) {
+            if (!db_delete_note(did)) {
+                set_status_msg("Falha ao excluir a nota do banco.");
+                return;
+            }
         } else {
-            unlink_utf8(target_path);
+            if (unlink_utf8(target_path) != 0) {
+                set_status_msg("Falha ao excluir o arquivo: %s", target_path);
+                return;
+            }
         }
 
         /* Close tabs associated with this note */
@@ -7716,13 +8365,13 @@ static void execute_delete_selected_note(void) {
     }
 }
 
-static long g_last_theme_click_time = 0;
-static long g_last_activity_time = 0;
-static long g_last_note_click_time = 0;
+static int64_t g_last_theme_click_time = 0;
+static int64_t g_last_activity_time = 0;
+static int64_t g_last_note_click_time = 0;
 static int g_last_clicked_note_idx = -1;
 
 static void handle_mouse_event(void) {
-    long now = get_current_time_ms();
+    int64_t now = get_current_time_ms();
 
     /* 1. Modal Prompt Insulation: protect prompt modes from background clicks/drags */
     if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
@@ -7826,7 +8475,6 @@ static void handle_mouse_event(void) {
         }
         /* Check Bottom Bar Buttons click on Status Bar (always row screen_rows - 1) */
         if (E.mouse_row == E.screen_rows - 1) {
-            long now = get_current_time_ms();
             if (now - g_last_theme_click_time > 200) {
                 g_last_theme_click_time = now;
                 if (E.mouse_col >= E.btn_new_start && E.mouse_col < E.btn_new_end) {
@@ -8047,7 +8695,6 @@ static void handle_mouse_event(void) {
                     return;
                 }
 
-                long now = get_current_time_ms();
                 if (clicked_note == g_last_clicked_note_idx && (now - g_last_note_click_time < 500)) {
                     /* Double click: Open note in tab and switch focus to editor */
                     g_last_clicked_note_idx = -1;
@@ -8204,7 +8851,9 @@ static void execute_bottom_command(const char *cmd) {
                strcmp(cmd, "close_all") == 0 || strcmp(cmd, "bdall") == 0) {
         close_all_tabs();
     } else if (strcmp(cmd, "q") == 0 || strcmp(cmd, "qa") == 0) {
-        if (E.modified) {
+        /* :q tambem verifica abas em segundo plano: antes so E.modified era
+         * olhado e uma alteracao em outra aba podia ser perdida. */
+        if (any_tab_modified()) {
             set_status_msg("Modificações não salvas! Use :w para salvar ou :q! para forçar");
         } else {
             E.quit_requested = true;
@@ -8212,7 +8861,9 @@ static void execute_bottom_command(const char *cmd) {
     } else if (strcmp(cmd, "q!") == 0 || strcmp(cmd, "qa!") == 0) {
         E.quit_requested = true;
     } else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "x") == 0 || strcmp(cmd, "wqa") == 0 || strcmp(cmd, "wqa!") == 0) {
-        if (save_current_note()) {
+        /* Salva todas as abas alteradas antes de sair; se qualquer gravacao
+         * falhar, permanece no editor com a mensagem de erro. */
+        if (save_all_modified_tabs()) {
             E.quit_requested = true;
         }
     } else if (strcmp(cmd, "zm") == 0 || strcmp(cmd, "zM") == 0 || strcmp(cmd, "foldall") == 0) {
@@ -8243,9 +8894,12 @@ static void execute_bottom_command(const char *cmd) {
         }
         g_screen_clear_needed = 1;
     } else if (strcmp(cmd, "tabnew") == 0) {
-        char init_path[512];
-        snprintf(init_path, sizeof(init_path), "%s%cNova_Nota_%d.md", DATA_DIR, PATH_SEP, E.num_tabs + 1);
-        open_note_by_path(init_path, true);
+        /* Cria de fato uma nota no SQLite. Antes era aberto um caminho em
+         * data/ (que pode nao existir), gerando uma aba vazia que falhava ao
+         * salvar. create_new_note() cuida de nome duplicado e de abrir a aba. */
+        char init_name[64];
+        snprintf(init_name, sizeof(init_name), "Nova_Nota_%d", E.num_tabs + 1);
+        create_new_note(init_name);
     } else if (strcmp(cmd, "nextlink") == 0 || strcmp(cmd, "nl") == 0) {
         jump_to_next_link();
     } else if (strcmp(cmd, "table") == 0 || strcmp(cmd, "tablealign") == 0 || strcmp(cmd, "ta") == 0) {
@@ -8354,11 +9008,15 @@ static void execute_bottom_command(const char *cmd) {
         for (int i = 0; i < E.num_notes; i++) {
             if (strcmp(E.notes[i].filepath, E.cur_filepath) == 0) {
                 if (target_level >= 0) {
+                    int nid = note_id_from_path(E.notes[i].filepath);
+                    if (nid > 0 && !db_set_attention(nid, target_level)) {
+                        set_status_msg("Falha ao gravar a marcacao de urgencia no banco.");
+                        break;
+                    }
                     char keep[512];
                     safe_strcpy(keep, sizeof(keep), E.notes[i].filepath);
                     E.notes[i].attention_level = target_level;
                     E.notes[i].needs_attention = (target_level > 0);
-                    save_attention_flags();
                     notes_resort_keep(keep);
                     g_screen_clear_needed = 1;
                     switch (target_level) {
@@ -8555,12 +9213,7 @@ static bool handle_prompt_line_edit(char *buf, size_t max_sz, int *cursor, int c
  * ========================================================================= */
 
 static void terminal_write(const char *s, int len) {
-#ifdef _WIN32
-    DWORD written;
-    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), s, len, &written, NULL);
-#else
-    if (write(STDOUT_FILENO, s, len) < 0) { /* ignore */ }
-#endif
+    (void)write_stdout_all(s, len);
 }
 
 static void run_game_of_life(void) {
@@ -8594,7 +9247,7 @@ static void run_game_of_life(void) {
     int generation = 0;
     int stagnant_count = 0;
     int last_live_count = 0;
-    long start_time = get_current_time_ms();
+    int64_t start_time = get_current_time_ms();
 
     while (1) {
         /* Compute next generation (toroidal wrap on rows - 1) */
@@ -8759,7 +9412,7 @@ static void editor_process_keypress(void) {
         return;
     }
     if (c == -1) {
-        long now = get_current_time_ms();
+        int64_t now = get_current_time_ms();
         if (g_last_activity_time > 0 && now - g_last_activity_time >= GAMEOFLIFE_IDLE_TIMEOUT_MS) { /* 10 minutes inactivity */
             run_game_of_life();
             g_last_activity_time = get_current_time_ms();
@@ -9652,7 +10305,8 @@ static void editor_process_keypress(void) {
                 delete_visual_selection();
                 E.has_selection = false;
             }
-            save_undo();
+            int ins_len = (g_last_utf8_len > 0) ? g_last_utf8_len : 1;
+            save_undo_for_typing(E.cursor_y, E.cursor_x, ins_len);
             if (g_last_utf8_len > 0) {
                 line_replace_range(&E.lines[E.cursor_y], E.cursor_x, 0, g_last_utf8_char, g_last_utf8_len);
                 E.cursor_x += g_last_utf8_len;
@@ -10451,7 +11105,7 @@ static bool should_refresh_now(void) {
         return true;
     }
 
-    long now = get_current_time_ms();
+    int64_t now = get_current_time_ms();
 
     /* Marquee de titulo longo: mesma cadencia de 300 ms usada em render_tab_bar,
      * e somente quando ha de fato algo rolando. */
@@ -10480,18 +11134,20 @@ static bool should_refresh_now(void) {
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
 #ifdef _WIN32
-    SetConsoleCP(CP_UTF8);
-    SetConsoleOutputCP(CP_UTF8);
-    char exe_dir[MAX_PATH];
-    if (GetModuleFileNameA(NULL, exe_dir, MAX_PATH)) {
-        char *slash = strrchr(exe_dir, '\\');
+    /* Codepage UTF-8 e configurada em enable_raw_mode(), que guarda os valores
+     * anteriores para restaura-los no fim. Usar a API Wide evita falhar quando
+     * o executavel esta em uma pasta com acentos/Unicode. */
+    WCHAR wexe_dir[32768];
+    DWORD wlen = GetModuleFileNameW(NULL, wexe_dir, (DWORD)(sizeof(wexe_dir) / sizeof(wexe_dir[0])));
+    if (wlen > 0 && wlen < (DWORD)(sizeof(wexe_dir) / sizeof(wexe_dir[0]))) {
+        WCHAR *slash = wcsrchr(wexe_dir, L'\\');
         if (slash) {
-            *slash = '\0';
-            SetCurrentDirectoryA(exe_dir);
+            *slash = L'\0';
+            SetCurrentDirectoryW(wexe_dir);
         }
     }
 #else
-    char exe_dir[1024];
+    char exe_dir[4096];
     ssize_t elen = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
     if (elen > 0) {
         exe_dir[elen] = '\0';

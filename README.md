@@ -32,6 +32,7 @@ Projetado para oferecer velocidade extrema (0 ms de latência), independência d
   - [Compilação no Linux](#no-linux-gcc--clang)
   - [Cross-compilação Linux -> Windows](#cross-compilação-linux---windows)
 - [Tabela Completa de Atalhos e Comandos](#-tabela-completa-de-atalhos-e-comandos)
+- [Robustez, Integridade e Desempenho](#-robustez-integridade-e-desempenho)
 
 ---
 
@@ -49,7 +50,7 @@ Projetado para oferecer velocidade extrema (0 ms de latência), independência d
 - **Banco de Dados SQLite Integrado (`notas.db`)**:
   - Modo WAL ativado para concorrência e gravações atômicas instantâneas.
   - Importação de pastas inteiras de arquivos `.md` e exportação com um clique.
-- **Salvamento Automático Silencioso**: Notas modificadas são gravadas periodicamente a cada 1 minuto de inatividade, preservando 100% o histórico de `u` (undo) e `Ctrl + R` (redo).
+- **Salvamento Automático Silencioso**: Notas modificadas são gravadas periodicamente a cada 1 minuto de inatividade. A digitação contínua é agrupada em um único passo de `u` (undo), como uma sessão de inserção do Vim, sem consumir um snapshot por tecla.
 - **8 Temas do VS Code em Cores RGB Reais (24-bit TrueColor)**: *Tokyo Night*, *One Dark Pro*, *Dracula*, *Monokai Pro*, *GitHub Dark*, *GitHub Light*, *VS Code Light+* e *Solarized Light*.
 
 ---
@@ -305,6 +306,34 @@ O repositório já inclui a biblioteca SQLite estática para Windows em `tools/s
 | **`[📄 Wrap]`** / **`:wrap`** | Qualquer | Alterna quebra automática de linha (*Soft Word Wrap*) |
 | **`[🧬 Life]`** / **`:life`** | Qualquer | Inicia a simulação do Game of Life |
 | **`:q`** / **`:wq`** / **`:q!`** | Comando | Fecha aba / Salva e sai / Sai forçadamente |
+
+---
+
+## 🛡️ Robustez, Integridade e Desempenho
+
+Esta versão passou por uma rodada de endurecimento focada em falhas reais de memória, persistência e renderização:
+
+| Área | Melhoria |
+| :--- | :--- |
+| **Escrita de arquivos** | Exportação e o fallback de arquivo real usam gravação atômica (temporário + `fsync` + `rename`), em vez de truncar o destino antes de escrever. |
+| **SQLite** | `db_open()` fecha o handle em qualquer falha de schema; a versão do schema é lida antes de gravar; IDs virtuais (`db:<id>`) são validados com `strtol`; importação só confirma com `COMMIT` verificado e faz `ROLLBACK` em erro. |
+| **Abas e saída** | `:q` verifica alterações em **todas** as abas; `:wq` salva todas as abas modificadas; fechar aba/`C`/`:closeall` não descarta dados se a gravação falhar. |
+| **Tabelas Markdown** | A linha nova deixou de usar buffer fixo de 512 bytes (risco de estouro de pilha); tabelas com mais de 32 colunas são recusadas em vez de perder colunas silenciosamente. |
+| **Renderização** | O cursor visual avança por linha/segmento em vez de varrer o documento inteiro a cada linha da tela. Em cadernos grandes isso reduz o custo de `O(linhas × altura)` para `O(linhas + altura)` por quadro. |
+| **Undo/Redo** | Snapshots completos continuam existindo, mas teclas consecutivas na mesma posição são agrupadas (janela de 800 ms), reduzindo memória e tempo por caractere. |
+| **Clipboard** | Corrigido o padding do Base64 do OSC 52 (`YQ==`, `YWI=`), que fazia terminais rejeitarem cópias de 1 ou 2 bytes; a leitura do clipboard Win32 é limitada ao tamanho real do bloco. |
+| **Links e caminhos** | No Linux, links são abertos com `fork`/`exec` (sem shell, sem injeção); no Windows, caminhos UTF-8 são convertidos para UTF-16 sem limite de 1024 bytes e a URL é validada antes do `ShellExecuteW`. |
+| **Terminal e tempo** | Escritas tratam envios parciais e `EINTR`; timers usam `int64_t`/`GetTickCount64`; o encerramento é idempotente e restaura o code page original do Windows. |
+
+### Testes
+
+O teste de armazenamento compila o próprio `notas.c` e cobre CRUD, importação, reexportação, IDs inválidos, Base64 e escrita atômica:
+
+```bash
+./tools/test/run_tests.sh
+```
+
+No Windows, o mesmo teste pode ser compilado diretamente com o MinGW e executado a partir de uma pasta de trabalho vazia (ele cria o `notas.db` local).
 
 ---
 
