@@ -31,7 +31,7 @@
   #include <direct.h>
   #include <io.h>
   #define PATH_SEP '\\'
-  #define mkdir_cross(dir) _mkdir(dir)
+  #define mkdir_cross(dir) mkdir_utf8(dir)
 
   /* Fallback definitions for Windows 10+ Virtual Terminal console flags (MinGW compatibility) */
   #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -55,7 +55,7 @@
   #include <sys/time.h>
   #include <pthread.h>
   #define PATH_SEP '/'
-  #define mkdir_cross(dir) mkdir(dir, 0755)
+  #define mkdir_cross(dir) mkdir_utf8(dir)
 #endif
 
 static void safe_strcpy(char *dest, size_t dest_sz, const char *src) {
@@ -765,6 +765,21 @@ static int rename_utf8(const char *oldpath, const char *newpath) {
     return rename(oldpath, newpath);
 #else
     return rename(oldpath, newpath);
+#endif
+}
+
+static int mkdir_utf8(const char *dir) {
+#ifdef _WIN32
+    WCHAR wdir[1024];
+    if (MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1024) > 0) {
+        if (CreateDirectoryW(wdir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+            return 0;
+        }
+        return -1;
+    }
+    return _mkdir(dir);
+#else
+    return mkdir(dir, 0755);
 #endif
 }
 
@@ -1757,15 +1772,6 @@ static void line_insert_char(Line *l, int at, char c) {
     mark_modified();
 }
 
-static void line_delete_char(Line *l, int at) {
-    if (at < 0 || at >= l->len) return;
-    memmove(&l->chars[at], &l->chars[at + 1], l->len - at);
-    l->len--;
-    l->chars[l->len] = '\0';
-    detect_heading(l);
-    mark_modified();
-}
-
 static void line_replace_range(Line *l, int at, int del_len, const char *new_str, int new_len) {
     if (at < 0 || at > l->len) return;
     if (at + del_len > l->len) del_len = l->len - at;
@@ -1787,6 +1793,15 @@ static void line_replace_range(Line *l, int at, int del_len, const char *new_str
     l->chars[l->len] = '\0';
     detect_heading(l);
     mark_modified();
+}
+
+static void line_delete_char(Line *l, int at) {
+    if (at < 0 || at >= l->len) return;
+    int bytes = 1;
+    utf8_decode_codepoint(&l->chars[at], &bytes);
+    if (bytes <= 0) bytes = 1;
+    if (at + bytes > l->len) bytes = l->len - at;
+    line_replace_range(l, at, bytes, NULL, 0);
 }
 
 static void line_append_string(Line *l, const char *s, int len) {
@@ -1812,6 +1827,7 @@ static void editor_paste_string(const char *text, int len) {
             E.search_query[qlen++] = text[j];
         }
         E.search_query[qlen] = '\0';
+        E.search_cursor = qlen;
         apply_note_search(E.search_query);
         if (E.num_filtered > 0) {
             int actual = E.filtered_indices[E.selected_note_idx];
@@ -1840,6 +1856,7 @@ static void editor_paste_string(const char *text, int len) {
             E.prompt_buf[plen++] = text[j];
         }
         E.prompt_buf[plen] = '\0';
+        E.prompt_cursor = plen;
         return;
     }
 
@@ -2028,6 +2045,10 @@ static void save_undo(void) {
     us->cursor_y = E.cursor_y;
     us->cursor_x = E.cursor_x;
     us->lines = (Line *)malloc(sizeof(Line) * (E.num_lines > 0 ? E.num_lines : 1));
+    if (!us->lines) {
+        E.undo_count--;
+        return;
+    }
     for (int i = 0; i < E.num_lines; i++) {
         line_init(&us->lines[i], E.lines[i].chars, E.lines[i].len);
         us->lines[i].heading_lvl = E.lines[i].heading_lvl;
@@ -2055,6 +2076,10 @@ static void apply_undo(void) {
     rs->cursor_y = E.cursor_y;
     rs->cursor_x = E.cursor_x;
     rs->lines = (Line *)malloc(sizeof(Line) * (E.num_lines > 0 ? E.num_lines : 1));
+    if (!rs->lines) {
+        E.redo_count--;
+        return;
+    }
     for (int i = 0; i < E.num_lines; i++) {
         line_init(&rs->lines[i], E.lines[i].chars, E.lines[i].len);
         rs->lines[i].heading_lvl = E.lines[i].heading_lvl;
@@ -2092,6 +2117,10 @@ static void apply_redo(void) {
     us->cursor_y = E.cursor_y;
     us->cursor_x = E.cursor_x;
     us->lines = (Line *)malloc(sizeof(Line) * (E.num_lines > 0 ? E.num_lines : 1));
+    if (!us->lines) {
+        E.undo_count--;
+        return;
+    }
     for (int i = 0; i < E.num_lines; i++) {
         line_init(&us->lines[i], E.lines[i].chars, E.lines[i].len);
         us->lines[i].heading_lvl = E.lines[i].heading_lvl;
@@ -2250,18 +2279,20 @@ static int compare_notes_mtime(const void *a, const void *b) {
 }
 
 static char *read_entire_file(const char *path, long *out_len) {
+    if (out_len) *out_len = 0;
     FILE *f = fopen_utf8(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long len = ftell(f);
+    if (len < 0) { fclose(f); return NULL; }
     fseek(f, 0, SEEK_SET);
-    char *buf = (char *)malloc(len + 1);
+    char *buf = (char *)malloc((size_t)len + 1);
     if (buf) {
-        fread(buf, 1, len, f);
-        buf[len] = '\0';
+        size_t bytes_read = fread(buf, 1, (size_t)len, f);
+        buf[bytes_read] = '\0';
+        if (out_len) *out_len = (long)bytes_read;
     }
     fclose(f);
-    if (out_len) *out_len = len;
     return buf;
 }
 
@@ -2540,6 +2571,10 @@ static char *lines_to_content(Line *lines, int num_lines, long *out_len) {
 static void editor_load_content(const char *content) {
     if (!content) return;
     const char *p = content;
+    /* Pula UTF-8 BOM (\xEF\xBB\xBF) se presente no inicio */
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+        p += 3;
+    }
     while (*p) {
         const char *nl = strchr(p, '\n');
         int linelen = nl ? (int)(nl - p) : (int)strlen(p);
@@ -2611,6 +2646,8 @@ static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_u
 
     int added = 0, updated = 0;
     bool dir_found = false;
+
+    db_exec("BEGIN TRANSACTION;");
 
 #ifdef _WIN32
     WCHAR wdir[1024];
@@ -2692,9 +2729,11 @@ static int import_notes_from_dir(const char *dirpath, int *out_added, int *out_u
 #endif
 
     if (!dir_found) {
+        db_exec("ROLLBACK;");
         if (errbuf && errsz) snprintf(errbuf, errsz, "pasta nao encontrada: %s", dirpath);
         return -1;
     }
+    db_exec("COMMIT;");
     if (out_added) *out_added = added;
     if (out_updated) *out_updated = updated;
     return added + updated;
@@ -2717,7 +2756,7 @@ static int export_notes_to_dir(const char *dirpath, char *errbuf, size_t errsz) 
 
     /* Cria a pasta de destino se ainda nao existir (o mkdir falhar por ja
      * existir nao e erro). */
-    mkdir_cross(dirpath);
+    mkdir_utf8(dirpath);
 
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(g_db, "SELECT name, content FROM notes ORDER BY mtime DESC;",
@@ -2837,6 +2876,9 @@ static void note_update_cache(NoteInfo *n) {
     char header[256] = "";
     if (raw && file_len > 0) {
         char *p = raw;
+        if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+            p += 3;
+        }
         while (*p && *p != '\n' && *p != '\r' && (*p == ' ' || *p == '\t')) p++;
         if (*p == '#') {
             while (*p == '#') p++;
@@ -2988,6 +3030,15 @@ static void rescan_notes(void) {
     E.num_notes = 0;
     int cap = (old_num_notes > 16) ? old_num_notes + 16 : 16;
     E.notes = (NoteInfo *)malloc(sizeof(NoteInfo) * cap);
+    if (!E.notes) {
+        if (old_notes) {
+            for (int i = 0; i < old_num_notes; i++) {
+                if (old_notes[i].search_norm) free(old_notes[i].search_norm);
+            }
+            free(old_notes);
+        }
+        return;
+    }
 
     time_t now = time(NULL);
 
@@ -3177,6 +3228,9 @@ static void load_preview(const char *path) {
     if (!content) return;
 
     const char *p = content;
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+        p += 3;
+    }
     while (*p) {
         const char *nl = strchr(p, '\n');
         int linelen = nl ? (int)(nl - p) : (int)strlen(p);
@@ -3197,9 +3251,11 @@ static void load_preview(const char *path) {
 
     if (g_preview.num_lines == 0) {
         g_preview.lines = (Line *)malloc(sizeof(Line));
-        g_preview.cap_lines = 1;
-        Line *l = &g_preview.lines[g_preview.num_lines++];
-        line_init(l, "", 0);
+        if (g_preview.lines) {
+            g_preview.cap_lines = 1;
+            Line *l = &g_preview.lines[g_preview.num_lines++];
+            line_init(l, "", 0);
+        }
     }
     update_lines_syntax(g_preview.lines, g_preview.num_lines);
 }
@@ -3527,10 +3583,7 @@ static bool save_current_note(void) {
     if (!found_in_notes) {
         rescan_notes();
     } else {
-        if (E.num_notes > 1) {
-            qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_priority);
-        }
-        apply_note_search(E.search_query);
+        notes_resort_keep(E.cur_filepath);
     }
 
     set_status_msg("\"%s\" %dL gravado", E.cur_filename, E.num_lines);
@@ -3592,10 +3645,13 @@ static void check_autosave(void) {
     }
 
     if (autosaved_count > 0) {
-        if (E.num_notes > 1) {
-            qsort(E.notes, E.num_notes, sizeof(NoteInfo), compare_notes_priority);
+        const char *keep_p = NULL;
+        if (E.focus == FOCUS_LEFT && E.selected_note_idx >= 0 && E.selected_note_idx < E.num_filtered) {
+            keep_p = E.notes[E.filtered_indices[E.selected_note_idx]].filepath;
+        } else if (E.cur_filepath[0]) {
+            keep_p = E.cur_filepath;
         }
-        apply_note_search(E.search_query);
+        notes_resort_keep(keep_p);
 
         if (autosaved_count == 1) {
             set_status_msg("💾 Salvo automaticamente: %s", last_saved_name);
@@ -3882,55 +3938,32 @@ static bool rename_note(const char *old_path, const char *raw_new_name) {
     } else if (is_open_in_tabs) {
         for (int t = 0; t < E.num_tabs; t++) {
             if (strcmp(E.tabs[t].cur_filepath, new_filepath) == 0) {
-                FILE *f = fopen_utf8(new_filepath, "wb");
-                if (f) {
-                    for (int i = 0; i < E.tabs[t].num_lines; i++) {
-                        fprintf(f, "%s\n", E.tabs[t].lines[i].chars);
-                    }
-                    fclose(f);
-                }
+                save_tab_by_idx(t);
                 break;
             }
         }
     } else {
-        /* Not open in any tab: read from disk, update line 0 heading, write back */
-        FILE *f = fopen_utf8(new_filepath, "r");
-        if (f) {
-            char lbuf[4096];
-            ABuffer full_content;
-            ab_init(&full_content);
-            bool first = true;
-            bool modified_heading = false;
-            while (fgets(lbuf, sizeof(lbuf), f)) {
-                int len = (int)strlen(lbuf);
-                while (len > 0 && (lbuf[len - 1] == '\r' || lbuf[len - 1] == '\n')) {
-                    lbuf[--len] = '\0';
-                }
-                if (first) {
-                    first = false;
-                    if (strncmp(lbuf, "# ", 2) == 0) {
-                        char hbuf[300];
-                        snprintf(hbuf, sizeof(hbuf), "# %s\n", new_title);
-                        ab_append(&full_content, hbuf, -1);
-                        modified_heading = true;
-                        continue;
-                    }
-                }
-                ab_append(&full_content, lbuf, -1);
-                ab_append(&full_content, "\n", 1);
+        /* Not open in any tab: read content, update line 0 heading, write back */
+        long clen = 0;
+        char *content = note_read_content(new_filepath, &clen);
+        if (content) {
+            const char *p = content;
+            if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+                p += 3;
             }
-            fclose(f);
-
-            if (modified_heading) {
-                FILE *fw = fopen_utf8(new_filepath, "wb");
-                if (fw) {
-                    if (full_content.len > 0) {
-                        fwrite(full_content.b, 1, full_content.len, fw);
-                    }
-                    fclose(fw);
-                }
+            if (strncmp(p, "# ", 2) == 0) {
+                const char *nl = strchr(p, '\n');
+                const char *rest = nl ? nl : "";
+                char hbuf[300];
+                snprintf(hbuf, sizeof(hbuf), "# %s", new_title);
+                ABuffer full_content;
+                ab_init(&full_content);
+                ab_append(&full_content, hbuf, (int)strlen(hbuf));
+                ab_append(&full_content, rest, (int)strlen(rest));
+                note_write_content(new_filepath, full_content.b, full_content.len);
+                ab_free(&full_content);
             }
-            if (full_content.b) free(full_content.b);
+            free(content);
         }
     }
 
@@ -6614,13 +6647,23 @@ static void render_status_bar(ABuffer *ab) {
 
     char note_desc[1024] = {0};
     int note_desc_w = 0;
+    char preview_name[256] = {0};
     if (E.focus == FOCUS_LEFT && g_preview.filepath[0]) {
-        const char *pname = strrchr(g_preview.filepath, PATH_SEP);
+        int pid_ = note_id_from_path(g_preview.filepath);
+        if (pid_ >= 0) {
+            if (!db_get_name(pid_, preview_name, sizeof(preview_name))) {
+                safe_strcpy(preview_name, sizeof(preview_name), g_preview.filepath);
+            } else if (!strchr(preview_name, '.')) {
+                strncat(preview_name, ".md", sizeof(preview_name) - strlen(preview_name) - 1);
+            }
+        } else {
+            const char *pname = strrchr(g_preview.filepath, PATH_SEP);
 #ifndef _WIN32
-        if (!pname) pname = strrchr(g_preview.filepath, '/');
+            if (!pname) pname = strrchr(g_preview.filepath, '/');
 #endif
-        pname = pname ? pname + 1 : g_preview.filepath;
-        snprintf(note_desc, sizeof(note_desc), "[Prévia] %s (Enter ou duplo clique p/ abrir)", pname);
+            safe_strcpy(preview_name, sizeof(preview_name), pname ? pname + 1 : g_preview.filepath);
+        }
+        snprintf(note_desc, sizeof(note_desc), "[Prévia] %s (Enter ou duplo clique p/ abrir)", preview_name);
     } else {
         snprintf(note_desc, sizeof(note_desc), "%s%s",
                  E.num_tabs == 0 ? "[Sem Abas Abertas]" : (E.cur_filename[0] ? E.cur_filename : "[Sem Arquivo]"),
@@ -6699,12 +6742,7 @@ static void render_status_bar(ABuffer *ab) {
         ab_append(ab, TH_FG_YELLOW, -1);
         ab_append(ab, "[Prévia] ", -1);
         ab_append(ab, TH_FG_WHITE, -1);
-        const char *pname = strrchr(g_preview.filepath, PATH_SEP);
-#ifndef _WIN32
-        if (!pname) pname = strrchr(g_preview.filepath, '/');
-#endif
-        pname = pname ? pname + 1 : g_preview.filepath;
-        ab_append(ab, pname, -1);
+        ab_append(ab, preview_name[0] ? preview_name : g_preview.filepath, -1);
         ab_append(ab, TH_FG_MUTED, -1);
         ab_append(ab, " (Enter/Duplo clique p/ abrir)", -1);
     } else {
@@ -7653,6 +7691,7 @@ static void execute_delete_selected_note(void) {
         /* Close tabs associated with this note */
         for (int i = E.num_tabs - 1; i >= 0; i--) {
             if (strcmp(E.tabs[i].cur_filepath, target_path) == 0) {
+                E.tabs[i].modified = false;
                 tab_close(i);
             }
         }
@@ -8258,6 +8297,26 @@ static void execute_bottom_command(const char *cmd) {
     } else if (strcmp(cmd, "rescan") == 0) {
         rescan_notes();
         set_status_msg("Notas atualizadas (%d encontradas)", E.num_notes);
+    } else if (strncmp(cmd, "import", 6) == 0) {
+        const char *arg = cmd + 6;
+        while (*arg == ' ') arg++;
+        if (*arg == '\0') {
+            E.prompt_buf[0] = '\0';
+            E.prompt_cursor = 0;
+            E.mode = MODE_PROMPT_IMPORT_DIR;
+        } else {
+            ui_import_from_dir(arg);
+        }
+    } else if (strncmp(cmd, "export", 6) == 0) {
+        const char *arg = cmd + 6;
+        while (*arg == ' ') arg++;
+        if (*arg == '\0') {
+            E.prompt_buf[0] = '\0';
+            E.prompt_cursor = 0;
+            E.mode = MODE_PROMPT_EXPORT_DIR;
+        } else {
+            ui_export_to_dir(arg);
+        }
     } else if (strncmp(cmd, "filter", 6) == 0 || strncmp(cmd, "filtro", 6) == 0) {
         /* Filter notes by urgency level 1, 2, 3, 4(H), 5(R), 6(O) or 0 (all) */
         const char *arg = strchr(cmd, ' ');
@@ -9505,8 +9564,13 @@ static void editor_process_keypress(void) {
             }
             if (E.cursor_x > 0) {
                 save_undo();
-                line_delete_char(&E.lines[E.cursor_y], E.cursor_x - 1);
-                E.cursor_x--;
+                int prev_x = E.cursor_x - 1;
+                while (prev_x > 0 && ((unsigned char)E.lines[E.cursor_y].chars[prev_x] & 0xC0) == 0x80) {
+                    prev_x--;
+                }
+                int del_bytes = E.cursor_x - prev_x;
+                line_replace_range(&E.lines[E.cursor_y], prev_x, del_bytes, NULL, 0);
+                E.cursor_x = prev_x;
             } else if (E.cursor_y > 0) {
                 save_undo();
                 int prev_len = E.lines[E.cursor_y - 1].len;
@@ -9589,8 +9653,12 @@ static void editor_process_keypress(void) {
                 E.has_selection = false;
             }
             save_undo();
-            for (int k = 0; k < g_last_utf8_len; k++) {
-                line_insert_char(&E.lines[E.cursor_y], E.cursor_x, g_last_utf8_char[k]);
+            if (g_last_utf8_len > 0) {
+                line_replace_range(&E.lines[E.cursor_y], E.cursor_x, 0, g_last_utf8_char, g_last_utf8_len);
+                E.cursor_x += g_last_utf8_len;
+            } else {
+                char ch = (char)c;
+                line_replace_range(&E.lines[E.cursor_y], E.cursor_x, 0, &ch, 1);
                 E.cursor_x++;
             }
             return;
@@ -10078,8 +10146,13 @@ static void editor_process_keypress(void) {
                 copy_to_system_clipboard(E.yank_buf, bytes_under_cursor);
             }
 
-            line_delete_char(cur, E.cursor_x);
-            if (E.cursor_x >= cur->len && E.cursor_x > 0) E.cursor_x--;
+            line_replace_range(cur, E.cursor_x, bytes_under_cursor, NULL, 0);
+            if (E.cursor_x >= cur->len && E.cursor_x > 0) {
+                E.cursor_x--;
+                while (E.cursor_x > 0 && ((unsigned char)cur->chars[E.cursor_x] & 0xC0) == 0x80) {
+                    E.cursor_x--;
+                }
+            }
             set_status_msg("Caractere recortado para a área de transferência (x)");
         }
         return;

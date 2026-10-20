@@ -30,6 +30,7 @@ O **Notas Definitivas** é um editor pessoal de notas em Markdown voltado para t
 | **v6.28.0** | *Dirty-flag* de renderização (`should_refresh_now()`, `g_needs_redraw`, marquee a 300 ms, expiração da mensagem de status em 5 s e batimento de manutenção de 30 s) e scripts de build portáveis (`build.sh`/`build.bat`). |
 | **v6.29.0** | Backend **SQLite**: as notas saíram de `data/*.md` para a tabela `notes` de `notas.db`; identidade de nota passou a ser o caminho virtual `"db:<id>"`; entraram a camada de acesso ao banco, as rotinas de importação/exportação e os botões `[Importar]`/`[Exportar]` com os modos `MODE_PROMPT_IMPORT_DIR`/`MODE_PROMPT_EXPORT_DIR`. |
 | **v6.30.0** | Lista lateral ordenada por **prioridade e depois data** (`compare_notes_priority()`, `notes_resort_keep()`); filtro de urgência efetivamente aplicado em `apply_note_search()`; correção do clique dos filtros `[2]`/`[3]` com painel estreito; rótulos compactos nos controles que não cabem. |
+| **v6.33.0** | Robustez, UTF-8 e CLI: exclusão atômica de caracteres multibyte UTF-8 (`line_delete_char`) e inserção atômica; tolerância a BOM UTF-8 (`\xEF\xBB\xBF`); criação de pastas com suporte a Unicode no Windows (`mkdir_utf8` / `CreateDirectoryW`); transações em lote SQLite na importação (`BEGIN TRANSACTION`); novos comandos `:import [dir]` e `:export [dir]`; proteção contra reescrita na exclusão de notas abertas em abas; resolução do título real em prévias virtuais `db:<id>`; correção na renomeação de notas do banco em abas inativas. |
 
 Consequências diretas para quem lê o documento antigo: não existe mais armazenamento em `data/`, não existe mais `data/.attention`, a ordenação não é apenas por data de modificação, e o pipeline de renderização não é mais acionado por tempo fixo. Este documento substitui aquele — e, para não envelhecer de novo, **não carrega mais a versão no nome do arquivo**.
 
@@ -291,7 +292,7 @@ O código compila nativamente em Linux e Windows sem emuladores adicionais. A ta
 | **Rastreamento de Mouse** | Sequências ANSI SGR 1006 | Mesmo padrão via processamento VT nativo |
 | **Banco de Dados** | `sqlite3_open("notas.db")` + `-lsqlite3` | Idem, linkando a libsqlite3 cross-compilada de `tools/sqlite3-mingw/` |
 | **Abertura de Arquivo** | `fopen` | `_wfopen` via `fopen_utf8` (caminho UTF-8 ➔ WideChar) |
-| **Criação de Pasta** | `mkdir(dir, 0755)` (`mkdir_cross`) | `_mkdir(dir)` (`mkdir_cross`) |
+| **Criação de Pasta** | `mkdir(dir, 0755)` (`mkdir_cross` / `mkdir_utf8`) | `CreateDirectoryW` via `mkdir_utf8` (suporte a UTF-8/Wide) |
 | **Exclusão de Arquivos** | `unlink(path)` | `DeleteFileW` com conversão UTF-8 ➔ Wide |
 | **Renomeação** | `rename(old, new)` | `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)` |
 | **Varredura de Diretório** | `opendir()`, `readdir()`, `closedir()` (importação) | `FindFirstFileW`, `FindNextFileW`, `FindClose` (importação) |
@@ -520,7 +521,7 @@ Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base at
 
 ### 7.40 `line_delete_char` (Linha 1750)
 - **Protótipo**: `static void line_delete_char(Line *l, int at)`
-- **Descrição**: Remove um byte na linha na posição 'at'.
+- **Descrição**: Remove de forma atômica o caractere UTF-8 na posição 'at' (calculando a largura do codepoint de 1 a 4 bytes e invocando `line_replace_range`), impedindo a criação de bytes de continuação órfãos em caracteres multibyte (como acentos e emojis).
 - **Retorno**: `static void`
 
 ### 7.41 `line_replace_range` (Linha 1759)
@@ -1085,7 +1086,7 @@ Abaixo estão catalogadas as **161** funções definidas em `notas.c` na base at
 
 ### 7.153 `execute_bottom_command` (Linha 7903)
 - **Protótipo**: `static void execute_bottom_command(const char *cmd)`
-- **Descrição**: Interpreta e executa os comandos da linha inferior (`:w`, `:q`, `:wq`, `:zm`, `:tabnew`, `:rescan`, `:life`, etc., com os alias registrados). Importar e exportar não têm comando: existem apenas pelos botões `[Importar]`/`[Exportar]`.
+- **Descrição**: Interpreta e executa os comandos da linha inferior (`:w`, `:q`, `:wq`, `:zm`, `:tabnew`, `:rescan`, `:life`, etc., com os alias registrados). A partir da v6.33.0, inclui suporte aos comandos `:import [dir]` e `:export [dir]` (e seus alias `:importar` e `:exportar`), permitindo especificar o caminho diretamente ou abrir o prompt interativo.
 - **Retorno**: `static void`
 
 ### 7.154 `handle_prompt_line_edit` (Linha 8140)
@@ -1202,7 +1203,7 @@ cd /mnt/SSDInterno/PROJETOS/Notas_Definitivas
 
 - `status_bar_lines` é forçado a 2 em `refresh_screen()`: o `:wrapbar` documentado (barra em 1 linha) hoje só alterna a compactação dos botões — meia-verdade.
 - O `README.md` e este documento agora descrevem a base correta; a antiga `DESCRICAO_TECNICA_DETALHADA_V6.27.0.md` (base v6.27.0, redesenho a 150 ms, armazenamento em `data/`) foi substituída por este arquivo.
-- Não há `:import`/`:export` por comando — importar e exportar existem apenas pelos dois botões.
+- Não há `:import`/`:export` por comando — importar e exportar existem apenas pelos dois botões. (Atualizado na v6.33.0: suporte a `:import [dir]` e `:export [dir]` via linha de comandos `:` implementado, com fallback para prompt interativo).
 - Sem assinatura de código: o `notas.exe` pode cair no SmartScreen (Propriedades ➔ Desbloquear).
 
 ---

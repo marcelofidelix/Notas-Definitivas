@@ -299,8 +299,8 @@ O repositório já inclui a biblioteca SQLite estática para Windows em `tools/s
 | **`c`** | Normal | Fecha a aba ativa atual |
 | **`C`** / **`:closeall`** | Normal | Fecha todas as abas abertas de uma só vez |
 | **`gt` / `gT`** | Normal | Salta para a próxima aba / aba anterior |
-| **`[⬇ Importar]`** | Rodapé | Importa arquivos Markdown de uma pasta para o SQLite |
-| **`[⬆ Exportar]`** | Rodapé | Exporta todas as notas do SQLite para arquivos Markdown em pasta |
+| **`[⬇ Importar]`** / **`:import [pasta]`** | Rodapé / Comando | Importa arquivos Markdown de uma pasta para o SQLite (em lote com transação atômica) |
+| **`[⬆ Exportar]`** / **`:export [pasta]`** | Rodapé / Comando | Exporta todas as notas do SQLite para arquivos Markdown em pasta |
 | **`[🎨 Tema]`** / **`Ctrl+T`** | Qualquer | Cicla instantaneamente entre os 8 temas do VS Code |
 | **`[📄 Wrap]`** / **`:wrap`** | Qualquer | Alterna quebra automática de linha (*Soft Word Wrap*) |
 | **`[🧬 Life]`** / **`:life`** | Qualquer | Inicia a simulação do Game of Life |
