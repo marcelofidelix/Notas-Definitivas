@@ -1662,6 +1662,30 @@ static char *get_system_clipboard(int *out_len) {
 /* =========================================================================
  * System / External Links Execution
  * ========================================================================= */
+/* Bloqueia links para executaveis e scripts. Um .md importado de uma fonte nao
+ * confiavel nao pode disparar a execucao de um programa com um simples Enter.
+ * Links web (http/https) nao sao afetados. */
+static bool link_target_is_executable(const char *target) {
+    if (!target) return false;
+    if (strncasecmp(target, "http://", 7) == 0 || strncasecmp(target, "https://", 8) == 0) {
+        return false;
+    }
+    const char *dot = strrchr(target, '.');
+    const char *sep = strrchr(target, '/');
+    const char *bsep = strrchr(target, '\\');
+    if (bsep && (!sep || bsep > sep)) sep = bsep;
+    if (!dot || (sep && dot < sep)) return false;
+    static const char *blocked[] = {
+        ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
+        ".lnk", ".msi", ".scr", ".com", ".reg", ".hta", ".pif", ".sh", ".run",
+        ".bin", ".appimage", ".desktop"
+    };
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        if (strcasecmp(dot, blocked[i]) == 0) return true;
+    }
+    return false;
+}
+
 static void open_link_target(const char *raw_target) {
     if (!raw_target || !*raw_target) return;
 
@@ -1681,6 +1705,12 @@ static void open_link_target(const char *raw_target) {
         target[tlen - 1] = '\0';
         memmove(target, target + 1, tlen - 1);
         tlen -= 2;
+    }
+
+    /* 2b. Executaveis e scripts nunca sao abertos a partir de links de nota */
+    if (link_target_is_executable(target)) {
+        set_status_msg("Link bloqueado (executavel ou script): %s", target);
+        return;
     }
 
 #ifdef _WIN32
@@ -1754,7 +1784,9 @@ static void open_link_target(const char *raw_target) {
 
     /* Check existence; if not found relative to process/exe dir, try relative to current note dir */
     DWORD attrs = GetFileAttributesW(full_wpath);
-    if (attrs == INVALID_FILE_ATTRIBUTES && E.cur_filepath[0]) {
+    /* Notas do banco usam o caminho virtual "db:<id>", que nao tem pasta. */
+    if (attrs == INVALID_FILE_ATTRIBUTES && E.cur_filepath[0] &&
+        strncmp(E.cur_filepath, "db:", 3) != 0) {
         char note_dir[4096];
         safe_strcpy(note_dir, sizeof(note_dir), E.cur_filepath);
         char *last_sep = strrchr(note_dir, '\\');
@@ -1995,18 +2027,35 @@ static void line_append_string(Line *l, const char *s, int len) {
     mark_modified();
 }
 
+/* Insere ate a primeira quebra de linha de 'text' no campo 'dst' (de tamanho
+ * dst_sz), na posicao *cursor. Respeita o limite do campo e nunca corta um
+ * caractere UTF-8 ao meio. Atualiza *cursor para depois do texto inserido. */
+static void paste_into_field(char *dst, size_t dst_sz, int *cursor, const char *text, int len) {
+    int dlen = (int)strlen(dst);
+    int cur = (cursor && *cursor >= 0 && *cursor <= dlen) ? *cursor : dlen;
+    int take = 0;
+    while (take < len && text[take] != '\r' && text[take] != '\n') take++;
+    int room = (int)dst_sz - 1 - dlen;
+    if (take > room) take = room;
+    if (take > 0 && take < len) {
+        /* Se o corte cair no meio de um caractere, recua ate o inicio dele */
+        while (take > 0 && ((unsigned char)text[take] & 0xC0) == 0x80) take--;
+    }
+    if (take <= 0) {
+        if (cursor) *cursor = cur;
+        return;
+    }
+    memmove(dst + cur + take, dst + cur, (size_t)(dlen - cur) + 1);
+    memcpy(dst + cur, text, (size_t)take);
+    if (cursor) *cursor = cur + take;
+}
+
 /* Clean Multi-line Paste Handler (prevents staircasing and buffer overflows) */
 static void editor_paste_string(const char *text, int len) {
     if (!text || len <= 0) return;
 
     if (E.mode == MODE_SEARCH_LEFT) {
-        int qlen = (int)strlen(E.search_query);
-        for (int j = 0; j < len && qlen < 240; j++) {
-            if (text[j] == '\r' || text[j] == '\n') break;
-            E.search_query[qlen++] = text[j];
-        }
-        E.search_query[qlen] = '\0';
-        E.search_cursor = qlen;
+        paste_into_field(E.search_query, sizeof(E.search_query), &E.search_cursor, text, len);
         apply_note_search(E.search_query);
         if (E.num_filtered > 0) {
             int actual = E.filtered_indices[E.selected_note_idx];
@@ -2018,24 +2067,12 @@ static void editor_paste_string(const char *text, int len) {
     }
 
     if (E.mode == MODE_COMMAND) {
-        int clen = (int)strlen(E.cmd_buf);
-        for (int j = 0; j < len && clen < 240; j++) {
-            if (text[j] == '\r' || text[j] == '\n') break;
-            E.cmd_buf[clen++] = text[j];
-        }
-        E.cmd_buf[clen] = '\0';
-        E.cmd_cursor = clen;
+        paste_into_field(E.cmd_buf, sizeof(E.cmd_buf), &E.cmd_cursor, text, len);
         return;
     }
 
     if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
-        int plen = (int)strlen(E.prompt_buf);
-        for (int j = 0; j < len && plen < 240; j++) {
-            if (text[j] == '\r' || text[j] == '\n') break;
-            E.prompt_buf[plen++] = text[j];
-        }
-        E.prompt_buf[plen] = '\0';
-        E.prompt_cursor = plen;
+        paste_into_field(E.prompt_buf, sizeof(E.prompt_buf), &E.prompt_cursor, text, len);
         return;
     }
 
@@ -2499,6 +2536,10 @@ static int compare_notes_mtime(const void *a, const void *b) {
     return 0;
 }
 
+/* Teto para ler um arquivo inteiro na memoria (importacao e previa). Evita que
+ * um .txt gigante dentro da pasta importada esgote a memoria do processo. */
+#define MAX_NOTE_FILE_BYTES (64L * 1024L * 1024L)
+
 static char *read_entire_file(const char *path, long *out_len) {
     if (out_len) *out_len = 0;
     FILE *f = fopen_utf8(path, "rb");
@@ -2518,6 +2559,7 @@ static char *read_entire_file(const char *path, long *out_len) {
     if (fseeko(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
 #endif
 
+    if (len > MAX_NOTE_FILE_BYTES) { fclose(f); return NULL; }
     char *buf = (char *)malloc((size_t)len + 1);
     if (!buf) { fclose(f); return NULL; }
     size_t bytes_read = fread(buf, 1, (size_t)len, f);
@@ -9096,7 +9138,10 @@ static void execute_bottom_command(const char *cmd) {
         while (*target == ' ') target++;
         open_or_create_wikilink_note(target);
     } else if (cmd[0] >= '0' && cmd[0] <= '9') {
-        int target_line = atoi(cmd);
+        long target_long = strtol(cmd, NULL, 10);
+        if (target_long > INT_MAX) target_long = INT_MAX;
+        if (target_long < 0) target_long = 0;
+        int target_line = (int)target_long;
         if (target_line > 0 && E.num_lines > 0) {
             if (target_line > E.num_lines) target_line = E.num_lines;
             E.cursor_y = target_line - 1;
@@ -11131,8 +11176,56 @@ static bool should_refresh_now(void) {
     return false;
 }
 
+/* Junta diretorio e nome com 'sep', sem snprintf: o tamanho e checado explicitamente
+ * e, se nao couber, o caminho original e mantido (evita truncagem silenciosa). */
+static void join_cwd_path(char *out, size_t out_sz, const char *cwd, char sep, const char *in) {
+    size_t cl = strlen(cwd), il = strlen(in);
+    if (cl + il + 2 > out_sz) {
+        safe_strcpy(out, out_sz, in);
+        return;
+    }
+    memcpy(out, cwd, cl);
+    out[cl] = sep;
+    memcpy(out + cl + 1, in, il);
+    out[cl + 1 + il] = '\0';
+}
+
+/* Converte o argumento de linha de comando em caminho absoluto ANTES do chdir()
+ * para a pasta do executavel. Sem isso, "notas nota.md" executado de outra pasta
+ * abriria (ou criaria) o arquivo ao lado do binario. */
+static void resolve_arg_path(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!in || !*in) return;
+#ifdef _WIN32
+    if (in[0] == '\\' || in[0] == '/' || in[1] == ':') {
+        safe_strcpy(out, out_sz, in);
+        return;
+    }
+    char cwd[4096];
+    DWORD cn = GetCurrentDirectoryA((DWORD)sizeof(cwd), cwd);
+    if (cn > 0 && cn < sizeof(cwd)) join_cwd_path(out, out_sz, cwd, '\\', in);
+    else safe_strcpy(out, out_sz, in);
+#else
+    if (in[0] == '/') {
+        safe_strcpy(out, out_sz, in);
+        return;
+    }
+    char cwd[4096];
+    if (getcwd(cwd, sizeof(cwd))) join_cwd_path(out, out_sz, cwd, '/', in);
+    else safe_strcpy(out, out_sz, in);
+#endif
+}
+
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
+    /* Notas sao privadas: arquivos novos (notas.db, temporarios) so para o dono. */
+#ifndef _WIN32
+    umask(077);
+#endif
+    char arg_abs[4096];
+    resolve_arg_path((argc > 1) ? argv[1] : NULL, arg_abs, sizeof(arg_abs));
+
 #ifdef _WIN32
     /* Codepage UTF-8 e configurada em enable_raw_mode(), que guarda os valores
      * anteriores para restaura-los no fim. Usar a API Wide evita falhar quando
@@ -11154,7 +11247,7 @@ int main(int argc, char **argv) {
         char *slash = strrchr(exe_dir, '/');
         if (slash) {
             *slash = '\0';
-            chdir(exe_dir);
+            if (chdir(exe_dir) != 0) { /* sem chdir: segue no diretorio atual */ }
         }
     }
 #endif
@@ -11163,7 +11256,7 @@ int main(int argc, char **argv) {
     init_editor();
 
     if (argc > 1) {
-        open_note_by_path(argv[1], true);
+        open_note_by_path(arg_abs, true);
         E.focus = FOCUS_RIGHT;
     }
 
