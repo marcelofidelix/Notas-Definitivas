@@ -72,6 +72,16 @@ static void safe_strcpy(char *dest, size_t dest_sz, const char *src) {
     dest[len] = '\0';
 }
 
+static void safe_strcat(char *dest, size_t dest_sz, const char *src) {
+    if (!dest || dest_sz == 0 || !src) return;
+    size_t dlen = strlen(dest);
+    if (dlen >= dest_sz - 1) return;
+    size_t slen = strlen(src);
+    if (dlen + slen >= dest_sz) slen = dest_sz - 1 - dlen;
+    memcpy(dest + dlen, src, slen);
+    dest[dlen + slen] = '\0';
+}
+
 
 /* =========================================================================
  * VS Code Popular Themes (ANSI 24-bit TrueColor)
@@ -1102,10 +1112,13 @@ static void get_window_size(int *rows, int *cols) {
     const char *lines = getenv("LINES");
     const char *columns = getenv("COLUMNS");
     if (lines && columns) {
-        int r = atoi(lines), cl = atoi(columns);
-        if (r > 0 && cl > 0) {
-            *rows = r;
-            *cols = cl;
+        char *end_r = NULL;
+        char *end_c = NULL;
+        long r = strtol(lines, &end_r, 10);
+        long cl = strtol(columns, &end_c, 10);
+        if (end_r != lines && end_c != columns && r > 0 && r <= 10000 && cl > 0 && cl <= 10000) {
+            *rows = (int)r;
+            *cols = (int)cl;
             return;
         }
     }
@@ -2956,10 +2969,14 @@ static void expand_user_path(const char *in, char *out, size_t out_sz) {
  * ------------------------------------------------------------------------- */
 static char *join_path_alloc(const char *dir, const char *name) {
     if (!dir || !name) return NULL;
-    size_t need = strlen(dir) + strlen(name) + 2;
-    char *out = (char *)malloc(need);
+    size_t dlen = strlen(dir);
+    size_t nlen = strlen(name);
+    char *out = (char *)malloc(dlen + nlen + 2);
     if (!out) return NULL;
-    snprintf(out, need, "%s%c%s", dir, PATH_SEP, name);
+    memcpy(out, dir, dlen);
+    out[dlen] = PATH_SEP;
+    memcpy(out + dlen + 1, name, nlen);
+    out[dlen + 1 + nlen] = '\0';
     return out;
 }
 
@@ -4308,9 +4325,16 @@ static bool rename_note(const char *old_path, const char *raw_new_name) {
         if (!last_sep) last_sep = strrchr(old_path, '/');
         if (!last_sep) last_sep = strrchr(old_path, '\\');
         if (last_sep) {
-            int dir_len = (int)(last_sep - old_path);
-            snprintf(new_filepath, sizeof(new_filepath), "%.*s%c%s",
-                     dir_len, old_path, PATH_SEP, new_filename);
+            size_t dir_len = (size_t)(last_sep - old_path);
+            size_t fn_len = strlen(new_filename);
+            if (dir_len + fn_len + 2 <= sizeof(new_filepath)) {
+                memcpy(new_filepath, old_path, dir_len);
+                new_filepath[dir_len] = PATH_SEP;
+                memcpy(new_filepath + dir_len + 1, new_filename, fn_len);
+                new_filepath[dir_len + 1 + fn_len] = '\0';
+            } else {
+                safe_strcpy(new_filepath, sizeof(new_filepath), new_filename);
+            }
         } else {
             safe_strcpy(new_filepath, sizeof(new_filepath), new_filename);
         }
@@ -7280,7 +7304,7 @@ static void render_status_bar(ABuffer *ab) {
             if (!db_get_name(pid_, preview_name, sizeof(preview_name))) {
                 safe_strcpy(preview_name, sizeof(preview_name), g_preview.filepath);
             } else if (!strchr(preview_name, '.')) {
-                strncat(preview_name, ".md", sizeof(preview_name) - strlen(preview_name) - 1);
+                safe_strcat(preview_name, sizeof(preview_name), ".md");
             }
         } else {
             const char *pname = strrchr(g_preview.filepath, PATH_SEP);
@@ -7483,6 +7507,51 @@ static void render_status_bar(ABuffer *ab) {
     ab_append(ab, "\x1b[K" STYLE_RESET, -1);
 }
 
+#define NOTAS_HAS_PROMPT_LABEL 1
+
+static const char *prompt_label_color(enum EditorMode mode) {
+    switch (mode) {
+        case MODE_PROMPT_NEW_NOTE:     return TH_FG_ACCENT;
+        case MODE_PROMPT_RENAME_NOTE:  return TH_FG_YELLOW;
+        case MODE_PROMPT_FIND:         return TH_FG_H1;
+        case MODE_PROMPT_REPLACE_FIND: return TH_FG_WARN;
+        case MODE_PROMPT_REPLACE_WITH: return TH_FG_ACCENT;
+        case MODE_PROMPT_IMPORT_DIR:   return TH_FG_ACCENT;
+        case MODE_PROMPT_EXPORT_DIR:   return TH_FG_ACCENT;
+        default: return TH_FG_WHITE;
+    }
+}
+
+static bool prompt_label(char *buf, size_t sz) {
+    if (!buf || sz == 0) return false;
+    buf[0] = '\0';
+    switch (E.mode) {
+        case MODE_PROMPT_NEW_NOTE:
+            safe_strcpy(buf, sz, " 📝 Nova nota: ");
+            return true;
+        case MODE_PROMPT_RENAME_NOTE:
+            safe_strcpy(buf, sz, " ✏️  Renomear nota: ");
+            return true;
+        case MODE_PROMPT_FIND:
+            safe_strcpy(buf, sz, " 🔍 Localizar na nota: ");
+            return true;
+        case MODE_PROMPT_REPLACE_FIND:
+            safe_strcpy(buf, sz, " 🔄 Localizar para substituir: ");
+            return true;
+        case MODE_PROMPT_REPLACE_WITH:
+            snprintf(buf, sz, " 🔄 Substituir '%s' por: ", E.replace_find_buf);
+            return true;
+        case MODE_PROMPT_IMPORT_DIR:
+            safe_strcpy(buf, sz, PROMPT_IMPORT_LABEL);
+            return true;
+        case MODE_PROMPT_EXPORT_DIR:
+            safe_strcpy(buf, sz, PROMPT_EXPORT_LABEL);
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void render_command_line(ABuffer *ab) {
     ab_append(ab, TH_BG_STATUS, -1);
 
@@ -7505,76 +7574,10 @@ static void render_command_line(ABuffer *ab) {
         int plen = utf8_width(prompt);
         int pad = E.screen_cols - plen;
         while (pad-- > 0) ab_append(ab, " ", 1);
-    } else if (E.mode == MODE_PROMPT_NEW_NOTE) {
-        ab_append(ab, TH_FG_ACCENT, -1);
-        ab_append(ab, STYLE_BOLD, -1);
-        const char *prompt = " 📝 Nova nota: ";
-        ab_append(ab, prompt, -1);
-        ab_append(ab, STYLE_RESET, -1);
-        ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
-        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
-        int pad = E.screen_cols - plen;
-        while (pad-- > 0) ab_append(ab, " ", 1);
-    } else if (E.mode == MODE_PROMPT_RENAME_NOTE) {
-        ab_append(ab, TH_FG_YELLOW, -1);
-        ab_append(ab, STYLE_BOLD, -1);
-        const char *prompt = " ✏️  Renomear nota: ";
-        ab_append(ab, prompt, -1);
-        ab_append(ab, STYLE_RESET, -1);
-        ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
-        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
-        int pad = E.screen_cols - plen;
-        while (pad-- > 0) ab_append(ab, " ", 1);
-    } else if (E.mode == MODE_PROMPT_FIND) {
-        ab_append(ab, TH_FG_H1, -1);
-        ab_append(ab, STYLE_BOLD, -1);
-        const char *prompt = " 🔍 Localizar na nota: ";
-        ab_append(ab, prompt, -1);
-        ab_append(ab, STYLE_RESET, -1);
-        ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
-        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
-        int pad = E.screen_cols - plen;
-        while (pad-- > 0) ab_append(ab, " ", 1);
-    } else if (E.mode == MODE_PROMPT_REPLACE_FIND) {
-        ab_append(ab, TH_FG_WARN, -1);
-        ab_append(ab, STYLE_BOLD, -1);
-        const char *prompt = " 🔄 Localizar para substituir: ";
-        ab_append(ab, prompt, -1);
-        ab_append(ab, STYLE_RESET, -1);
-        ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
-        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
-        int pad = E.screen_cols - plen;
-        while (pad-- > 0) ab_append(ab, " ", 1);
-    } else if (E.mode == MODE_PROMPT_REPLACE_WITH) {
-        ab_append(ab, TH_FG_ACCENT, -1);
-        ab_append(ab, STYLE_BOLD, -1);
-        char prompt[300];
-        snprintf(prompt, sizeof(prompt), " 🔄 Substituir '%s' por: ", E.replace_find_buf);
-        ab_append(ab, prompt, -1);
-        ab_append(ab, STYLE_RESET, -1);
-        ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
-        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
-        int pad = E.screen_cols - plen;
-        while (pad-- > 0) ab_append(ab, " ", 1);
-    } else if (E.mode == MODE_PROMPT_IMPORT_DIR) {
-        const char *prompt = PROMPT_IMPORT_LABEL;
-        ab_append(ab, TH_FG_ACCENT, -1);
-        ab_append(ab, STYLE_BOLD, -1);
-        ab_append(ab, prompt, -1);
-        ab_append(ab, STYLE_RESET, -1);
-        ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
-        int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
-        int pad = E.screen_cols - plen;
-        while (pad-- > 0) ab_append(ab, " ", 1);
-    } else if (E.mode == MODE_PROMPT_EXPORT_DIR) {
-        const char *prompt = PROMPT_EXPORT_LABEL;
-        ab_append(ab, TH_FG_ACCENT, -1);
+    } else if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
+        char prompt[512];
+        prompt_label(prompt, sizeof(prompt));
+        ab_append(ab, prompt_label_color(E.mode), -1);
         ab_append(ab, STYLE_BOLD, -1);
         ab_append(ab, prompt, -1);
         ab_append(ab, STYLE_RESET, -1);
@@ -7789,7 +7792,7 @@ static void refresh_screen(void) {
         if (cur_pos < 0) cur_pos = 0;
         if (cur_pos > clen) cur_pos = clen;
         int col = 1 + utf8_width_len(E.cmd_buf, cur_pos) + 1;
-        char cpos[32];
+        char cpos[64];
         snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.mode == MODE_CONFIRM_DELETE_NOTE) {
@@ -7798,74 +7801,23 @@ static void refresh_screen(void) {
         char prompt[512];
         snprintf(prompt, sizeof(prompt), " Deseja realmente excluir a nota '%s'? (s/n): ", tname);
         int col = utf8_width(prompt) + 1;
-        char cpos[32];
+        char cpos[64];
         snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[2 q", E.screen_rows, col);
         ab_append(&ab, cpos, (int)strlen(cpos));
-    } else if (E.mode == MODE_PROMPT_NEW_NOTE) {
-        int pwidth = utf8_width(" 📝 Nova nota: ");
+    } else if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
+        char plabel[512];
+        prompt_label(plabel, sizeof(plabel));
+        int pwidth = utf8_width(plabel);
         int cur_pos = E.prompt_cursor;
         int plen = (int)strlen(E.prompt_buf);
         if (cur_pos < 0) cur_pos = 0;
         if (cur_pos > plen) cur_pos = plen;
         int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
-        char cpos[32];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
-        ab_append(&ab, cpos, (int)strlen(cpos));
-    } else if (E.mode == MODE_PROMPT_RENAME_NOTE) {
-        int pwidth = utf8_width(" ✏️  Renomear nota: ");
-        int cur_pos = E.prompt_cursor;
-        int plen = (int)strlen(E.prompt_buf);
-        if (cur_pos < 0) cur_pos = 0;
-        if (cur_pos > plen) cur_pos = plen;
-        int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
-        char cpos[32];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
-        ab_append(&ab, cpos, (int)strlen(cpos));
-    } else if (E.mode == MODE_PROMPT_FIND) {
-        int pwidth = utf8_width(" 🔍 Localizar na nota: ");
-        int cur_pos = E.prompt_cursor;
-        int plen = (int)strlen(E.prompt_buf);
-        if (cur_pos < 0) cur_pos = 0;
-        if (cur_pos > plen) cur_pos = plen;
-        int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
-        char cpos[32];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
-        ab_append(&ab, cpos, (int)strlen(cpos));
-    } else if (E.mode == MODE_PROMPT_REPLACE_FIND) {
-        int pwidth = utf8_width(" 🔄 Localizar para substituir: ");
-        int cur_pos = E.prompt_cursor;
-        int plen = (int)strlen(E.prompt_buf);
-        if (cur_pos < 0) cur_pos = 0;
-        if (cur_pos > plen) cur_pos = plen;
-        int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
-        char cpos[32];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
-        ab_append(&ab, cpos, (int)strlen(cpos));
-    } else if (E.mode == MODE_PROMPT_REPLACE_WITH) {
-        char prompt[300];
-        snprintf(prompt, sizeof(prompt), " 🔄 Substituir '%s' por: ", E.replace_find_buf);
-        int pwidth = utf8_width(prompt);
-        int cur_pos = E.prompt_cursor;
-        int plen = (int)strlen(E.prompt_buf);
-        if (cur_pos < 0) cur_pos = 0;
-        if (cur_pos > plen) cur_pos = plen;
-        int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
-        char cpos[32];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
-        ab_append(&ab, cpos, (int)strlen(cpos));
-    } else if (E.mode == MODE_PROMPT_IMPORT_DIR || E.mode == MODE_PROMPT_EXPORT_DIR) {
-        const char *prompt = (E.mode == MODE_PROMPT_IMPORT_DIR) ? PROMPT_IMPORT_LABEL : PROMPT_EXPORT_LABEL;
-        int pwidth = utf8_width(prompt);
-        int cur_pos = E.prompt_cursor;
-        int plen = (int)strlen(E.prompt_buf);
-        if (cur_pos < 0) cur_pos = 0;
-        if (cur_pos > plen) cur_pos = plen;
-        int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
-        char cpos[32];
+        char cpos[64];
         snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.mode == MODE_SEARCH_LEFT) {
-        char cpos[32];
+        char cpos[64];
         int q_w = utf8_width(E.search_query);
         int avail = E.left_width - 6;
         if (avail < 2) avail = 2;
@@ -7876,7 +7828,7 @@ static void refresh_screen(void) {
         int crow = (E.selected_note_idx - E.sidebar_scroll_y) + 4;
         if (crow < 4) crow = 4;
         if (crow > editor_rows) crow = editor_rows;
-        char cpos[32];
+        char cpos[64];
         snprintf(cpos, sizeof(cpos), "\x1b[%d;3H\x1b[?25h", crow);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.focus == FOCUS_RIGHT && E.num_tabs == 0) {
@@ -7895,7 +7847,7 @@ static void refresh_screen(void) {
         if (cy > editor_rows) cy = editor_rows;
         if (cx < E.left_width + 2) cx = E.left_width + 2;
         if (cx > E.screen_cols) cx = E.screen_cols;
-        char cpos[32];
+        char cpos[64];
         const char *cursor_shape = (E.mode == MODE_INSERT) ? "\x1b[5 q" : "\x1b[2 q";
         snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h%s", cy, cx, cursor_shape);
         ab_append(&ab, cpos, (int)strlen(cpos));
@@ -8418,16 +8370,8 @@ static void handle_mouse_event(void) {
     /* 1. Modal Prompt Insulation: protect prompt modes from background clicks/drags */
     if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
         if (E.mouse_btn == 0 && !E.mouse_released && E.mouse_row == E.screen_rows) {
-            int pwidth = 0;
-            if (E.mode == MODE_PROMPT_NEW_NOTE) pwidth = utf8_width(" 📝 Nova nota: ");
-            else if (E.mode == MODE_PROMPT_RENAME_NOTE) pwidth = utf8_width(" ✏️  Renomear nota: ");
-            else if (E.mode == MODE_PROMPT_FIND) pwidth = utf8_width(" 🔍 Localizar na nota: ");
-            else if (E.mode == MODE_PROMPT_REPLACE_FIND) pwidth = utf8_width(" 🔄 Localizar para substituir: ");
-            else if (E.mode == MODE_PROMPT_REPLACE_WITH) {
-                char pbuf[300];
-                snprintf(pbuf, sizeof(pbuf), " 🔄 Substituir '%s' por: ", E.replace_find_buf);
-                pwidth = utf8_width(pbuf);
-            }
+            char pbuf[512];
+            int pwidth = prompt_label(pbuf, sizeof(pbuf)) ? utf8_width(pbuf) : 0;
             int clicked_col = E.mouse_col - pwidth - 1;
             if (clicked_col < 0) clicked_col = 0;
             int plen = (int)strlen(E.prompt_buf);
@@ -9078,22 +9022,27 @@ static void execute_bottom_command(const char *cmd) {
         }
     } else if (strncmp(cmd, "s/", 2) == 0 || strncmp(cmd, "%s/", 3) == 0 || strncmp(cmd, "sub/", 4) == 0) {
         /* Vim style substitute :s/antigo/novo/ or :%s/antigo/novo/g */
-        const char *p = (cmd[0] == '%') ? cmd + 3 : (cmd[0] == 's' ? cmd + 2 : cmd + 4);
-        char f_str[128] = {0};
-        char r_str[128] = {0};
+        /* O prefixo e medido pelo que de fato foi digitado: "sub/" tambem comeca
+         * com 's', entao decidir pelo primeiro caractere cortava "sub/" no lugar
+         * errado e o padrao virava "b". */
+        const char *p = (cmd[0] == '%') ? cmd + 3 : (strncmp(cmd, "sub/", 4) == 0 ? cmd + 4 : cmd + 2);
         const char *slash2 = strchr(p, '/');
-        if (slash2) {
-            int flen = slash2 - p;
-            if (flen < (int)sizeof(f_str)) {
-                strncpy(f_str, p, flen);
-                const char *r_start = slash2 + 1;
-                const char *slash3 = strchr(r_start, '/');
-                if (slash3) {
-                    int rlen = slash3 - r_start;
-                    if (rlen < (int)sizeof(r_str)) strncpy(r_str, r_start, rlen);
-                } else {
-                    safe_strcpy(r_str, sizeof(r_str), r_start);
-                }
+        if (slash2 && slash2 > p) {
+            const char *r_start = slash2 + 1;
+            const char *slash3 = strchr(r_start, '/');
+            size_t flen = (size_t)(slash2 - p);
+            size_t rlen = slash3 ? (size_t)(slash3 - r_start) : strlen(r_start);
+            /* Os campos nunca excedem E.cmd_buf (256 bytes); a checagem so
+             * impede que um campo grande seja truncado ou apagado em silencio. */
+            char f_str[256];
+            char r_str[256];
+            if (flen >= sizeof(f_str) || rlen >= sizeof(r_str)) {
+                set_status_msg("Padrão ou substituição longos demais para :s/");
+            } else {
+                memcpy(f_str, p, flen);
+                f_str[flen] = '\0';
+                memcpy(r_str, r_start, rlen);
+                r_str[rlen] = '\0';
                 replace_in_current_note(f_str, r_str);
             }
         } else {

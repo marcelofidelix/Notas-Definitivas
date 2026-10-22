@@ -1,6 +1,6 @@
 # Arquitetura e Manual Técnico — Notas Definitivas (pós-v6.33.0)
 > **Documento de Engenharia de Software e Especificação Técnica Integral**  
-> **Base descrita**: `notas.c` — **11.195 linhas** de C99 em arquivo único, estado de trabalho posterior à v6.33.0
+> **Base descrita**: `notas.c` — **11.237 linhas** de C99 em arquivo único, estado de trabalho posterior à v6.33.0
 > **Dependência externa**: `libsqlite3` (obrigatória desde a v6.29.0)  
 > **Escopo**: descreve a base de código atual, o que mudou nos ciclos **v6.28.0**, **v6.29.0**, **v6.30.0** e **v6.33.0**, e a rodada de **robustez/desempenho** documentada na seção 9.
 
@@ -31,7 +31,7 @@ O **Notas Definitivas** é um editor pessoal de notas em Markdown voltado para t
 | **v6.29.0** | Backend **SQLite**: as notas saíram de `data/*.md` para a tabela `notes` de `notas.db`; identidade de nota passou a ser o caminho virtual `"db:<id>"`; entraram a camada de acesso ao banco, as rotinas de importação/exportação e os botões `[Importar]`/`[Exportar]` com os modos `MODE_PROMPT_IMPORT_DIR`/`MODE_PROMPT_EXPORT_DIR`. |
 | **v6.30.0** | Lista lateral ordenada por **prioridade e depois data** (`compare_notes_priority()`, `notes_resort_keep()`); filtro de urgência efetivamente aplicado em `apply_note_search()`; correção do clique dos filtros `[2]`/`[3]` com painel estreito; rótulos compactos nos controles que não cabem. |
 | **v6.33.0** | Robustez, UTF-8 e CLI: exclusão atômica de caracteres multibyte UTF-8 (`line_delete_char`) e inserção atômica; tolerância a BOM UTF-8 (`\xEF\xBB\xBF`); criação de pastas com suporte a Unicode no Windows (`mkdir_utf8` / `CreateDirectoryW`); transações em lote SQLite na importação (`BEGIN TRANSACTION`); novos comandos `:import [dir]` e `:export [dir]`; proteção contra reescrita na exclusão de notas abertas em abas; resolução do título real em prévias virtuais `db:<id>`; correção na renomeação de notas do banco em abas inativas. |
-| **Pós-v6.33.0** | Rodada de endurecimento (seção 9): escrita atômica de arquivos, validação estrita de IDs, transações de importação com COMMIT/ROLLBACK verificados, correção do Base64/OSC 52, eliminação de estouro de pilha em tabelas, renderização incremental (`RenderCursor`), undo coalescido para digitação, timers de 64 bits, saída de terminal com escrita completa e proteção de abas na saída. |
+| **Pós-v6.33.0** | Rodada de endurecimento e refatoração limpa (seção 9): escrita atômica de arquivos, validação estrita de IDs, transações de importação com COMMIT/ROLLBACK verificados, correção do Base64/OSC 52, eliminação de estouro de pilha em tabelas, renderização incremental (`RenderCursor`), undo coalescido para digitação, timers de 64 bits, saída de terminal com escrita completa, desduplicação e sincronização total dos prompts modais (`prompt_label`), correção do clique de mouse em importação/exportação, correção de `:s/` e `:sub/` com campos longos, endurecimento de buffers de escape (`cpos[64]`), `safe_strcat()`, `strtol` para `LINES`/`COLUMNS`, zero avisos em compilação estrita e suíte de regressão de edição (`editor_test.c`). |
 
 Consequências diretas para quem lê o documento antigo: não existe mais armazenamento em `data/`, não existe mais `data/.attention`, a ordenação não é apenas por data de modificação, e o pipeline de renderização não é mais acionado por tempo fixo. Este documento substitui aquele — e, para não envelhecer de novo, **não carrega mais a versão no nome do arquivo**.
 
@@ -1238,6 +1238,9 @@ Esta seção documenta as mudanças feitas para tornar o editor mais resistente 
 - **`table_trim_copy()`**: alocação verificada; em OOM o alinhamento é abortado sem liberar células pela metade.
 - **Clipboard**: `base64_encode()` foi reescrito. O cálculo antigo de padding gerava `YQ`/`YWI` em vez de `YQ==`/`YWI=`, então o OSC 52 de textos de 1 ou 2 bytes era rejeitado por terminais. A leitura Win32 agora limita a conversão ao `GlobalSize()` do handle, sem confiar em NUL terminador.
 - **Conversão UTF-8 ➔ UTF-16**: `utf8_to_wide_alloc()` substitui buffers fixos de 1024/4096 WCHAR em `fopen_utf8`, `unlink_utf8`, `rename_utf8`, `mkdir_utf8`, `stat_cross` e na abertura de URL. Caminhos com acentos e comprimento maior deixam de falhar ou passar buffers não inicializados ao `ShellExecuteW`.
+- **Concatenação e Buffers Seguros**: adicionada a função `safe_strcat(dest, sz, src)` que substitui chamadas frágeis de `strncat` na barra de status (`preview_name`); substituição de `snprintf` dinâmico em `join_path_alloc()` e `rename_note()` por cópia `memcpy` com capacidade garantida; buffers de escape ANSI de posicionamento (`cpos`) expandidos de 32 para 64 bytes em `refresh_screen()`, eliminando todos os alertas de `-Wformat-truncation=2`.
+- **Parsing de Comandos `:s/` e `:sub/`**: em `execute_bottom_command()`, o comando `:sub/` iniciava com 's' e caía na mesma regra de `:s/`, consumindo 2 caracteres em vez de 4 e transformando o padrão em `b/<busca>/...`. O cálculo de prefixo foi corrigido com checagem de `sub/` antes de `s/`, e os buffers de busca e substituição foram expandidos para 256 bytes com verificação de overflow, prevenindo truncamento ou apagamento silencioso de textos $\ge 128$ bytes.
+- **Centralização de Prompts Modais (`prompt_label`)**: as rotinas `render_command_line()`, posicionamento de cursor em `refresh_screen()` e hit-testing do mouse em `handle_mouse_event()` continham definições literais e larguras repetidas dos 7 prompts modais. A introdução de `prompt_label(buf, sz)` e `prompt_label_color(mode)` unificou toda a lógica, reduziu ~140 linhas redundantes e corrigiu o hit-testing de mouse para `MODE_PROMPT_IMPORT_DIR` e `MODE_PROMPT_EXPORT_DIR`, que anteriormente ficavam com largura zero.
 
 ### 9.3 Desempenho
 
@@ -1260,6 +1263,7 @@ Medição em harness isolado (Windows/MinGW, `-O2`, 20.000 linhas de 159 caracte
 
 - `write_stdout_all()` substitui `WriteFile`/`write` de uma tacada: trata escrita parcial, `EINTR` e buffer nulo. O quadro só é emitido se o `ABuffer` estiver completo; caso contrário, limpeza e redesenho são reagendados.
 - `get_current_time_ms()` retorna `int64_t`; no Windows usa `GetTickCount64()` e não sofre mais o wrap de ~49,7 dias. `first_unsaved_time`, deadlines de undo, timers de clique/marquee e autosave acompanham o tipo.
+- `get_window_size()` migrou de `atoi()` para `strtol` com validação de formato e limites de segurança (1..10000 linhas/colunas) para as variáveis de ambiente `LINES` e `COLUMNS`.
 - `disable_raw_mode()` é idempotente (`g_terminal_shutdown_done`), evitando liberar o editor duas vezes por causa do `atexit`.
 - `main()` configura o code page em `enable_raw_mode()` (que guarda os valores anteriores) e usa `GetModuleFileNameW`/`SetCurrentDirectoryW`; uma pasta de instalação com acentos deixa de quebrar a descoberta do executável.
 - No POSIX, `open_link_target()` troca `system("xdg-open ...")` por `fork`/`exec` com `xdg-open -- <alvo>`; o conteúdo de uma nota não pode mais injetar comandos de shell. `read_entire_file()` usa `fseeko`/`ftello` e rejeita leitura curta/arquivo > `LONG_MAX`.
@@ -1275,15 +1279,25 @@ Medição em harness isolado (Windows/MinGW, `-O2`, 20.000 linhas de 159 caracte
 
 ### 9.6 Testes e Validação
 
-`tools/test/storage_test.c` foi ampliado para 32 verificações, incluindo:
+A cobertura automatizada divide-se em três pilares:
 
-- `note_id_from_path("db:0")`, `"db:12lixo"` e `"db:-1"` rejeitados;
-- Base64 de 1, 2 e 3 bytes com padding correto;
-- escrita atômica seguida de leitura e comparação byte a byte;
-- importação/reexportação e CRUD já existentes.
+1. **Camada de Armazenamento (`tools/test/storage_test.c`)**: 27 verificações estritas cobrindo:
+   - `db_open` e banco nascendo vazio;
+   - montagem, validação e rejeição de IDs virtuais (`db:0`, `db:12lixo`, `db:-1`);
+   - Base64 de 1, 2 e 3 bytes com padding correto;
+   - gravação atômica com conferência de integridade byte a byte;
+   - importação em lote com transação atômica e exportação;
+   - CRUD completo de notas e atualização de criticidade.
+2. **Camada de Edição (`tools/test/editor_test.c`)**: 28 verificações sem TUI cobrindo:
+   - comandos `:s/` e `:sub/` com substituição de 200 bytes, padrões sem barra final e proteção de buffer;
+   - ciclos completos de `undo` e `redo`, preservação de posição de cursor e estado de dobras recolhidas;
+   - coalescência temporal de digitação contínua (agrupamento de 3+ caracteres em 1 snapshot de undo);
+   - consistência dos rótulos modais em `prompt_label()`.
+3. **Fidelidade Visual Golden Master (`golden.c`)**:
+   - Captura e comparação de 1,39 MB de sequências de escape ANSI em 198 estados de tela (`refresh_equal = True`), assegurando ausência de qualquer regressão visual para caracteres ASCII, acentuações UTF-8 e ideogramas CJK.
 
-Validação local desta rodada: compilação Windows/MinGW com `-Wall -Wextra -Wpedantic` sem warnings; `-fanalyzer` e `cppcheck` sem achados; suíte de armazenamento e harness de funções centrais (tabela >32 colunas, aliasing de `line_replace_range`, coalescência de undo, `RenderCursor`, clamp de scroll) verdes. O ramo POSIX foi revisado, mas não executado nesta máquina por não haver toolchain Linux/WSL disponível.
+Validação estrita: compilação Windows/MinGW com `-Wall -Wextra -Wformat=2 -Wformat-truncation=2` com **zero avisos**; `-fanalyzer` e `cppcheck` limpos; UBSan com trap mode ativo sem falhas.
 
 ---
 
-*Documento atualizado para o estado pós-v6.33.0 (`notas.c`, 11.195 linhas). O catálogo da seção 7 preserva os números de linha da v6.30.0; a seção 9 descreve a rodada atual e as funções novas.*
+*Documento atualizado para o estado pós-v6.33.0 (`notas.c`, 11.237 linhas). O catálogo da seção 7 preserva os números de linha da v6.30.0; a seção 9 descreve a rodada atual e as funções novas.*

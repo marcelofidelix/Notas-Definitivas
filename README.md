@@ -320,20 +320,27 @@ Esta versão passou por uma rodada de endurecimento focada em falhas reais de me
 | **Abas e saída** | `:q` verifica alterações em **todas** as abas; `:wq` salva todas as abas modificadas; fechar aba/`C`/`:closeall` não descarta dados se a gravação falhar. |
 | **Tabelas Markdown** | A linha nova deixou de usar buffer fixo de 512 bytes (risco de estouro de pilha); tabelas com mais de 32 colunas são recusadas em vez de perder colunas silenciosamente. |
 | **Renderização** | O cursor visual avança por linha/segmento em vez de varrer o documento inteiro a cada linha da tela. Em cadernos grandes isso reduz o custo de `O(linhas × altura)` para `O(linhas + altura)` por quadro. |
+| **Prompts e mouse** | Os 7 prompts modais usam fonte única de verdade (`prompt_label`), sincronizando renderização, cálculo de coluna do cursor e hit-testing do mouse (corrigindo o deslocamento de clique em `:import`/`:export`). |
+| **Substituição (`:s/`)** | Correção de prefixo em `:sub/` e ampliação dos buffers para 256 bytes com proteção contra truncamento ou perda silenciosa em padrões longos. |
 | **Undo/Redo** | Snapshots completos continuam existindo, mas teclas consecutivas na mesma posição são agrupadas (janela de 800 ms), reduzindo memória e tempo por caractere. |
 | **Clipboard** | Corrigido o padding do Base64 do OSC 52 (`YQ==`, `YWI=`), que fazia terminais rejeitarem cópias de 1 ou 2 bytes; a leitura do clipboard Win32 é limitada ao tamanho real do bloco. |
 | **Links e caminhos** | No Linux, links são abertos com `fork`/`exec` (sem shell, sem injeção); no Windows, caminhos UTF-8 são convertidos para UTF-16 sem limite de 1024 bytes e a URL é validada antes do `ShellExecuteW`. |
-| **Terminal e tempo** | Escritas tratam envios parciais e `EINTR`; timers usam `int64_t`/`GetTickCount64`; o encerramento é idempotente e restaura o code page original do Windows. |
+| **Terminal e buffers** | Escritas tratam envios parciais e `EINTR`; `LINES`/`COLUMNS` são lidos com `strtol` com validação e limite; buffers de escape ANSI expandidos para 64 bytes e uso de `safe_strcat()`, eliminando alertas de `-Wformat-truncation=2`. |
 
 ### Testes
 
-O teste de armazenamento compila o próprio `notas.c` e cobre CRUD, importação, reexportação, IDs inválidos, Base64 e escrita atômica:
+O projeto conta com testes automatizados compilados diretamente com o próprio `notas.c` como unidade de tradução (sem necessidade de interface gráfica aberta):
 
-```bash
-./tools/test/run_tests.sh
-```
-
-No Windows, o mesmo teste pode ser compilado diretamente com o MinGW e executado a partir de uma pasta de trabalho vazia (ele cria o `notas.db` local).
+1. **Testes de Armazenamento e SQLite (`storage_test.c`)**: cobre CRUD, importação, reexportação, integridade de IDs, Base64 e escrita atômica:
+   ```bash
+   ./tools/test/run_tests.sh
+   ```
+2. **Testes de Regressão da Lógica de Edição (`editor_test.c`)**: valida comandos `:s/` e `:sub/` (com strings longas e sem barra final), ciclos de undo/redo com dobras recolhidas, agrupamento de digitação contínua e consistência de rótulos dos prompts modais:
+   ```bash
+   gcc -O2 tools/test/editor_test.c -o editor_test.exe -Itools/sqlite3-mingw/include -Ltools/sqlite3-mingw/lib -lsqlite3
+   ./editor_test.exe
+   ```
+3. **Validação Visual Golden Master**: garantia de paridade binária estrita (0 bytes divergentes) na emissão de sequências de escape ANSI em todos os modos e combinações de texto (ASCII, acentuação UTF-8 e caracteres CJK).
 
 ---
 
