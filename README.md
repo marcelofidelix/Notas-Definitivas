@@ -344,7 +344,12 @@ O projeto conta com testes automatizados compilados diretamente com o próprio `
    gcc -O2 tools/test/editor_test.c -o editor_test.exe -Itools/sqlite3-mingw/include -Ltools/sqlite3-mingw/lib -lsqlite3
    ./editor_test.exe
    ```
-3. **Validação Visual Golden Master**: garantia de paridade binária estrita (0 bytes divergentes) na emissão de sequências de escape ANSI em todos os modos e combinações de texto (ASCII, acentuação UTF-8 e caracteres CJK).
+3. **Teste de Integração da Interface (`tui_test.c`, Windows)**: dirige o editor por teclas reais (fila de entrada + `editor_process_keypress`) e inspeciona os quadros que iriam ao terminal: importação via `:import`, edição/gravação (`o`, `dd`, `V`, `u`, `Ctrl+R`, `:s`, `:w`), bracketed paste, busca lateral, prompt de nova nota, nota de 20 mil linhas (abrir, `G`/`gg`, `zM`) e `:q`/`:wq`; uma nota com `ESC`/OSC embutidos não pode vazar escapes no quadro. Rode em uma pasta vazia (ele cria `notas.db` ali):
+   ```bash
+   gcc -O2 tools/test/tui_test.c -o tui_test.exe -Itools/sqlite3-mingw/include -Ltools/sqlite3-mingw/lib -lsqlite3
+   ./tui_test.exe <pasta-com-arquivos-md>
+   ```
+4. **Validação Visual Golden Master**: garantia de paridade binária estrita (0 bytes divergentes) na emissão de sequências de escape ANSI em todos os modos e combinações de texto (ASCII, acentuação UTF-8 e caracteres CJK).
 
 ---
 
