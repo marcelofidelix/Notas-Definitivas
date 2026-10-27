@@ -302,7 +302,7 @@ O código compila nativamente em Linux e Windows sem emuladores adicionais. A ta
 | **Varredura de Diretório** | `opendir()`, `readdir()`, `closedir()` (importação) | `FindFirstFileW`, `FindNextFileW`, `FindClose` (importação) |
 | **Cópia p/ Clipboard** | Thread `pthread` detachável: `wl-copy` (Wayland), `xclip`/`xsel` (X11), `clip.exe` (host Windows); + OSC 52 Base64 | Thread `CreateThread` gravando `CF_UNICODETEXT`; OSC 52 apenas em sessão SSH |
 | **Colagem do Clipboard** | `wl-paste`, `xclip`/`xsel`, ou `powershell Get-Clipboard` (WSL/Git Bash) | `GetClipboardData(CF_UNICODETEXT)` ➔ UTF-8, com fallback ANSI (`CF_TEXT`) |
-| **Abertura de Links** | `xdg-open -- <alvo>` via `fork`/`exec` (sem shell, sem injeção) | `ShellExecuteW(NULL, "open", wurl, ...)` com URL convertida para UTF-16 e validada |
+| **Abertura de Links** | `xdg-open -- <alvo>` via `fork`/`exec` (sem shell, sem injeção); executáveis rodam via `execl()` na pasta deles | `ShellExecuteW(NULL, "open", wurl, ...)` com URL convertida para UTF-16 e validada |
 | **Diretório de Trabalho** | `chdir()` para o diretório do executável (via `/proc/self/exe`, buffer de 4096) | `SetCurrentDirectoryW` com `GetModuleFileNameW` (caminho Unicode, buffer de 32768 WCHAR) |
 
 ---
@@ -1317,6 +1317,12 @@ Validação estrita: compilação Windows/MinGW com `-Wall -Wextra -Wformat=2 -W
 | `replace_in_current_note()` | Copiava a linha montada outra vez com `line_init`. | Adota o buffer montado. |
 
 `editor_test.c` ganhou casos para colagem multilinha (LF/CRLF/CR, cursor, undo), carga em lote de 50 mil linhas com detecção de blocos de código, exclusão de intervalos e sanitização de escapes.
+
+### 9.8 Scripts como Atalhos e Cursor Fixo
+
+- **Links para scripts e executáveis voltaram a ser executados.** O bloqueio por extensão (`link_target_is_executable()`) foi removido a pedido do usuário. Em `open_link_target()`, no Windows, o arquivo é aberto com `ShellExecuteW` passando a **pasta do arquivo** como diretório de trabalho; `.ps1` é executado com `powershell.exe -NoProfile -NoExit -File "<caminho>"` (o verbo `open` de um `.ps1` só o abriria no Bloco de Notas), respeitando a ExecutionPolicy. No POSIX, um arquivo regular com permissão de execução roda via `execl()` direto (sem shell) após `chdir()` para a pasta dele; o resto segue para `xdg-open`. A barra de status mostra `Executando: <caminho>`. **Risco aceito**: uma nota importada de fonte não confiável pode conter um link para script.
+- **Cursor sem piscar.** Os formatos ficam em `CURSOR_BLOCK` (`?12l` + DECSCUSR 2, bloco fixo: Normal, painel esquerdo, confirmação de exclusão) e `CURSOR_BAR` (`?12l` + DECSCUSR 6, barra fixa: Inserção, `:`, busca e prompts); antes Inserção, comando, busca e prompts usavam DECSCUSR 5 (barra piscante) e o painel esquerdo herdava o formato anterior. Além disso, cada quadro é envolvido em `SYNC_BEGIN`/`SYNC_END` (DEC 2026, saída sincronizada): o terminal aplica o quadro de uma vez, então o `?25l`/`?25h` do redesenho (a cada tecla, marquee de 300 ms e batimento de 30 s) não aparece como piscada. Terminais sem suporte ignoram a sequência.
+- `tui_test.c` verifica que todo quadro (Normal, Inserção, `:`, painel esquerdo, busca, prompt) vem sincronizado, com `?12l` e sem DECSCUSR 0/1/3/5, e que `Enter` sobre `[rodar](rodar.bat)` executa o `.bat` de fato.
 
 ---
 

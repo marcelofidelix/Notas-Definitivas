@@ -386,6 +386,16 @@ static const Theme themes[NUM_THEMES] = {
 #define STYLE_UNDERLINE "\x1b[4m"
 #define STYLE_RESET     "\x1b[0m"
 
+/* Cursor de texto sempre FIXO (sem piscar), em qualquer modo e painel:
+ * DECSCUSR 2 = bloco fixo, 6 = barra fixa (5 seria barra piscante) e
+ * ?12l desliga o piscar em terminais que o controlam a parte. */
+#define CURSOR_BLOCK    "\x1b[?12l\x1b[2 q"
+#define CURSOR_BAR      "\x1b[?12l\x1b[6 q"
+
+/* Atualizacao sincronizada (DEC 2026): o quadro e aplicado de uma vez. */
+#define SYNC_BEGIN      "\x1b[?2026h"
+#define SYNC_END        "\x1b[?2026l"
+
 /* Rotulos dos prompts de importacao/exportacao. Sao macros para que o desenho
  * do rodape e o calculo da coluna do cursor usem a MESMA string. */
 #define PROMPT_IMPORT_LABEL " \xe2\xac\x87 Importar de: "
@@ -1742,28 +1752,17 @@ static char *get_system_clipboard(int *out_len) {
 /* =========================================================================
  * System / External Links Execution
  * ========================================================================= */
-/* Bloqueia links para executaveis e scripts. Um .md importado de uma fonte nao
- * confiavel nao pode disparar a execucao de um programa com um simples Enter.
- * Links web (http/https) nao sao afetados. */
-static bool link_target_is_executable(const char *target) {
-    if (!target) return false;
-    if (strncasecmp(target, "http://", 7) == 0 || strncasecmp(target, "https://", 8) == 0) {
-        return false;
-    }
-    const char *dot = strrchr(target, '.');
-    const char *sep = strrchr(target, '/');
-    const char *bsep = strrchr(target, '\\');
+/* Links para executaveis e scripts (.exe, .bat, .cmd, .ps1, .sh, ...) sao
+ * executados com Enter, como atalhos. ATENCAO: isso vale tambem para notas
+ * importadas; so siga links de scripts em notas de origem confiavel. */
+static bool path_has_ext(const char *path, const char *ext) {
+    if (!path || !ext) return false;
+    const char *dot = strrchr(path, '.');
+    const char *sep = strrchr(path, '/');
+    const char *bsep = strrchr(path, '\\');
     if (bsep && (!sep || bsep > sep)) sep = bsep;
     if (!dot || (sep && dot < sep)) return false;
-    static const char *blocked[] = {
-        ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
-        ".lnk", ".msi", ".scr", ".com", ".reg", ".hta", ".pif", ".sh", ".run",
-        ".bin", ".appimage", ".desktop"
-    };
-    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
-        if (strcasecmp(dot, blocked[i]) == 0) return true;
-    }
-    return false;
+    return strcasecmp(dot, ext) == 0;
 }
 
 static void open_link_target(const char *raw_target) {
@@ -1785,12 +1784,6 @@ static void open_link_target(const char *raw_target) {
         target[tlen - 1] = '\0';
         memmove(target, target + 1, tlen - 1);
         tlen -= 2;
-    }
-
-    /* 2b. Executaveis e scripts nunca sao abertos a partir de links de nota */
-    if (link_target_is_executable(target)) {
-        set_status_msg("Link bloqueado (executavel ou script): %s", target);
-        return;
     }
 
 #ifdef _WIN32
@@ -1911,10 +1904,44 @@ static void open_link_target(const char *raw_target) {
                 set_status_msg("Erro ao abrir pasta: %s", clean_path);
             }
         } else {
-            /* Open file with default application associated in Windows */
-            HINSTANCE h = ShellExecuteW(NULL, L"open", full_wpath, NULL, NULL, SW_SHOWNORMAL);
+            /* Pasta do arquivo como diretorio de trabalho: scripts que usam
+             * caminhos relativos rodam como se fossem chamados de la. */
+            WCHAR wdir[4096];
+            wcsncpy(wdir, full_wpath, 4095);
+            wdir[4095] = L'\0';
+            WCHAR *wslash = wcsrchr(wdir, L'\\');
+            if (wslash) *wslash = L'\0';
+            const WCHAR *workdir = wslash ? wdir : NULL;
+
+            HINSTANCE h;
+            bool is_script = false;
+            if (path_has_ext(clean_path, ".ps1")) {
+                /* O verbo "open" de um .ps1 apenas o abre no Bloco de Notas.
+                 * Executa no PowerShell (respeitando a ExecutionPolicy) e mantem
+                 * a janela aberta para mostrar a saida ou o erro. */
+                static const WCHAR prefix[] = L"-NoProfile -NoExit -File \"";
+                WCHAR params[4096 + 64];
+                size_t plen = wcslen(prefix), flen = wcslen(full_wpath);
+                if (plen + flen + 2 > sizeof(params) / sizeof(params[0])) {
+                    set_status_msg("Caminho do script longo demais: %s", clean_path);
+                    return;
+                }
+                wcscpy(params, prefix);
+                wcscat(params, full_wpath);
+                wcscat(params, L"\"");
+                h = ShellExecuteW(NULL, L"open", L"powershell.exe", params, workdir, SW_SHOWNORMAL);
+                is_script = true;
+            } else {
+                /* Associacao padrao do Windows: documentos abrem no aplicativo
+                 * deles; .exe/.bat/.cmd/.vbs/... sao executados. */
+                h = ShellExecuteW(NULL, L"open", full_wpath, NULL, workdir, SW_SHOWNORMAL);
+                is_script = path_has_ext(clean_path, ".exe") || path_has_ext(clean_path, ".bat") ||
+                            path_has_ext(clean_path, ".cmd") || path_has_ext(clean_path, ".vbs") ||
+                            path_has_ext(clean_path, ".js") || path_has_ext(clean_path, ".wsf") ||
+                            path_has_ext(clean_path, ".lnk") || path_has_ext(clean_path, ".msi");
+            }
             if ((INT_PTR)h > 32) {
-                set_status_msg("Arquivo aberto: %s", clean_path);
+                set_status_msg(is_script ? "Executando: %s" : "Arquivo aberto: %s", clean_path);
             } else if ((INT_PTR)h == SE_ERR_NOASSOC) {
                 /* If no application is associated, show Open With dialog */
                 ShellExecuteW(NULL, L"openas", full_wpath, NULL, NULL, SW_SHOWNORMAL);
@@ -1927,7 +1954,12 @@ static void open_link_target(const char *raw_target) {
         set_status_msg("Arquivo ou pasta não encontrado: %s", clean_path);
     }
 #else
-    set_status_msg("Abrindo: %s", target);
+    /* Arquivo regular com permissao de execucao (script com shebang ou
+     * binario): roda diretamente, na pasta dele. O resto vai para xdg-open. */
+    struct stat lst;
+    bool run_direct = (strncmp(target, "file://", 7) != 0 && strstr(target, "://") == NULL &&
+                       stat(target, &lst) == 0 && S_ISREG(lst.st_mode) && access(target, X_OK) == 0);
+    set_status_msg(run_direct ? "Executando: %s" : "Abrindo: %s", target);
     /* fork+exec em vez de system(): o alvo vem do conteudo da nota e nao pode
      * ser interpretado pelo shell (evita injecao de comandos via link). */
     pid_t pid = fork();
@@ -1940,6 +1972,18 @@ static void open_link_target(const char *raw_target) {
                 dup2(devnull, STDOUT_FILENO);
                 dup2(devnull, STDERR_FILENO);
                 close(devnull);
+            }
+            if (run_direct) {
+                char abs_target[4096];
+                if (realpath(target, abs_target)) {
+                    char dir[4096];
+                    safe_strcpy(dir, sizeof(dir), abs_target);
+                    char *slash = strrchr(dir, '/');
+                    if (slash && slash != dir) *slash = '\0';
+                    if (chdir(dir) != 0) { /* segue no diretorio atual */ }
+                    execl(abs_target, abs_target, (char *)NULL);
+                }
+                _exit(127);
             }
             execlp("xdg-open", "xdg-open", "--", target, (char *)NULL);
             _exit(127);
@@ -8007,6 +8051,11 @@ static void refresh_screen(void) {
     ABuffer ab = frame_ab;
     ab_reset(&ab);
 
+    /* Saida sincronizada (DEC 2026): o terminal aplica o quadro inteiro de uma
+     * vez, entao o cursor escondido durante o desenho nao chega a "piscar".
+     * Terminais sem suporte ignoram a sequencia. */
+    ab_append(&ab, SYNC_BEGIN, -1);
+
     if (g_screen_clear_needed || size_changed) {
         ab_append(&ab, "\x1b[2J\x1b[3J\x1b[H", 11);
         g_screen_clear_needed = 0;
@@ -8041,7 +8090,7 @@ static void refresh_screen(void) {
         if (cur_pos > clen) cur_pos = clen;
         int col = 1 + utf8_width_len(E.cmd_buf, cur_pos) + 1;
         char cpos[64];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
+        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH" CURSOR_BAR "\x1b[?25h", E.screen_rows, col);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.mode == MODE_CONFIRM_DELETE_NOTE) {
         int actual = (E.num_filtered > 0 && E.selected_note_idx < E.num_filtered) ? E.filtered_indices[E.selected_note_idx] : -1;
@@ -8050,7 +8099,7 @@ static void refresh_screen(void) {
         snprintf(prompt, sizeof(prompt), " Deseja realmente excluir a nota '%s'? (s/n): ", tname);
         int col = utf8_width(prompt) + 1;
         char cpos[64];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[2 q", E.screen_rows, col);
+        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH" CURSOR_BLOCK "\x1b[?25h", E.screen_rows, col);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.mode >= MODE_PROMPT_NEW_NOTE && E.mode <= MODE_PROMPT_EXPORT_DIR) {
         char plabel[512];
@@ -8062,7 +8111,7 @@ static void refresh_screen(void) {
         if (cur_pos > plen) cur_pos = plen;
         int col = pwidth + utf8_width_len(E.prompt_buf, cur_pos) + 1;
         char cpos[64];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h\x1b[5 q", E.screen_rows, col);
+        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH" CURSOR_BAR "\x1b[?25h", E.screen_rows, col);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.mode == MODE_SEARCH_LEFT) {
         char cpos[64];
@@ -8070,14 +8119,14 @@ static void refresh_screen(void) {
         int avail = E.left_width - 6;
         if (avail < 2) avail = 2;
         int disp_w = (q_w > avail) ? avail : q_w;
-        snprintf(cpos, sizeof(cpos), "\x1b[2;%dH\x1b[?25h\x1b[5 q", 5 + disp_w);
+        snprintf(cpos, sizeof(cpos), "\x1b[2;%dH" CURSOR_BAR "\x1b[?25h", 5 + disp_w);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.focus == FOCUS_LEFT) {
         int crow = (E.selected_note_idx - E.sidebar_scroll_y) + 4;
         if (crow < 4) crow = 4;
         if (crow > editor_rows) crow = editor_rows;
         char cpos[64];
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;3H\x1b[?25h", crow);
+        snprintf(cpos, sizeof(cpos), "\x1b[%d;3H" CURSOR_BLOCK "\x1b[?25h", crow);
         ab_append(&ab, cpos, (int)strlen(cpos));
     } else if (E.focus == FOCUS_RIGHT && E.num_tabs == 0) {
         ab_append(&ab, "\x1b[?25l", 6);
@@ -8096,10 +8145,12 @@ static void refresh_screen(void) {
         if (cx < E.left_width + 2) cx = E.left_width + 2;
         if (cx > E.screen_cols) cx = E.screen_cols;
         char cpos[64];
-        const char *cursor_shape = (E.mode == MODE_INSERT) ? "\x1b[5 q" : "\x1b[2 q";
-        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH\x1b[?25h%s", cy, cx, cursor_shape);
+        const char *cursor_shape = (E.mode == MODE_INSERT) ? CURSOR_BAR : CURSOR_BLOCK;
+        snprintf(cpos, sizeof(cpos), "\x1b[%d;%dH%s\x1b[?25h", cy, cx, cursor_shape);
         ab_append(&ab, cpos, (int)strlen(cpos));
     }
+
+    ab_append(&ab, SYNC_END, -1);
 
     if (ab.failed || !ab.b) {
         /* Nunca emite um quadro truncado: agenda uma nova tentativa completa. */

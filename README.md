@@ -91,7 +91,7 @@ O gerenciamento de texto opera sob a mesma convenção intuitiva do Neovim:
    - `r` substitui todos os caracteres da seleção pelo caractere seguinte.
 
 3. **Modo Inserção** (`i`):
-   - Digitação fluida com cursor em barra vertical piscante.
+   - Digitação fluida com cursor em barra vertical fixa (o cursor nunca pisca, em nenhum modo ou painel).
    - `Ctrl + V`: Cola da área de transferência do sistema (com suporte total a acentuação UTF-8).
    - `Ctrl + C`: Copia texto selecionado com `Shift + Setas`.
    - `Shift + Setas` ou `Ctrl + Shift + Setas`: Seleciona trechos sem sair do modo inserção (`INSERT [SEL]`).
@@ -163,6 +163,7 @@ A partir da versão 6.29+, todas as notas residem no banco de dados **`notas.db`
   - URLs da Web (`https://...`): Abrem no navegador padrão.
   - Arquivos locais (`./doc.pdf`, `C:\...`): Abrem no aplicativo padrão do sistema.
   - Pastas locais (`./data`): Abrem diretamente no explorador de arquivos.
+  - Scripts e executáveis (`./backup.bat`, `C:\tools\deploy.ps1`, `./sync.sh`): são **executados** como um atalho, com a pasta do próprio script como diretório de trabalho. No Windows, `.exe`/`.bat`/`.cmd`/`.vbs` rodam pela associação padrão e `.ps1` roda no PowerShell (janela fica aberta para mostrar a saída; respeita a ExecutionPolicy). No Linux, arquivos com permissão de execução rodam diretamente (sem shell). ⚠️ Isso vale para qualquer nota, inclusive importadas: só siga links de scripts em notas de origem confiável.
   - WikiLinks (`[[Nome da Nota]]`): Abrem diretamente a nota no editor.
 
 ### Quebra Automática de Linhas (Word Wrap)

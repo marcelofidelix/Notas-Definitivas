@@ -306,6 +306,73 @@ static void t_big_note(void) {
     chk("quadro medio < 50 ms", t_frames < 1000, msg);
 }
 
+/* Nenhum quadro pode pedir cursor piscante (DECSCUSR 0/1/3/5); todos chegam
+ * sincronizados e com o piscar desligado. */
+static bool frame_cursor_steady(const char *shape) {
+    return frame_has(SYNC_BEGIN) && frame_has(SYNC_END) && frame_has("\x1b[?12l") && frame_has(shape) &&
+           !frame_has("\x1b[5 q") && !frame_has("\x1b[1 q") && !frame_has("\x1b[3 q") && !frame_has("\x1b[0 q");
+}
+
+static void t_cursor_steady(void) {
+    printf("\n-- cursor fixo em todos os modos e paineis --\n");
+    open_by_title("Alfa");
+    frame();
+    chk("normal (editor): bloco fixo", frame_cursor_steady("\x1b[2 q"), "");
+    keys("i");
+    frame();
+    chk("insercao: barra fixa", frame_cursor_steady("\x1b[6 q"), "");
+    esc();
+    keys(":");
+    frame();
+    chk("linha de comando: barra fixa", frame_cursor_steady("\x1b[6 q"), "");
+    esc();
+    E.focus = FOCUS_LEFT;
+    E.mode = MODE_NORMAL;
+    frame();
+    chk("painel esquerdo: bloco fixo", frame_cursor_steady("\x1b[2 q"), "");
+    keys("\x06");
+    frame();
+    chk("busca lateral: barra fixa", frame_cursor_steady("\x1b[6 q"), "");
+    esc();
+    E.search_query[0] = '\0';
+    E.search_cursor = 0;
+    apply_note_search("");
+    E.focus = FOCUS_LEFT; /* Esc da busca devolve o foco ao editor */
+    E.mode = MODE_NORMAL;
+    keys("n");
+    frame();
+    {
+        char why[96];
+        snprintf(why, sizeof why, "mode=%d focus=%d", (int)E.mode, (int)E.focus);
+        chk("prompt de nova nota: barra fixa", E.mode == MODE_PROMPT_NEW_NOTE && frame_cursor_steady("\x1b[6 q"), why);
+    }
+    esc();
+}
+
+static void t_script_link(void) {
+    printf("\n-- Enter em link de script executa o script --\n");
+    remove("marcador.txt");
+    FILE *f = fopen("rodar.bat", "wb");
+    if (f) {
+        fputs("@echo off\r\necho executado> \"%~dp0marcador.txt\"\r\n", f);
+        fclose(f);
+    }
+    int id = db_insert_note("Scripts", "[rodar](rodar.bat)\n", time(NULL), 0);
+    chk("nota com link de script criada", id > 0, "");
+    rescan_notes();
+    chk("abre a nota", open_by_title("Scripts"), "");
+    E.cursor_y = 0;
+    E.cursor_x = 1;
+    keys("\r");
+    chk("status informa a execucao", strstr(E.status_msg, "Executando") != NULL, E.status_msg);
+    bool ok = false;
+    for (int i = 0; i < 50 && !ok; i++) {
+        FILE *m = fopen("marcador.txt", "rb");
+        if (m) { ok = true; fclose(m); } else Sleep(100);
+    }
+    chk("o .bat rodou de fato (marcador criado)", ok, "marcador.txt nao apareceu em 5 s");
+}
+
 static void t_quit(void) {
     printf("\n-- saida protegida --\n");
     chk("abre Gama", open_by_title("Gama"), "");
@@ -340,6 +407,8 @@ int main(int argc, char **argv) {
     t_sidebar_search();
     t_new_note_prompt();
     t_big_note();
+    t_cursor_steady();
+    t_script_link();
     t_quit();
 
     free(g_frame);
