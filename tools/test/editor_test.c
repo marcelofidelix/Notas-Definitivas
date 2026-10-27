@@ -6,6 +6,8 @@
  *   - comando :s/antigo/novo/ (campos longos, sem barra final, padrao vazio);
  *   - desfazer/refazer (round trip, cursor, dobras, limite de niveis);
  *   - agrupamento de digitacao em um unico passo de undo;
+ *   - colagem multilinha em lote, carga/exclusao de linhas em lote;
+ *   - remocao de bytes de controle no texto enviado ao terminal;
  *   - rotulo dos prompts (fonte unica para desenho, cursor e mouse).
  * Nao abre terminal nem banco de dados.
  *
@@ -224,6 +226,108 @@ static void t_typing_coalesce(void) {
     doc_reset();
 }
 
+/* ---- colagem multilinha em lote ------------------------------------------ */
+
+static void t_paste(void) {
+    printf("\n-- colagem multilinha --\n");
+    E.mode = MODE_NORMAL;
+
+    { const char *d[] = { "hello world" }; doc_set(1, d); }
+    E.cursor_y = 0; E.cursor_x = 6;
+    editor_paste_string("A\r\nB\nC", 6);
+    {
+        const char *exp[] = { "hello A", "B", "Cworld" };
+        chk("LF/CRLF dividem linhas e o resto da linha vai para o fim", doc_is(3, exp),
+            E.num_lines > 2 ? E.lines[2].chars : "(linhas faltando)");
+    }
+    chk("cursor no fim do texto colado", E.cursor_y == 2 && E.cursor_x == 1, "cursor incorreto");
+    apply_undo();
+    { const char *orig[] = { "hello world" }; chk("undo desfaz a colagem inteira", doc_is(1, orig), E.lines[0].chars); }
+
+    { const char *d[] = { "ab" }; doc_set(1, d); }
+    E.cursor_y = 0; E.cursor_x = 1;
+    editor_paste_string("X\n", 2);
+    { const char *exp[] = { "aX", "b" }; chk("quebra final abre linha com o restante", doc_is(2, exp), "conteudo incorreto"); }
+    chk("cursor no inicio da nova linha", E.cursor_y == 1 && E.cursor_x == 0, "cursor incorreto");
+
+    { const char *d[] = { "" }; doc_set(1, d); }
+    editor_paste_string("1\r2", 3);
+    { const char *exp[] = { "1", "2" }; chk("CR isolado tambem quebra a linha", doc_is(2, exp), "conteudo incorreto"); }
+
+    { const char *d[] = { "# T", "fim" }; doc_set(2, d); }
+    E.cursor_y = 0; E.cursor_x = 3;
+    editor_paste_string("\n```\ncodigo\n```", 15);
+    chk("colagem recalcula blocos de codigo uma vez no fim",
+        E.num_lines == 5 && E.lines[1].is_code_fence && E.lines[2].in_code_block && !E.lines[4].in_code_block,
+        "flags de sintaxe incorretas");
+
+    { const char *d[] = { "xy" }; doc_set(1, d); }
+    E.cursor_y = 0; E.cursor_x = 1;
+    editor_paste_string("123", 3);
+    chk("colagem de uma linha insere no cursor", line0_is("x123y") && E.cursor_x == 4, E.lines[0].chars);
+    doc_reset();
+}
+
+/* ---- carga e exclusao em lote -------------------------------------------- */
+
+static void t_bulk_lines(void) {
+    printf("\n-- carga e exclusao de linhas em lote --\n");
+    const int N = 50000;
+    ABuffer src;
+    ab_init(&src);
+    for (int i = 0; i < N; i++) {
+        char t[32];
+        int n = snprintf(t, sizeof t, (i % 1000 == 0) ? "```\r\n" : "linha %d\n", i);
+        ab_append(&src, t, n);
+    }
+    doc_reset();
+    int64_t t0 = get_current_time_ms();
+    editor_load_content(src.b);
+    int64_t dt = get_current_time_ms() - t0;
+    ab_free(&src);
+    chk("carrega todas as linhas", E.num_lines == N, "contagem incorreta");
+    chk("CR final removido e cerca detectada", E.lines[0].len == 3 && E.lines[0].is_code_fence, E.lines[0].chars);
+    chk("linha interna marcada como bloco de codigo", E.lines[1].in_code_block, "in_code_block incorreto");
+    {
+        char msg[64];
+        snprintf(msg, sizeof msg, "%lld ms", (long long)dt);
+        chk("50k linhas carregam em menos de 1 s (era O(n^2))", dt < 1000, msg);
+    }
+
+    /* Exclusao visual de varias linhas: junta prefixo e sufixo e remove o meio */
+    { const char *d[] = { "abcdef", "meio1", "meio2", "xyz" }; doc_set(4, d); }
+    E.mode = MODE_VISUAL_CHAR;
+    E.visual_start_y = 0; E.visual_start_x = 2;
+    E.cursor_y = 3; E.cursor_x = 1;
+    delete_visual_selection_ex(false);
+    { const char *exp[] = { "abz" }; chk("exclusao multilinha junta as pontas", doc_is(1, exp), E.lines[0].chars); }
+
+    { const char *d[] = { "a", "b", "c", "d" }; doc_set(4, d); }
+    buf_delete_lines(1, 2);
+    { const char *exp[] = { "a", "d" }; chk("buf_delete_lines remove o intervalo", doc_is(2, exp), "conteudo incorreto"); }
+    buf_delete_lines(0, 99);
+    { const char *exp[] = { "" }; chk("apagar tudo deixa uma linha vazia", doc_is(1, exp), "documento sem linha"); }
+    E.mode = MODE_NORMAL;
+    doc_reset();
+}
+
+/* ---- saida de texto para o terminal -------------------------------------- */
+
+static void t_terminal_sanitize(void) {
+    printf("\n-- sanitizacao de texto para o terminal --\n");
+    ABuffer ab;
+    ab_init(&ab);
+    /* ESC/OSC 52, BEL, CR, DEL e CSI C1 (U+009B) precisam sumir; UTF-8 fica */
+    ab_append_text(&ab, "a\x1b]52;c;QUFB\x07" "b\r\x7f\xc2\x9b" "c\xc3\xa7", -1);
+    chk("remove C0, DEL e C1; preserva UTF-8", ab.b && strcmp(ab.b, "a]52;c;QUFBbc\xc3\xa7") == 0,
+        ab.b ? ab.b : "(vazio)");
+    ab_reset(&ab);
+    chk("ab_reset esvazia mantendo a capacidade", ab.len == 0 && ab.cap > 0 && ab.b[0] == '\0', "estado incorreto");
+    ab_append_text(&ab, "\xc2\xa0ok", 4);
+    chk("NBSP (U+00A0) nao e confundido com C1", ab.len == 4, "NBSP removido");
+    ab_free(&ab);
+}
+
 /* ---- rotulos dos prompts ------------------------------------------------- */
 
 #ifdef NOTAS_HAS_PROMPT_LABEL
@@ -262,6 +366,9 @@ int main(void) {
     t_substitute();
     t_undo_redo();
     t_typing_coalesce();
+    t_paste();
+    t_bulk_lines();
+    t_terminal_sanitize();
 #ifdef NOTAS_HAS_PROMPT_LABEL
     t_prompt_label();
 #endif

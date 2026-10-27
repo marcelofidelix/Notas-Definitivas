@@ -326,6 +326,10 @@ Esta versão passou por uma rodada de endurecimento focada em falhas reais de me
 | **Clipboard** | Corrigido o padding do Base64 do OSC 52 (`YQ==`, `YWI=`), que fazia terminais rejeitarem cópias de 1 ou 2 bytes; a leitura do clipboard Win32 é limitada ao tamanho real do bloco. |
 | **Links e caminhos** | No Linux, links são abertos com `fork`/`exec` (sem shell, sem injeção); no Windows, caminhos UTF-8 são convertidos para UTF-16 sem limite de 1024 bytes e a URL é validada antes do `ShellExecuteW`. |
 | **Terminal e buffers** | Escritas tratam envios parciais e `EINTR`; `LINES`/`COLUMNS` são lidos com `strtol` com validação e limite; buffers de escape ANSI expandidos para 64 bytes e uso de `safe_strcat()`, eliminando alertas de `-Wformat-truncation=2`. |
+| **Injeção de escapes** | Conteúdo de notas, nomes, prompts e mensagens passam por `ab_append_text()`, que descarta bytes de controle (C0, DEL, C1): um `.md` importado com `ESC` embutido não consegue mais reescrever o clipboard (OSC 52), o título ou a tela do terminal. |
+| **Carga e colagem** | Abrir uma nota recalcula dobras uma única vez (antes O(n²): 50 mil linhas levavam ~2,2 s, agora < 1 ms); colagem multilinha e exclusão de seleção operam em lote e não perdem texto em falha de memória. |
+| **Colagem e clipboard** | Bracketed paste e leitura do clipboard limitados a 64 MB; o texto colado é sempre consumido até o marcador final, sem vazar como comandos do Modo Normal; leitura `CF_TEXT` limitada ao tamanho do bloco. |
+| **SQLite e índice** | Statement de leitura reaproveitado, gravação com tamanho explícito, `DEFENSIVE` + `trusted_schema=OFF` contra banco adulterado; reaproveitamento do cache de busca por `bsearch` (antes O(n²)). |
 
 ### Testes
 

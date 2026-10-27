@@ -512,6 +512,51 @@ static void ab_append(ABuffer *ab, const char *s, int len) {
     ab->b[ab->len] = '\0';
 }
 
+/* Acrescenta TEXTO de origem nao confiavel (conteudo de nota, nomes, prompts,
+ * mensagens com titulos). Bytes de controle C0, DEL e C1 codificado em UTF-8
+ * (U+0080..U+009F) sao descartados: um .md importado com ESC embutido nao pode
+ * injetar sequencias no terminal (OSC 52 no clipboard, titulo da janela,
+ * reposicionamento do cursor). Esses codepoints ja tem largura 0 em
+ * utf8_codepoint_width(), entao o calculo de colunas nao muda. Sequencias de
+ * estilo do proprio editor continuam usando ab_append(). */
+static void ab_append_text(ABuffer *ab, const char *s, int len) {
+    if (!ab || ab->failed || !s) return;
+    if (len < 0) {
+        size_t slen = strlen(s);
+        if (slen > (size_t)INT_MAX) { ab->failed = true; return; }
+        len = (int)slen;
+    }
+    int start = 0;
+    int i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)s[i];
+        int skip = 0;
+        if (c < 0x20 || c == 0x7F) {
+            skip = 1;
+        } else if (c == 0xC2 && i + 1 < len &&
+                   (unsigned char)s[i + 1] >= 0x80 && (unsigned char)s[i + 1] <= 0x9F) {
+            skip = 2;
+        }
+        if (skip) {
+            if (i > start) ab_append(ab, s + start, i - start);
+            i += skip;
+            start = i;
+        } else {
+            i++;
+        }
+    }
+    if (len > start) ab_append(ab, s + start, len - start);
+}
+
+/* Esvazia o buffer mantendo a capacidade: o quadro seguinte reaproveita a
+ * memoria em vez de refazer a cadeia de realloc a cada redesenho. */
+static void ab_reset(ABuffer *ab) {
+    if (!ab) return;
+    ab->len = 0;
+    ab->failed = false;
+    if (ab->b) ab->b[0] = '\0';
+}
+
 static void ab_free(ABuffer *ab) {
     if (!ab) return;
     if (ab->b) free(ab->b);
@@ -1561,6 +1606,10 @@ static void copy_to_system_clipboard(const char *text, int len) {
 #endif
 }
 
+/* Teto para texto vindo do clipboard ou de bracketed paste. Evita overflow de
+ * int nos contadores e que um colar acidental de gigabytes esgote a memoria. */
+#define MAX_PASTE_BYTES (64 * 1024 * 1024)
+
 #ifdef _WIN32
 static char *get_system_clipboard(int *out_len) {
     if (out_len) *out_len = 0;
@@ -1580,7 +1629,7 @@ static char *get_system_clipboard(int *out_len) {
             size_t max_wchars = (bytes >= sizeof(WCHAR)) ? (size_t)(bytes / sizeof(WCHAR)) : 0;
             size_t wlen = 0;
             while (wlen < max_wchars && pw[wlen] != L'\0') wlen++;
-            if (wlen > 0 && wlen <= (size_t)INT_MAX) {
+            if (wlen > 0 && wlen <= (size_t)(MAX_PASTE_BYTES / 2)) {
                 int utf8_len = WideCharToMultiByte(CP_UTF8, 0, pw, (int)wlen,
                                                    NULL, 0, NULL, NULL);
                 if (utf8_len > 0) {
@@ -1604,10 +1653,22 @@ static char *get_system_clipboard(int *out_len) {
         if (hData) {
             char *pText = (char *)GlobalLock(hData);
             if (pText) {
-                char *res = strdup(pText);
+                /* Mesmo cuidado do ramo Unicode: nao confia em NUL dentro do
+                 * bloco (strdup podia ler alem do fim do handle). */
+                SIZE_T bytes = GlobalSize(hData);
+                const char *nul = (const char *)memchr(pText, '\0', (size_t)bytes);
+                size_t tlen = nul ? (size_t)(nul - pText) : (size_t)bytes;
+                char *res = NULL;
+                if (tlen > 0 && tlen <= (size_t)MAX_PASTE_BYTES) {
+                    res = (char *)malloc(tlen + 1);
+                    if (res) {
+                        memcpy(res, pText, tlen);
+                        res[tlen] = '\0';
+                    }
+                }
                 GlobalUnlock(hData);
                 CloseClipboard();
-                if (res && out_len) *out_len = (int)strlen(res);
+                if (res && out_len) *out_len = (int)tlen;
                 return res;
             }
         }
@@ -1648,21 +1709,27 @@ static char *get_system_clipboard(int *out_len) {
         return NULL;
     }
 
-    char tmp[512];
+    char tmp[4096];
     size_t nr;
+    bool failed = false;
     while ((nr = fread(tmp, 1, sizeof(tmp), pipe)) > 0) {
+        if (failed) continue; /* drena o pipe para o utilitario terminar */
+        if ((size_t)len + nr > (size_t)MAX_PASTE_BYTES) { failed = true; continue; }
         if (len + (int)nr + 1 >= cap) {
-            cap = (cap * 2) + (int)nr;
-            char *nb = (char *)realloc(buf, cap);
-            if (!nb) break;
+            int new_cap = cap;
+            while (new_cap <= len + (int)nr + 1) new_cap *= 2;
+            char *nb = (char *)realloc(buf, (size_t)new_cap);
+            if (!nb) { failed = true; continue; }
             buf = nb;
+            cap = new_cap;
         }
         memcpy(&buf[len], tmp, nr);
         len += (int)nr;
     }
     pclose(pipe);
 
-    if (len <= 0) {
+    /* Nunca devolve um clipboard truncado silenciosamente */
+    if (failed || len <= 0) {
         free(buf);
         return NULL;
     }
@@ -1901,22 +1968,41 @@ static void detect_heading(Line *l) {
     }
 }
 
-static void line_init(Line *l, const char *s, int len) {
-    l->chars = (char *)malloc(len + 1);
-    if (s && len > 0) memcpy(l->chars, s, len);
-    l->chars[len] = '\0';
-    l->len = len;
+/* Devolve false (com l->chars == NULL e len 0) se a alocacao falhar; o
+ * chamador decide se desfaz a operacao em vez de desreferenciar NULL. */
+static bool line_init(Line *l, const char *s, int len) {
+    if (len < 0) len = 0;
     l->folded = false;
     l->hidden = false;
     l->is_code_fence = false;
     l->in_code_block = false;
+    l->heading_lvl = 0;
+    l->chars = (char *)malloc((size_t)len + 1);
+    if (!l->chars) {
+        l->len = 0;
+        return false;
+    }
+    if (s && len > 0) memcpy(l->chars, s, (size_t)len);
+    l->chars[len] = '\0';
+    l->len = len;
     detect_heading(l);
+    return true;
 }
 
 static void line_free(Line *l) {
     if (l->chars) free(l->chars);
     l->chars = NULL;
     l->len = 0;
+}
+
+/* Troca o conteudo de uma linha existente. Aloca a nova copia ANTES de liberar
+ * a antiga: em falha de memoria a linha original continua intacta. */
+static bool line_set(Line *l, const char *s, int len) {
+    Line repl;
+    if (!line_init(&repl, s, len)) return false;
+    line_free(l);
+    *l = repl;
+    return true;
 }
 
 static void mark_modified(void) {
@@ -1933,32 +2019,64 @@ static void mark_modified(void) {
     }
 }
 
-static void buf_insert_line(int at, const char *s, int len) {
-    if (at < 0 || at > E.num_lines) return;
-    if (E.num_lines + 1 > E.cap_lines) {
-        int new_cap = E.cap_lines ? E.cap_lines * 2 : 32;
-        Line *new_lines = (Line *)realloc(E.lines, sizeof(Line) * new_cap);
-        if (!new_lines) return;
-        E.lines = new_lines;
-        E.cap_lines = new_cap;
+/* Garante capacidade para 'extra' linhas novas no buffer ativo, com checagem
+ * de overflow. Cresce geometricamente para que inserir N linhas custe O(N). */
+static bool buf_reserve_lines(int extra) {
+    if (extra <= 0) return true;
+    if (E.num_lines > INT_MAX - extra) return false;
+    int need = E.num_lines + extra;
+    if (need <= E.cap_lines) return true;
+    int new_cap = E.cap_lines > 0 ? E.cap_lines : 32;
+    while (new_cap < need) {
+        if (new_cap > INT_MAX / 2) { new_cap = need; break; }
+        new_cap *= 2;
     }
-    memmove(&E.lines[at + 1], &E.lines[at], sizeof(Line) * (E.num_lines - at));
-    line_init(&E.lines[at], s, len);
+    if ((size_t)new_cap > SIZE_MAX / sizeof(Line)) return false;
+    Line *new_lines = (Line *)realloc(E.lines, sizeof(Line) * (size_t)new_cap);
+    if (!new_lines) return false;
+    E.lines = new_lines;
+    E.cap_lines = new_cap;
+    return true;
+}
+
+/* Insere sem recalcular dobras/blocos de codigo. Para cargas e colagens em
+ * lote: o chamador chama update_folding() uma unica vez no fim, em vez de
+ * pagar O(linhas) por linha inserida (O(n^2) no total). */
+static bool buf_insert_line_raw(int at, const char *s, int len) {
+    if (at < 0 || at > E.num_lines) return false;
+    if (!buf_reserve_lines(1)) return false;
+    Line nl;
+    if (!line_init(&nl, s, len)) return false;
+    memmove(&E.lines[at + 1], &E.lines[at], sizeof(Line) * (size_t)(E.num_lines - at));
+    E.lines[at] = nl;
     E.num_lines++;
+    return true;
+}
+
+static void buf_insert_line(int at, const char *s, int len) {
+    if (!buf_insert_line_raw(at, s, len)) return;
     mark_modified();
     update_folding();
 }
 
-static void buf_delete_line(int at) {
-    if (at < 0 || at >= E.num_lines) return;
-    line_free(&E.lines[at]);
-    memmove(&E.lines[at], &E.lines[at + 1], sizeof(Line) * (E.num_lines - at - 1));
-    E.num_lines--;
+/* Remove 'count' linhas a partir de 'at' com um unico memmove e um unico
+ * recalculo de dobras (apagar uma selecao de k linhas era O(k * n)). */
+static void buf_delete_lines(int at, int count) {
+    if (at < 0 || at >= E.num_lines || count <= 0) return;
+    if (count > E.num_lines - at) count = E.num_lines - at;
+    for (int i = at; i < at + count; i++) line_free(&E.lines[i]);
+    memmove(&E.lines[at], &E.lines[at + count],
+            sizeof(Line) * (size_t)(E.num_lines - at - count));
+    E.num_lines -= count;
     mark_modified();
     if (E.num_lines == 0) {
-        buf_insert_line(0, "", 0);
+        buf_insert_line_raw(0, "", 0);
     }
     update_folding();
+}
+
+static void buf_delete_line(int at) {
+    buf_delete_lines(at, 1);
 }
 
 static void line_insert_char(Line *l, int at, char c) {
@@ -2099,44 +2217,100 @@ static void editor_paste_string(const char *text, int len) {
     if (E.cursor_x > E.lines[E.cursor_y].len) E.cursor_x = E.lines[E.cursor_y].len;
     if (E.cursor_x < 0) E.cursor_x = 0;
 
-    save_undo();
-
-    int i = 0;
-    while (i < len) {
-        int start = i;
-        while (i < len && text[i] != '\n' && text[i] != '\r') {
-            i++;
+    /* Conta os segmentos (LF, CRLF ou CR isolado encerram uma linha). */
+    int nseg = 1;
+    for (int k = 0; k < len; k++) {
+        if (text[k] == '\n') {
+            nseg++;
+        } else if (text[k] == '\r') {
+            nseg++;
+            if (k + 1 < len && text[k + 1] == '\n') k++;
         }
-        int chunk_len = i - start;
+    }
 
-        if (chunk_len > 0) {
-            Line *cur = &E.lines[E.cursor_y];
-            char *nc = (char *)realloc(cur->chars, cur->len + chunk_len + 1);
-            if (!nc) break;
-            cur->chars = nc;
-            memmove(&cur->chars[E.cursor_x + chunk_len], &cur->chars[E.cursor_x], cur->len - E.cursor_x + 1);
-            memcpy(&cur->chars[E.cursor_x], &text[start], chunk_len);
-            cur->len += chunk_len;
-            E.cursor_x += chunk_len;
-            detect_heading(cur);
+    Line *cur = &E.lines[E.cursor_y];
+    int cx = E.cursor_x;
+
+    if (nseg == 1) {
+        if (cur->len > INT_MAX - len - 1) {
+            set_status_msg("Texto colado grande demais para a linha.");
+            return;
         }
+        save_undo();
+        int before = cur->len;
+        line_replace_range(cur, cx, 0, text, len);
+        if (cur->len == before) {
+            set_status_msg("Memoria insuficiente para colar.");
+            return;
+        }
+        E.cursor_x = cx + len;
+    } else {
+        /* Colagem multilinha em lote: todas as alocacoes acontecem ANTES de
+         * mexer no documento. Antes, cada quebra chamava buf_insert_line()
+         * (memmove + recalculo de dobras, O(n) cada) e uma falha de memoria no
+         * meio truncava a linha do cursor, perdendo o texto apos ele. */
+        int extra = nseg - 1;
+        int tail_len = cur->len - cx;
+        Line *nl = (Line *)malloc(sizeof(Line) * (size_t)extra);
+        int built = 0, seg0_len = 0, last_len = 0;
+        bool ok = (nl != NULL) && buf_reserve_lines(extra);
+        int pos = 0;
+        for (int s = 0; s < nseg && ok; s++) {
+            int st = pos;
+            while (pos < len && text[pos] != '\n' && text[pos] != '\r') pos++;
+            int slen = pos - st;
+            if (pos < len) pos += (text[pos] == '\r' && pos + 1 < len && text[pos + 1] == '\n') ? 2 : 1;
 
-        if (i < len && (text[i] == '\n' || text[i] == '\r')) {
-            char nl_ch = text[i++];
-            if (nl_ch == '\r' && i < len && text[i] == '\n') {
-                i++; /* Skip \n in CRLF */
+            if (s == 0) {
+                seg0_len = slen;
+                ok = (cx <= INT_MAX - slen - 1);
+            } else if (s < nseg - 1) {
+                ok = line_init(&nl[built], text + st, slen);
+                if (ok) built++;
+            } else {
+                /* Ultimo segmento recebe o restante da linha original */
+                ok = (slen <= INT_MAX - tail_len - 1);
+                char *tmp = ok ? (char *)malloc((size_t)slen + (size_t)tail_len + 1) : NULL;
+                ok = ok && tmp;
+                if (ok) {
+                    memcpy(tmp, text + st, (size_t)slen);
+                    memcpy(tmp + slen, cur->chars + cx, (size_t)tail_len);
+                    ok = line_init(&nl[built], tmp, slen + tail_len);
+                    if (ok) { built++; last_len = slen; }
+                }
+                free(tmp);
             }
-
-            Line *cur = &E.lines[E.cursor_y];
-            buf_insert_line(E.cursor_y + 1, &cur->chars[E.cursor_x], cur->len - E.cursor_x);
-            cur = &E.lines[E.cursor_y];
-            cur->chars[E.cursor_x] = '\0';
-            cur->len = E.cursor_x;
-            detect_heading(cur);
-
-            E.cursor_y++;
-            E.cursor_x = 0;
         }
+        char *first = NULL;
+        if (ok) {
+            first = (char *)malloc((size_t)cx + (size_t)seg0_len + 1);
+            ok = (first != NULL);
+        }
+        if (!ok) {
+            for (int k = 0; k < built; k++) line_free(&nl[k]);
+            free(nl);
+            set_status_msg("Memoria insuficiente para colar.");
+            return;
+        }
+
+        save_undo();
+
+        memcpy(first, cur->chars, (size_t)cx);
+        memcpy(first + cx, text, (size_t)seg0_len);
+        first[cx + seg0_len] = '\0';
+        free(cur->chars);
+        cur->chars = first;
+        cur->len = cx + seg0_len;
+        detect_heading(cur);
+
+        int at = E.cursor_y + 1;
+        memmove(&E.lines[at + extra], &E.lines[at], sizeof(Line) * (size_t)(E.num_lines - at));
+        memcpy(&E.lines[at], nl, sizeof(Line) * (size_t)extra);
+        E.num_lines += extra;
+        free(nl);
+
+        E.cursor_y += extra;
+        E.cursor_x = last_len;
     }
 
     update_folding();
@@ -2281,6 +2455,27 @@ static void invalidate_typing_undo(void) {
     g_typing_undo_path[0] = '\0';
 }
 
+/* Copia profunda do buffer ativo para 'us'. Em falha de memoria libera o que
+ * ja foi copiado e devolve false (antes, um malloc nulo no meio da copia era
+ * desreferenciado por line_init). */
+static bool snapshot_lines(UndoState *us) {
+    us->num_lines = 0;
+    us->cursor_y = E.cursor_y;
+    us->cursor_x = E.cursor_x;
+    us->lines = (Line *)malloc(sizeof(Line) * (size_t)(E.num_lines > 0 ? E.num_lines : 1));
+    if (!us->lines) return false;
+    for (int i = 0; i < E.num_lines; i++) {
+        if (!line_init(&us->lines[i], E.lines[i].chars, E.lines[i].len)) {
+            free_undo_state(us);
+            return false;
+        }
+        us->lines[i].folded = E.lines[i].folded;
+        us->lines[i].hidden = E.lines[i].hidden;
+        us->num_lines = i + 1;
+    }
+    return true;
+}
+
 static void save_undo(void) {
     invalidate_typing_undo();
     if (E.undo_count >= MAX_UNDO) {
@@ -2288,21 +2483,11 @@ static void save_undo(void) {
         memmove(&E.undo_stack[0], &E.undo_stack[1], sizeof(UndoState) * (MAX_UNDO - 1));
         E.undo_count = MAX_UNDO - 1;
     }
-    UndoState *us = &E.undo_stack[E.undo_count++];
-    us->num_lines = E.num_lines;
-    us->cursor_y = E.cursor_y;
-    us->cursor_x = E.cursor_x;
-    us->lines = (Line *)malloc(sizeof(Line) * (E.num_lines > 0 ? E.num_lines : 1));
-    if (!us->lines) {
-        E.undo_count--;
+    if (!snapshot_lines(&E.undo_stack[E.undo_count])) {
+        set_status_msg("Memoria insuficiente: alteracao sem ponto de desfazer.");
         return;
     }
-    for (int i = 0; i < E.num_lines; i++) {
-        line_init(&us->lines[i], E.lines[i].chars, E.lines[i].len);
-        us->lines[i].heading_lvl = E.lines[i].heading_lvl;
-        us->lines[i].folded = E.lines[i].folded;
-        us->lines[i].hidden = E.lines[i].hidden;
-    }
+    E.undo_count++;
     for (int i = 0; i < E.redo_count; i++) {
         free_undo_state(&E.redo_stack[i]);
     }
@@ -2341,21 +2526,11 @@ static void apply_undo(void) {
         memmove(&E.redo_stack[0], &E.redo_stack[1], sizeof(UndoState) * (MAX_UNDO - 1));
         E.redo_count = MAX_UNDO - 1;
     }
-    UndoState *rs = &E.redo_stack[E.redo_count++];
-    rs->num_lines = E.num_lines;
-    rs->cursor_y = E.cursor_y;
-    rs->cursor_x = E.cursor_x;
-    rs->lines = (Line *)malloc(sizeof(Line) * (E.num_lines > 0 ? E.num_lines : 1));
-    if (!rs->lines) {
-        E.redo_count--;
+    if (!snapshot_lines(&E.redo_stack[E.redo_count])) {
+        set_status_msg("Memoria insuficiente para desfazer.");
         return;
     }
-    for (int i = 0; i < E.num_lines; i++) {
-        line_init(&rs->lines[i], E.lines[i].chars, E.lines[i].len);
-        rs->lines[i].heading_lvl = E.lines[i].heading_lvl;
-        rs->lines[i].folded = E.lines[i].folded;
-        rs->lines[i].hidden = E.lines[i].hidden;
-    }
+    E.redo_count++;
 
     UndoState *us = &E.undo_stack[--E.undo_count];
     for (int i = 0; i < E.num_lines; i++) line_free(&E.lines[i]);
@@ -2383,21 +2558,11 @@ static void apply_redo(void) {
         memmove(&E.undo_stack[0], &E.undo_stack[1], sizeof(UndoState) * (MAX_UNDO - 1));
         E.undo_count = MAX_UNDO - 1;
     }
-    UndoState *us = &E.undo_stack[E.undo_count++];
-    us->num_lines = E.num_lines;
-    us->cursor_y = E.cursor_y;
-    us->cursor_x = E.cursor_x;
-    us->lines = (Line *)malloc(sizeof(Line) * (E.num_lines > 0 ? E.num_lines : 1));
-    if (!us->lines) {
-        E.undo_count--;
+    if (!snapshot_lines(&E.undo_stack[E.undo_count])) {
+        set_status_msg("Memoria insuficiente para refazer.");
         return;
     }
-    for (int i = 0; i < E.num_lines; i++) {
-        line_init(&us->lines[i], E.lines[i].chars, E.lines[i].len);
-        us->lines[i].heading_lvl = E.lines[i].heading_lvl;
-        us->lines[i].folded = E.lines[i].folded;
-        us->lines[i].hidden = E.lines[i].hidden;
-    }
+    E.undo_count++;
 
     UndoState *rs = &E.redo_stack[--E.redo_count];
     for (int i = 0; i < E.num_lines; i++) line_free(&E.lines[i]);
@@ -2607,12 +2772,17 @@ static char *read_entire_file(const char *path, long *out_len) {
  * ========================================================================= */
 
 static sqlite3 *g_db = NULL;
+static sqlite3_stmt *g_stmt_get_content = NULL;
 
 static inline bool db_is_open(void) { return g_db != NULL; }
 
 static void db_close(void) {
     sqlite3 *db = g_db;
     g_db = NULL;
+    if (g_stmt_get_content) {
+        sqlite3_finalize(g_stmt_get_content);
+        g_stmt_get_content = NULL;
+    }
     if (!db) return;
     /* close_v2 nunca devolve SQLITE_BUSY: se algum statement ainda existir,
      * o handle e liberado quando ele for finalizado. Evita vazar o banco no
@@ -2653,6 +2823,17 @@ static bool db_open(void) {
         return false;
     }
     sqlite3_busy_timeout(g_db, 3000);
+
+    /* Endurecimento contra um notas.db adulterado: o modo defensivo impede
+     * corromper o arquivo via writable_schema/PRAGMAs perigosos, e
+     * trusted_schema=OFF impede que views/triggers do proprio banco chamem
+     * funcoes com efeitos colaterais. Nenhum dos dois afeta o CRUD normal. */
+#ifdef SQLITE_DBCONFIG_DEFENSIVE
+    sqlite3_db_config(g_db, SQLITE_DBCONFIG_DEFENSIVE, 1, (int *)NULL);
+#endif
+#ifdef SQLITE_DBCONFIG_TRUSTED_SCHEMA
+    sqlite3_db_config(g_db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, (int *)NULL);
+#endif
 
     /* WAL permite leitura e escrita concorrentes sem travar o loop da
      * interface; synchronous=NORMAL e o ajuste recomendado pela propria SQLite
@@ -2749,8 +2930,12 @@ static int db_insert_note(const char *name, const char *content, time_t mtime, i
     return id;
 }
 
-static bool db_update_content(int id, const char *content, time_t mtime) {
+/* len < 0 usa strlen. Com o tamanho explicito o texto vai inteiro para o
+ * banco, mesmo que contenha NUL, e evita um strlen() da nota a cada save. */
+static bool db_update_content_len(int id, const char *content, long len, time_t mtime) {
     if (!g_db || id < 0) return false;
+    if (!content) { content = ""; len = 0; }
+    if (len > INT_MAX) return false;
     sqlite3_stmt *st = NULL;
     bool ok = false;
     if (sqlite3_prepare_v2(g_db,
@@ -2758,12 +2943,16 @@ static bool db_update_content(int id, const char *content, time_t mtime) {
             -1, &st, NULL) != SQLITE_OK) {
         return false;
     }
-    sqlite3_bind_text(st, 1, content ? content : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, content, len < 0 ? -1 : (int)len, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)(mtime > 0 ? mtime : time(NULL)));
     sqlite3_bind_int(st, 3, id);
     if (sqlite3_step(st) == SQLITE_DONE) ok = (sqlite3_changes(g_db) > 0);
     sqlite3_finalize(st);
     return ok;
+}
+
+static bool db_update_content(int id, const char *content, time_t mtime) {
+    return db_update_content_len(id, content, -1, mtime);
 }
 
 static bool db_update_name(int id, const char *newname) {
@@ -2832,11 +3021,16 @@ static bool db_get_name(int id, char *out, size_t out_sz) {
 static char *db_get_content(int id, long *out_len) {
     if (out_len) *out_len = 0;
     if (!g_db || id < 0) return NULL;
-    sqlite3_stmt *st = NULL;
+    /* Statement reaproveitado: rescan_notes() le o conteudo de todas as notas
+     * na abertura, e compilar o SQL a cada leitura dominava esse custo. */
+    sqlite3_stmt *st = g_stmt_get_content;
     char *out = NULL;
-    if (sqlite3_prepare_v2(g_db, "SELECT content FROM notes WHERE id=?1;",
-                           -1, &st, NULL) != SQLITE_OK) {
-        return NULL;
+    if (!st) {
+        if (sqlite3_prepare_v2(g_db, "SELECT content FROM notes WHERE id=?1;",
+                               -1, &st, NULL) != SQLITE_OK) {
+            return NULL;
+        }
+        g_stmt_get_content = st;
     }
     sqlite3_bind_int(st, 1, id);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -2851,7 +3045,9 @@ static char *db_get_content(int id, long *out_len) {
             }
         }
     }
-    sqlite3_finalize(st);
+    /* reset libera o lock de leitura (WAL) sem descartar o plano compilado */
+    sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
     return out;
 }
 
@@ -2876,7 +3072,7 @@ static char *note_read_content(const char *path, long *out_len) {
 
 static bool note_write_content(const char *path, const char *data, long len) {
     int id = note_id_from_path(path);
-    if (id >= 0) return db_update_content(id, data, time(NULL));
+    if (id >= 0) return db_update_content_len(id, data, len, time(NULL));
     return write_file_atomic(path, data, len);
 }
 
@@ -2913,14 +3109,21 @@ static void editor_load_content(const char *content) {
     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
         p += 3;
     }
+    /* Insere sem recalcular dobras a cada linha: com buf_insert_line() abrir
+     * uma nota de N linhas custava O(N^2) (20k linhas = ~2*10^8 iteracoes). */
+    bool oom = false;
     while (*p) {
         const char *nl = strchr(p, '\n');
-        int linelen = nl ? (int)(nl - p) : (int)strlen(p);
+        size_t raw_len = nl ? (size_t)(nl - p) : strlen(p);
+        int linelen = raw_len > (size_t)INT_MAX - 1 ? INT_MAX - 1 : (int)raw_len;
         while (linelen > 0 && p[linelen - 1] == '\r') linelen--;
-        buf_insert_line(E.num_lines, p, linelen);
+        if (!buf_insert_line_raw(E.num_lines, p, linelen)) { oom = true; break; }
         if (!nl) break;
         p = nl + 1;
     }
+    mark_modified();
+    update_folding();
+    if (oom) set_status_msg("Memoria insuficiente: nota carregada parcialmente.");
 }
 
 /* -------------------------------------------------------------------------
@@ -3277,28 +3480,40 @@ static void note_update_cache(NoteInfo *n) {
         }
     }
 
-    size_t total_raw_len = strlen(n->filename) + 1 + strlen(n->title) + 1 + strlen(header) + 1 + (file_len > 0 ? file_len : 0) + 32;
-    char *combined_raw = (char *)malloc(total_raw_len);
-    if (!combined_raw) {
+    /* Normaliza cada parte direto no destino. Antes o texto inteiro era
+     * copiado para um buffer intermediario via snprintf (que ainda falha acima
+     * de INT_MAX) e so depois normalizado: duas alocacoes do tamanho da nota.
+     * normalize_text() nunca produz mais bytes do que le, entao 'cap' basta. */
+    size_t body_len = (raw && file_len > 0) ? (size_t)file_len : 0;
+    size_t cap = strlen(n->filename) + strlen(n->title) + strlen(header) + body_len + 4;
+    n->search_norm = (char *)malloc(cap);
+    if (!n->search_norm) {
         if (raw) free(raw);
         n->search_norm = strdup("");
         return;
     }
-
-    snprintf(combined_raw, total_raw_len, "%s %s %s %s",
-             n->filename, n->title, header, (raw && file_len > 0) ? raw : "");
-
-    if (raw) free(raw);
-
-    n->search_norm = (char *)malloc(total_raw_len + 1);
-    if (n->search_norm) {
-        normalize_text(combined_raw, n->search_norm, total_raw_len + 1);
-        n->search_norm_len = (int)strlen(n->search_norm);
-    } else {
-        n->search_norm = strdup("");
-        n->search_norm_len = 0;
+    const char *parts[4] = { n->filename, n->title, header, body_len ? raw : "" };
+    size_t pos = 0;
+    for (int k = 0; k < 4; k++) {
+        if (k > 0 && pos + 1 < cap) n->search_norm[pos++] = ' ';
+        normalize_text(parts[k], n->search_norm + pos, cap - pos);
+        pos += strlen(n->search_norm + pos);
     }
-    free(combined_raw);
+    if (raw) free(raw);
+    n->search_norm_len = pos > (size_t)INT_MAX ? INT_MAX : (int)pos;
+}
+
+/* Indice id -> posicao para reaproveitar caches em rescan_notes() em
+ * O(log n), em vez de comparar cada nota nova com todas as antigas. */
+typedef struct {
+    int id;
+    int idx;
+} NoteIdIndex;
+
+static int compare_note_id_index(const void *a, const void *b) {
+    int ia = ((const NoteIdIndex *)a)->id;
+    int ib = ((const NoteIdIndex *)b)->id;
+    return (ia > ib) - (ia < ib);
 }
 
 static const char *get_attention_color(int level) {
@@ -3433,6 +3648,23 @@ static void rescan_notes(void) {
 
     time_t now = time(NULL);
 
+    NoteIdIndex *old_index = NULL;
+    int old_index_n = 0;
+    if (old_notes && old_num_notes > 0) {
+        old_index = (NoteIdIndex *)malloc(sizeof(NoteIdIndex) * (size_t)old_num_notes);
+        if (old_index) {
+            for (int o = 0; o < old_num_notes; o++) {
+                if (!old_notes[o].search_norm) continue;
+                int oid = note_id_from_path(old_notes[o].filepath);
+                if (oid <= 0) continue;
+                old_index[old_index_n].id = oid;
+                old_index[old_index_n].idx = o;
+                old_index_n++;
+            }
+            qsort(old_index, (size_t)old_index_n, sizeof(NoteIdIndex), compare_note_id_index);
+        }
+    }
+
     /* Varredura do banco: cada linha vira um NoteInfo com caminho virtual
      * "db:<id>". A ordenacao por data continua sendo feita logo abaixo. */
     {
@@ -3466,10 +3698,17 @@ static void rescan_notes(void) {
 
                 /* reaproveita o cache de busca se a nota nao mudou de data */
                 NoteInfo *found_old = NULL;
-                for (int o = 0; o < old_num_notes; o++) {
-                    if (old_notes[o].search_norm && strcmp(old_notes[o].filepath, n->filepath) == 0) {
-                        found_old = &old_notes[o];
-                        break;
+                if (old_index) {
+                    NoteIdIndex key = { nid, 0 };
+                    NoteIdIndex *hit = (NoteIdIndex *)bsearch(&key, old_index, (size_t)old_index_n,
+                                                              sizeof(NoteIdIndex), compare_note_id_index);
+                    if (hit) found_old = &old_notes[hit->idx];
+                } else {
+                    for (int o = 0; o < old_num_notes; o++) {
+                        if (old_notes[o].search_norm && strcmp(old_notes[o].filepath, n->filepath) == 0) {
+                            found_old = &old_notes[o];
+                            break;
+                        }
                     }
                 }
 
@@ -3487,7 +3726,7 @@ static void rescan_notes(void) {
             sqlite3_finalize(st);
         }
     }
-
+    free(old_index);
 
     if (old_notes) {
         for (int i = 0; i < old_num_notes; i++) {
@@ -3640,8 +3879,8 @@ static void load_preview(const char *path) {
             g_preview.lines = new_lines;
             g_preview.cap_lines = new_cap;
         }
-        Line *l = &g_preview.lines[g_preview.num_lines++];
-        line_init(l, p, linelen);
+        if (!line_init(&g_preview.lines[g_preview.num_lines], p, linelen)) break;
+        g_preview.num_lines++;
         if (!nl) break;
         p = nl + 1;
     }
@@ -3651,8 +3890,7 @@ static void load_preview(const char *path) {
         g_preview.lines = (Line *)malloc(sizeof(Line));
         if (g_preview.lines) {
             g_preview.cap_lines = 1;
-            Line *l = &g_preview.lines[g_preview.num_lines++];
-            line_init(l, "", 0);
+            if (line_init(&g_preview.lines[0], "", 0)) g_preview.num_lines = 1;
         }
     }
     update_lines_syntax(g_preview.lines, g_preview.num_lines);
@@ -4249,8 +4487,17 @@ static void replace_in_current_note(const char *find_str, const char *rep_str) {
                 save_undo();
                 undo_saved = true;
             }
-            line_free(l);
-            line_init(l, nb.b ? nb.b : "", nb.len);
+            if (nb.b) {
+                /* Adota o buffer montado em vez de copia-lo outra vez */
+                free(l->chars);
+                l->chars = nb.b;
+                l->len = nb.len;
+                detect_heading(l);
+                nb.b = NULL;
+            } else if (!line_set(l, "", 0)) {
+                oom = true;
+                break;
+            }
             mark_modified();
             count += line_hits;
         }
@@ -4399,8 +4646,7 @@ static bool rename_note(const char *old_path, const char *raw_new_name) {
             if (E.tabs[t].num_lines > 0 && strncmp(E.tabs[t].lines[0].chars, "# ", 2) == 0) {
                 char hbuf[300];
                 snprintf(hbuf, sizeof(hbuf), "# %s", new_title);
-                line_free(&E.tabs[t].lines[0]);
-                line_init(&E.tabs[t].lines[0], hbuf, (int)strlen(hbuf));
+                line_set(&E.tabs[t].lines[0], hbuf, (int)strlen(hbuf));
             }
         }
     }
@@ -4411,8 +4657,7 @@ static bool rename_note(const char *old_path, const char *raw_new_name) {
         if (E.num_lines > 0 && strncmp(E.lines[0].chars, "# ", 2) == 0) {
             char hbuf[300];
             snprintf(hbuf, sizeof(hbuf), "# %s", new_title);
-            line_free(&E.lines[0]);
-            line_init(&E.lines[0], hbuf, (int)strlen(hbuf));
+            line_set(&E.lines[0], hbuf, (int)strlen(hbuf));
         }
         save_current_note();
     } else if (is_open_in_tabs) {
@@ -4774,9 +5019,7 @@ static void delete_visual_selection_ex(bool do_yank) {
     }
 
     if (linewise) {
-        for (int i = end_y; i >= start_y; i--) {
-            buf_delete_line(i);
-        }
+        buf_delete_lines(start_y, end_y - start_y + 1);
         E.cursor_y = start_y;
         if (E.cursor_y >= E.num_lines) E.cursor_y = E.num_lines - 1;
         if (E.cursor_y < 0) E.cursor_y = 0;
@@ -4815,22 +5058,24 @@ static void delete_visual_selection_ex(bool do_yank) {
             int suffix_len = last->len - last_skip;
             if (suffix_len < 0) suffix_len = 0;
 
-            char *new_chars = (char *)malloc(first_keep + suffix_len + 1);
-            if (new_chars) {
-                if (first_keep > 0) memcpy(new_chars, first->chars, first_keep);
-                if (suffix_len > 0) memcpy(new_chars + first_keep, &last->chars[last_skip], suffix_len);
-                new_chars[first_keep + suffix_len] = '\0';
-
-                free(first->chars);
-                first->chars = new_chars;
-                first->len = first_keep + suffix_len;
-                detect_heading(first);
-                mark_modified();
+            char *new_chars = (char *)malloc((size_t)first_keep + (size_t)suffix_len + 1);
+            if (!new_chars) {
+                /* Sem a juncao, apagar as linhas do meio perderia o sufixo da
+                 * ultima linha: aborta sem tocar no documento. */
+                set_status_msg("Memoria insuficiente para excluir a selecao.");
+                return;
             }
+            if (first_keep > 0) memcpy(new_chars, first->chars, first_keep);
+            if (suffix_len > 0) memcpy(new_chars + first_keep, &last->chars[last_skip], suffix_len);
+            new_chars[first_keep + suffix_len] = '\0';
 
-            for (int i = end_y; i >= start_y + 1; i--) {
-                buf_delete_line(i);
-            }
+            free(first->chars);
+            first->chars = new_chars;
+            first->len = first_keep + suffix_len;
+            detect_heading(first);
+            mark_modified();
+
+            buf_delete_lines(start_y + 1, end_y - start_y);
 
             E.cursor_y = start_y;
             E.cursor_x = first_keep;
@@ -5940,10 +6185,10 @@ static void render_left_panel(ABuffer *ab, int row) {
             if (q_w > avail) {
                 char trunc[256];
                 utf8_truncate_display(E.search_query, avail, trunc, sizeof(trunc));
-                ab_append(ab, trunc, (int)strlen(trunc));
+                ab_append_text(ab, trunc, (int)strlen(trunc));
                 cols_drawn += utf8_width(trunc);
             } else {
-                ab_append(ab, E.search_query, (int)strlen(E.search_query));
+                ab_append_text(ab, E.search_query, (int)strlen(E.search_query));
                 cols_drawn += q_w;
             }
             ab_append(ab, "\x1b[7m \x1b[27m", -1);
@@ -5980,7 +6225,7 @@ static void render_left_panel(ABuffer *ab, int row) {
                 if (p_w > max_text) {
                     char trunc[128];
                     utf8_truncate_display(placeholder, max_text, trunc, sizeof(trunc));
-                    ab_append(ab, trunc, (int)strlen(trunc));
+                    ab_append_text(ab, trunc, (int)strlen(trunc));
                     cols_drawn += utf8_width(trunc);
                 } else {
                     ab_append(ab, placeholder, (int)strlen(placeholder));
@@ -6047,10 +6292,10 @@ static void render_left_panel(ABuffer *ab, int row) {
         if (h_w > w) {
             char trunc[128];
             utf8_truncate_display(hdr, w, trunc, sizeof(trunc));
-            ab_append(ab, trunc, (int)strlen(trunc));
+            ab_append_text(ab, trunc, (int)strlen(trunc));
             cols_drawn += utf8_width(trunc);
         } else {
-            ab_append(ab, hdr, (int)strlen(hdr));
+            ab_append_text(ab, hdr, (int)strlen(hdr));
             cols_drawn += h_w;
         }
 
@@ -6362,11 +6607,11 @@ static void render_left_panel(ABuffer *ab, int row) {
         if (title_w > avail_title) {
             char trunc[256];
             utf8_truncate_display(n->title, avail_title - 1, trunc, sizeof(trunc));
-            ab_append(ab, trunc, (int)strlen(trunc));
+            ab_append_text(ab, trunc, (int)strlen(trunc));
             ab_append(ab, "~", 1);
             cols_drawn += utf8_width(trunc) + 1;
         } else {
-            ab_append(ab, n->title, (int)strlen(n->title));
+            ab_append_text(ab, n->title, (int)strlen(n->title));
             cols_drawn += title_w;
         }
 
@@ -6499,7 +6744,7 @@ static void render_tab_bar(ABuffer *ab) {
         }
 
         if (title_w <= avail_title) {
-            ab_append(ab, t->title, (int)strlen(t->title));
+            ab_append_text(ab, t->title, (int)strlen(t->title));
             tab_drawn += title_w;
             while (tab_drawn < this_w - 3) {
                 ab_append(ab, " ", 1);
@@ -6516,7 +6761,7 @@ static void render_tab_bar(ABuffer *ab) {
              * do marquee realmente mudar (a cada 300 ms), e nao a cada 150 ms. */
             g_marquee_active = true;
             g_last_marquee_tick = now_ms / 300;
-            ab_append(ab, slice, (int)strlen(slice));
+            ab_append_text(ab, slice, (int)strlen(slice));
             tab_drawn += utf8_width(slice);
             while (tab_drawn < this_w - 3) {
                 ab_append(ab, " ", 1);
@@ -6558,7 +6803,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
         ab_append(ab, TH_FG_H2, -1);
         ab_append(ab, STYLE_BOLD, -1);
         while (*p && *cols_printed < max_w) {
-            ab_append(ab, p, 1);
+            ab_append_text(ab, p, 1);
             (*cols_printed)++;
             if (*p == ']') { p++; break; }
             p++;
@@ -6572,7 +6817,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
     if (*p == '#' || (p[0] == '/' && p[1] == '/') || *p == ';') {
         ab_append(ab, TH_FG_MUTED, -1);
         while (*p && *cols_printed < max_w) {
-            ab_append(ab, p++, 1);
+            ab_append_text(ab, p++, 1);
             (*cols_printed)++;
         }
         ab_append(ab, STYLE_RESET, -1);
@@ -6589,7 +6834,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
         if (ch == '#' || (ch == '/' && i + 1 < l->len && l->chars[i + 1] == '/') || ch == ';') {
             ab_append(ab, TH_FG_MUTED, -1);
             while (i < l->len && *cols_printed < max_w) {
-                ab_append(ab, &l->chars[i++], 1);
+                ab_append_text(ab, &l->chars[i++], 1);
                 (*cols_printed)++;
             }
             break;
@@ -6599,18 +6844,18 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
         if (ch == '"' || ch == '\'') {
             char quote = ch;
             ab_append(ab, TH_FG_DATE, -1);
-            ab_append(ab, &l->chars[i++], 1);
+            ab_append_text(ab, &l->chars[i++], 1);
             (*cols_printed)++;
             while (i < l->len && l->chars[i] != quote && *cols_printed < max_w) {
                 if (l->chars[i] == '\\' && i + 1 < l->len) {
-                    ab_append(ab, &l->chars[i++], 1);
+                    ab_append_text(ab, &l->chars[i++], 1);
                     (*cols_printed)++;
                 }
-                ab_append(ab, &l->chars[i++], 1);
+                ab_append_text(ab, &l->chars[i++], 1);
                 (*cols_printed)++;
             }
             if (i < l->len && l->chars[i] == quote && *cols_printed < max_w) {
-                ab_append(ab, &l->chars[i++], 1);
+                ab_append_text(ab, &l->chars[i++], 1);
                 (*cols_printed)++;
             }
             ab_append(ab, TH_FG_MAIN, -1);
@@ -6620,22 +6865,22 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
         /* Variable: $VAR or ${VAR} */
         if (ch == '$') {
             ab_append(ab, TH_FG_WARN, -1);
-            ab_append(ab, &l->chars[i++], 1);
+            ab_append_text(ab, &l->chars[i++], 1);
             (*cols_printed)++;
             if (i < l->len && l->chars[i] == '{') {
-                ab_append(ab, &l->chars[i++], 1);
+                ab_append_text(ab, &l->chars[i++], 1);
                 (*cols_printed)++;
                 while (i < l->len && l->chars[i] != '}' && *cols_printed < max_w) {
-                    ab_append(ab, &l->chars[i++], 1);
+                    ab_append_text(ab, &l->chars[i++], 1);
                     (*cols_printed)++;
                 }
                 if (i < l->len && l->chars[i] == '}' && *cols_printed < max_w) {
-                    ab_append(ab, &l->chars[i++], 1);
+                    ab_append_text(ab, &l->chars[i++], 1);
                     (*cols_printed)++;
                 }
             } else {
                 while (i < l->len && (isalnum((unsigned char)l->chars[i]) || l->chars[i] == '_') && *cols_printed < max_w) {
-                    ab_append(ab, &l->chars[i++], 1);
+                    ab_append_text(ab, &l->chars[i++], 1);
                     (*cols_printed)++;
                 }
             }
@@ -6647,7 +6892,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
         if (ch == '-' && (i == 0 || isspace((unsigned char)l->chars[i - 1])) && i + 1 < l->len && (isalpha((unsigned char)l->chars[i + 1]) || l->chars[i + 1] == '-')) {
             ab_append(ab, TH_FG_YELLOW, -1);
             while (i < l->len && !isspace((unsigned char)l->chars[i]) && l->chars[i] != '=' && *cols_printed < max_w) {
-                ab_append(ab, &l->chars[i++], 1);
+                ab_append_text(ab, &l->chars[i++], 1);
                 (*cols_printed)++;
             }
             ab_append(ab, TH_FG_MAIN, -1);
@@ -6689,7 +6934,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
                 ab_append(ab, TH_FG_H1, -1);
                 ab_append(ab, STYLE_BOLD, -1);
                 for (int w = wstart; w < i && *cols_printed < max_w; w++) {
-                    ab_append(ab, &l->chars[w], 1);
+                    ab_append_text(ab, &l->chars[w], 1);
                     (*cols_printed)++;
                 }
                 ab_append(ab, STYLE_RESET, -1);
@@ -6697,7 +6942,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
                 ab_append(ab, TH_FG_MAIN, -1);
             } else {
                 for (int w = wstart; w < i && *cols_printed < max_w; w++) {
-                    ab_append(ab, &l->chars[w], 1);
+                    ab_append_text(ab, &l->chars[w], 1);
                     (*cols_printed)++;
                 }
             }
@@ -6707,7 +6952,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
         /* Operators = : | & */
         if (ch == '=' || ch == ':' || ch == '|' || ch == '&') {
             ab_append(ab, TH_FG_ACCENT, -1);
-            ab_append(ab, &l->chars[i++], 1);
+            ab_append_text(ab, &l->chars[i++], 1);
             (*cols_printed)++;
             ab_append(ab, TH_FG_MAIN, -1);
             continue;
@@ -6728,7 +6973,7 @@ static void render_code_line(ABuffer *ab, Line *l, int *cols_printed, int max_w)
         /* Regular character */
         int ch_len = utf8_charlen((unsigned char)ch);
         if (ch_len <= 0) ch_len = 1;
-        ab_append(ab, &l->chars[i], ch_len);
+        ab_append_text(ab, &l->chars[i], ch_len);
         (*cols_printed)++;
         i += ch_len;
     }
@@ -7008,7 +7253,7 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                     ab_append(ab, TH_FG_YELLOW, -1);
                     ab_append(ab, STYLE_BOLD, -1);
                     while (*p && cols_printed < editor_width - 1) {
-                        ab_append(ab, p++, 1);
+                        ab_append_text(ab, p++, 1);
                         cols_printed++;
                     }
                 }
@@ -7066,7 +7311,7 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                 const char *bullet_color = (bullet_char == '*') ? TH_FG_ACCENT : TH_FG_YELLOW;
                 ab_append(ab, bullet_color, -1);
                 ab_append(ab, STYLE_BOLD, -1);
-                ab_append(ab, &l->chars[char_idx], 1);
+                ab_append_text(ab, &l->chars[char_idx], 1);
                 ab_append(ab, "\x1b[22m", 4);
                 ab_append(ab, line_fg, -1);
                 cols_printed += 1;
@@ -7111,13 +7356,13 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                                 if (spans[s].is_wikilink) {
                                     ab_append(ab, TH_FG_WIKI, -1);
                                     ab_append(ab, STYLE_BOLD "[", -1);
-                                    ab_append(ab, tlink, (int)strlen(tlink));
+                                    ab_append_text(ab, tlink, (int)strlen(tlink));
                                     ab_append(ab, "]", 1); ab_append(ab, "\x1b[22m", 4);
                                     cols_printed += utf8_width(tlink) + 2;
                                 } else {
                                     ab_append(ab, TH_FG_LINK, -1);
                                     ab_append(ab, STYLE_UNDERLINE, -1);
-                                    ab_append(ab, tlink, (int)strlen(tlink));
+                                    ab_append_text(ab, tlink, (int)strlen(tlink));
                                     ab_append(ab, STYLE_RESET, -1);
                                     cols_printed += utf8_width(tlink);
                                 }
@@ -7127,13 +7372,13 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                             if (spans[s].is_wikilink) {
                                 ab_append(ab, TH_FG_WIKI, -1);
                                 ab_append(ab, STYLE_BOLD "[", -1);
-                                ab_append(ab, spans[s].text, (int)strlen(spans[s].text));
+                                ab_append_text(ab, spans[s].text, (int)strlen(spans[s].text));
                                 ab_append(ab, "]", 1); ab_append(ab, "\x1b[22m", 4);
                                 cols_printed += utf8_width(spans[s].text) + 2;
                             } else {
                                 ab_append(ab, TH_FG_LINK, -1);
                                 ab_append(ab, STYLE_UNDERLINE, -1);
-                                ab_append(ab, spans[s].text, (int)strlen(spans[s].text));
+                                ab_append_text(ab, spans[s].text, (int)strlen(spans[s].text));
                                 ab_append(ab, STYLE_RESET, -1);
                                 cols_printed += utf8_width(spans[s].text);
                             }
@@ -7209,7 +7454,7 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                     if (!hide_styles && char_idx >= msp->open_start && char_idx < msp->content_start) {
                         /* Opening delimiter: subtle muted color in Insert mode */
                         ab_append(ab, TH_FG_MUTED, -1);
-                        ab_append(ab, &l->chars[char_idx], ch_len);
+                        ab_append_text(ab, &l->chars[char_idx], ch_len);
                         if (char_idx + ch_len >= msp->content_start) {
                             if (msp->type == STYLE_SPAN_BOLD || msp->type == STYLE_SPAN_BOLD_ITALIC) ab_append(ab, STYLE_BOLD, -1);
                             if (msp->type == STYLE_SPAN_ITALIC || msp->type == STYLE_SPAN_BOLD_ITALIC) ab_append(ab, STYLE_ITALIC, -1);
@@ -7220,7 +7465,7 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                         if (msp->type == STYLE_SPAN_BOLD || msp->type == STYLE_SPAN_BOLD_ITALIC) ab_append(ab, STYLE_BOLD, -1);
                         if (msp->type == STYLE_SPAN_ITALIC || msp->type == STYLE_SPAN_BOLD_ITALIC) ab_append(ab, STYLE_ITALIC, -1);
                         ab_append(ab, line_fg, -1);
-                        ab_append(ab, &l->chars[char_idx], ch_len);
+                        ab_append_text(ab, &l->chars[char_idx], ch_len);
                         if (char_idx + ch_len >= msp->content_end) {
                             ab_append(ab, "\x1b[22;23m", -1);
                             ab_append(ab, line_fg, -1);
@@ -7230,7 +7475,7 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                     } else if (!hide_styles && char_idx >= msp->close_start && char_idx < msp->close_start + msp->close_len) {
                         /* Closing delimiter: subtle muted color in Insert mode */
                         ab_append(ab, TH_FG_MUTED, -1);
-                        ab_append(ab, &l->chars[char_idx], ch_len);
+                        ab_append_text(ab, &l->chars[char_idx], ch_len);
                         if (char_idx + ch_len >= msp->close_start + msp->close_len) {
                             ab_append(ab, "\x1b[22;23m", -1);
                             ab_append(ab, line_fg, -1);
@@ -7240,7 +7485,7 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                 } else {
                     ab_append(ab, line_fg, -1);
                     if (l->heading_lvl >= 1) ab_append(ab, STYLE_BOLD, -1);
-                    ab_append(ab, &l->chars[char_idx], ch_len);
+                    ab_append_text(ab, &l->chars[char_idx], ch_len);
                 }
 
                 cols_printed += cw;
@@ -7392,13 +7637,13 @@ static void render_status_bar(ABuffer *ab) {
         ab_append(ab, TH_FG_YELLOW, -1);
         ab_append(ab, "[Prévia] ", -1);
         ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, preview_name[0] ? preview_name : g_preview.filepath, -1);
+        ab_append_text(ab, preview_name[0] ? preview_name : g_preview.filepath, -1);
         ab_append(ab, TH_FG_MUTED, -1);
         ab_append(ab, " (Enter/Duplo clique p/ abrir)", -1);
     } else {
         ab_append(ab, TH_FG_WHITE, -1);
         ab_append(ab, STYLE_BOLD, -1);
-        ab_append(ab, E.cur_filename[0] ? E.cur_filename : "[Sem Arquivo]", -1);
+        ab_append_text(ab, E.cur_filename[0] ? E.cur_filename : "[Sem Arquivo]", -1);
         ab_append(ab, STYLE_RESET, -1);
         ab_append(ab, TH_BG_STATUS, -1);
         if (E.modified) {
@@ -7559,7 +7804,7 @@ static void render_command_line(ABuffer *ab) {
         ab_append(ab, TH_FG_H1, -1);
         ab_append(ab, STYLE_BOLD ":", -1);
         ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.cmd_buf, (int)strlen(E.cmd_buf));
+        ab_append_text(ab, E.cmd_buf, (int)strlen(E.cmd_buf));
         int pad = E.screen_cols - 1 - (int)strlen(E.cmd_buf);
         while (pad-- > 0) ab_append(ab, " ", 1);
     } else if (E.mode == MODE_CONFIRM_DELETE_NOTE) {
@@ -7569,7 +7814,7 @@ static void render_command_line(ABuffer *ab) {
         int actual = (E.num_filtered > 0 && E.selected_note_idx < E.num_filtered) ? E.filtered_indices[E.selected_note_idx] : -1;
         const char *tname = (actual >= 0) ? E.notes[actual].title : "esta nota";
         snprintf(prompt, sizeof(prompt), " Deseja realmente excluir a nota '%s'? (s/n): ", tname);
-        ab_append(ab, prompt, -1);
+        ab_append_text(ab, prompt, -1);
         ab_append(ab, STYLE_RESET, -1);
         int plen = utf8_width(prompt);
         int pad = E.screen_cols - plen;
@@ -7579,10 +7824,10 @@ static void render_command_line(ABuffer *ab) {
         prompt_label(prompt, sizeof(prompt));
         ab_append(ab, prompt_label_color(E.mode), -1);
         ab_append(ab, STYLE_BOLD, -1);
-        ab_append(ab, prompt, -1);
+        ab_append_text(ab, prompt, -1);
         ab_append(ab, STYLE_RESET, -1);
         ab_append(ab, TH_FG_WHITE, -1);
-        ab_append(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
+        ab_append_text(ab, E.prompt_buf, (int)strlen(E.prompt_buf));
         int plen = utf8_width(prompt) + utf8_width(E.prompt_buf);
         int pad = E.screen_cols - plen;
         while (pad-- > 0) ab_append(ab, " ", 1);
@@ -7591,7 +7836,7 @@ static void render_command_line(ABuffer *ab) {
         if (E.status_msg[0] && now - E.status_msg_time < 5) {
             ab_append(ab, TH_FG_YELLOW, -1);
             ab_append(ab, " ", 1);
-            ab_append(ab, E.status_msg, (int)strlen(E.status_msg));
+            ab_append_text(ab, E.status_msg, (int)strlen(E.status_msg));
             int pad = E.screen_cols - 1 - (int)strlen(E.status_msg);
             while (pad-- > 0) ab_append(ab, " ", 1);
         } else {
@@ -7756,8 +8001,11 @@ static void refresh_screen(void) {
     /* Calculate scroll after window dimensions and status bar lines are resolved */
     editor_scroll();
 
-    ABuffer ab;
-    ab_init(&ab);
+    /* Buffer de quadro persistente: um quadro tem dezenas a centenas de KB de
+     * escapes; reaproveitar a capacidade evita ~8 realloc por redesenho. */
+    static ABuffer frame_ab;
+    ABuffer ab = frame_ab;
+    ab_reset(&ab);
 
     if (g_screen_clear_needed || size_changed) {
         ab_append(&ab, "\x1b[2J\x1b[3J\x1b[H", 11);
@@ -7861,7 +8109,12 @@ static void refresh_screen(void) {
         g_screen_clear_needed = 1;
         g_needs_redraw = 1;
     }
-    ab_free(&ab);
+    if (ab.failed || ab.cap > (8 << 20)) {
+        /* Depois de falha ou de um quadro anormalmente grande, devolve a
+         * memoria em vez de reter o pico indefinidamente. */
+        ab_free(&ab);
+    }
+    frame_ab = ab;
 }
 
 static void set_status_msg(const char *fmt, ...) {
@@ -8125,11 +8378,14 @@ static int editor_read_key(void) {
                     seq[3] = read_raw_byte(80);
                     seq[4] = read_raw_byte(80);
                     if (seq[3] == '0' && seq[4] == '~') {
-                        /* Start of Bracketed Paste */
-                        int cap = 8192;
-                        char *pbuf = (char *)malloc(cap);
-                        if (!pbuf) return -1;
-                        int plen = 0;
+                        /* Start of Bracketed Paste. O texto colado e lido ATE o
+                         * marcador final mesmo se estourar o limite ou faltar
+                         * memoria: interromper no meio deixaria o restante ser
+                         * interpretado como comandos do Modo Normal. Bytes ESC
+                         * do texto sao descartados (nao viram conteudo). */
+                        ABuffer pb;
+                        ab_init(&pb);
+                        bool too_big = false;
                         while (1) {
                             int b = read_raw_byte(200);
                             if (b == -1) break;
@@ -8143,45 +8399,28 @@ static int editor_read_key(void) {
                                     if (b2 == '2' && b3 == '0' && b4 == '1' && b5 == '~') {
                                         break; /* End of Bracketed Paste */
                                     }
-                                    if (plen + 6 >= cap) {
-                                        int new_cap = cap * 2;
-                                        char *np = (char *)realloc(pbuf, new_cap);
-                                        if (!np) break;
-                                        pbuf = np;
-                                        cap = new_cap;
+                                    int rest[5] = { b1, b2, b3, b4, b5 };
+                                    for (int k = 0; k < 5 && !too_big; k++) {
+                                        if (rest[k] == -1) continue;
+                                        char cb = (char)rest[k];
+                                        ab_append(&pb, &cb, 1);
                                     }
-                                    pbuf[plen++] = '\x1b';
-                                    if (b1 != -1) pbuf[plen++] = (char)b1;
-                                    if (b2 != -1) pbuf[plen++] = (char)b2;
-                                    if (b3 != -1) pbuf[plen++] = (char)b3;
-                                    if (b4 != -1) pbuf[plen++] = (char)b4;
-                                    if (b5 != -1) pbuf[plen++] = (char)b5;
-                                    continue;
-                                } else if (b1 != -1) {
-                                    if (plen + 2 >= cap) {
-                                        int new_cap = cap * 2;
-                                        char *np = (char *)realloc(pbuf, new_cap);
-                                        if (!np) break;
-                                        pbuf = np;
-                                        cap = new_cap;
-                                    }
-                                    pbuf[plen++] = '\x1b';
-                                    pbuf[plen++] = (char)b1;
-                                    continue;
+                                } else if (b1 != -1 && !too_big) {
+                                    char cb = (char)b1;
+                                    ab_append(&pb, &cb, 1);
                                 }
+                            } else if (!too_big) {
+                                char cb = (char)b;
+                                ab_append(&pb, &cb, 1);
                             }
-                            if (plen + 2 >= cap) {
-                                int new_cap = cap * 2;
-                                char *np = (char *)realloc(pbuf, new_cap);
-                                if (!np) break;
-                                pbuf = np;
-                                cap = new_cap;
-                            }
-                            pbuf[plen++] = (char)b;
+                            if (pb.len > MAX_PASTE_BYTES || pb.failed) too_big = true;
                         }
-                        pbuf[plen] = '\0';
-                        editor_paste_string(pbuf, plen);
-                        free(pbuf);
+                        if (too_big) {
+                            set_status_msg("Colagem ignorada: texto grande demais ou memoria insuficiente.");
+                        } else if (pb.b && pb.len > 0) {
+                            editor_paste_string(pb.b, pb.len);
+                        }
+                        ab_free(&pb);
                         return -1;
                     }
                 }

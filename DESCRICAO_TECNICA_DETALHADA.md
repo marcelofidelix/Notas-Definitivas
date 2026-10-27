@@ -1298,6 +1298,26 @@ A cobertura automatizada divide-se em três pilares:
 
 Validação estrita: compilação Windows/MinGW com `-Wall -Wextra -Wformat=2 -Wformat-truncation=2` com **zero avisos**; `-fanalyzer` e `cppcheck` limpos; UBSan com trap mode ativo sem falhas.
 
+### 9.7 Rodada de Desempenho e Segurança
+
+| Função / área | Antes | Agora |
+| :--- | :--- | :--- |
+| `ab_append_text()` (nova) | Texto de notas, títulos, prompts e mensagens ia cru para o terminal; um `.md` importado com `ESC` podia emitir OSC 52 (sobrescrever o clipboard), mudar o título ou reposicionar a tela. | Todo texto de origem não confiável passa por `ab_append_text()`, que descarta C0, DEL e C1 codificado em UTF-8 (U+0080..U+009F). Esses codepoints já têm largura 0, então o layout não muda. Escapes do próprio editor seguem em `ab_append()`. |
+| `editor_load_content()` | `buf_insert_line()` por linha, cada uma recalculando dobras do documento inteiro: O(n²). 50 mil linhas ≈ 2,2 s. | `buf_insert_line_raw()` + um único `update_folding()` no fim: < 1 ms para 50 mil linhas. |
+| `buf_reserve_lines()`, `buf_insert_line_raw()`, `buf_delete_lines()` (novas) | Crescimento sem checagem de overflow; excluir k linhas fazia k `memmove` + k recálculos. | Capacidade geométrica com checagem de overflow; exclusão de intervalos com um `memmove` e um recálculo. |
+| `editor_paste_string()` | Uma inserção (memmove + recálculo) por quebra de linha; falha de memória no meio truncava a linha do cursor, perdendo o texto após ele. | Colagem em lote: todas as alocações acontecem antes de alterar o documento; em falha nada muda. LF, CRLF e CR isolado continuam aceitos. |
+| `line_init()` / `line_set()` / `snapshot_lines()` | `malloc` sem checagem (NULL desreferenciado); três cópias duplicadas do snapshot de undo. | `line_init()` devolve `bool`; `line_set()` troca o conteúdo sem destruir o original em falha; `snapshot_lines()` centraliza undo/redo e libera cópias parciais. |
+| `delete_visual_selection_ex()` | Se a junção das pontas falhasse, as linhas do meio e a última eram apagadas mesmo assim. | Aborta sem tocar no documento. |
+| Bracketed paste | `realloc` falho interrompia a leitura e o resto do texto colado era executado como comandos do Modo Normal; sem limite de tamanho (overflow de `int`). | Lê sempre até `ESC[201~`, limite de 64 MB (`MAX_PASTE_BYTES`), bytes `ESC` do texto não viram conteúdo. |
+| `get_system_clipboard()` | Win32 `CF_TEXT` usava `strdup` sem limite; POSIX devolvia clipboard truncado em falha e podia estourar `int`. | Leitura limitada a `GlobalSize()`; POSIX drena o pipe, limita a 64 MB e não devolve texto truncado. |
+| `refresh_screen()` | `ABuffer` novo a cada quadro (~8 `realloc`). | Buffer de quadro persistente (`ab_reset()`), liberado após falha ou quadro > 8 MB. |
+| `db_get_content()` / `db_update_content_len()` | `prepare` a cada leitura; gravação usava `strlen` (truncava em NUL). | Statement reaproveitado (finalizado em `db_close()`); gravação com o tamanho real. |
+| `db_open()` | — | `SQLITE_DBCONFIG_DEFENSIVE` e `trusted_schema=OFF` contra um `notas.db` adulterado. |
+| `note_update_cache()` / `rescan_notes()` | Cópia intermediária do texto via `snprintf` antes de normalizar; busca do cache antigo O(n²). | Normalização direta no destino; reaproveitamento do cache por `bsearch` sobre o id. |
+| `replace_in_current_note()` | Copiava a linha montada outra vez com `line_init`. | Adota o buffer montado. |
+
+`editor_test.c` ganhou casos para colagem multilinha (LF/CRLF/CR, cursor, undo), carga em lote de 50 mil linhas com detecção de blocos de código, exclusão de intervalos e sanitização de escapes.
+
 ---
 
 *Documento atualizado para o estado pós-v6.33.0 (`notas.c`, 11.237 linhas). O catálogo da seção 7 preserva os números de linha da v6.30.0; a seção 9 descreve a rodada atual e as funções novas.*
