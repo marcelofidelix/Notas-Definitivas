@@ -1,0 +1,38 @@
+[package]
+name = "notas"
+version = "7.0.0"
+edition = "2021"
+description = "Notas Definitivas - editor TUI de notas Markdown com SQLite (versao em Rust)"
+license = "MIT"
+rust-version = "1.80"
+
+[[bin]]
+name = "notas"
+path = "src/main.rs"
+
+[dependencies]
+# SQLite embutido (compilado estaticamente, sem DLL externa), igual a versao em C.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Terminal: modo raw, eventos de teclado/mouse/colagem/redimensionamento (Windows e Unix).
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+# Area de transferencia do sistema (Win32 CF_UNICODETEXT, X11, Wayland).
+arboard = { version = "3", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true

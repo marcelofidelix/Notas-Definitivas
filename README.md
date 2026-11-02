@@ -354,6 +354,13 @@ O projeto conta com testes automatizados compilados diretamente com o próprio `
 
 ---
 
+## 🦀 Versão alternativa em Rust
+
+A pasta [ust/](rust/) contém uma **reescrita completa em Rust** com as mesmas funcionalidades e o **mesmo 
+otas.db** (as duas versões podem alternar sobre o mesmo banco). Ela adiciona segurança de memória, SQLite embutido, ~105 testes e um fuzz de milhões de entradas. Veja [ust/README.md](rust/README.md) para compilar, a arquitetura e as diferenças.
+
+---
+
 ## 📄 Licença
 
 Distribuído sob a licença **MIT**. Consulte o arquivo [LICENSE](LICENSE) para mais detalhes.

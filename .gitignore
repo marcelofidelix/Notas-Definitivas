@@ -14,3 +14,8 @@ notas.db-shm
 # Importacao/exportacao de markdown feitas em teste
 *.import-tmp/
 *.export-tmp/
+
+# Versao em Rust: artefatos de compilacao (o Cargo.lock FICA no repositorio)
+rust/target/
+notas_rs.exe
+notas_rs
