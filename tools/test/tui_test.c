@@ -306,6 +306,74 @@ static void t_big_note(void) {
     chk("quadro medio < 50 ms", t_frames < 1000, msg);
 }
 
+/* Parte da linha do quadro (separada por \r\n) que contem `marca`. */
+static bool row_with(const char *marca, char *out, size_t sz) {
+    if (!g_frame) return false;
+    const char *p = g_frame;
+    const char *end = g_frame + g_frame_len;
+    while (p < end) {
+        const char *nl = p;
+        while (nl + 1 < end && !(nl[0] == '\r' && nl[1] == '\n')) nl++;
+        if (nl + 1 >= end) nl = end;
+        size_t len = (size_t)(nl - p);
+        if (len + 1 <= sz) {
+            memcpy(out, p, len);
+            out[len] = '\0';
+            /* compara o texto visivel: o desenho intercala escapes entre os caracteres */
+            static char vis[16384];
+            size_t o = 0;
+            for (size_t i = 0; i < len && o + 1 < sizeof vis; i++) {
+                if (out[i] == '\x1b' && i + 1 < len && out[i + 1] == '[') {
+                    i += 2;
+                    while (i < len && !((unsigned char)out[i] >= 0x40 && (unsigned char)out[i] <= 0x7E)) i++;
+                    continue;
+                }
+                vis[o++] = out[i];
+            }
+            vis[o] = '\0';
+            if (strstr(vis, marca)) return true;
+        }
+        p = nl + 2;
+    }
+    return false;
+}
+
+static void t_selection_highlight(void) {
+    printf("\n-- selecao V-Line / v realcada --\n");
+    const char *bg = TH_BG_SELECT;
+    int id = db_insert_note("Selecao", "primeira linha\n\n```\ncodigo aqui\n```\nultima linha\n", time(NULL), 0);
+    chk("nota de selecao criada", id > 0, "");
+    rescan_notes();
+    chk("abre a nota", open_by_title("Selecao"), "");
+    keys("gg");
+    keys("V");
+    keys("jjjj");
+    frame();
+    chk("modo V-LINE", E.mode == MODE_VISUAL_LINE, "");
+    static char row[16384];
+    const char *marks[] = { "primeira linha", "codigo", "```" };
+    for (int i = 0; i < 3; i++) {
+        bool ok = row_with(marks[i], row, sizeof row) && strstr(row, bg) != NULL;
+        chk(marks[i], ok, "linha selecionada sem realce");
+    }
+    /* O realce vai ate o fim da linha: o ultimo fundo antes do \x1b[K e o de selecao. */
+    if (row_with("primeira linha", row, sizeof row)) {
+        const char *k = strstr(row, "\x1b[K");
+        const char *last = NULL;
+        for (const char *q = row; q && (!k || q < k);) {
+            const char *f = strstr(q, "\x1b[48;2;");
+            if (!f || (k && f > k)) break;
+            last = f;
+            q = f + 1;
+        }
+        chk("V-Line preenche ate o fim da linha", last && strncmp(last, bg, strlen(bg)) == 0, "");
+    }
+    chk("contador na barra de status", frame_text_has("5 linhas") && frame_text_has("selecionados"), "");
+    esc();
+    frame();
+    chk("sem selecao nao ha contador", !frame_text_has("selecionados"), "");
+}
+
 /* Nenhum quadro pode pedir cursor piscante (DECSCUSR 0/1/3/5); todos chegam
  * sincronizados e com o piscar desligado. */
 static bool frame_cursor_steady(const char *shape) {
@@ -407,6 +475,7 @@ int main(int argc, char **argv) {
     t_sidebar_search();
     t_new_note_prompt();
     t_big_note();
+    t_selection_highlight();
     t_cursor_steady();
     t_script_link();
     t_quit();

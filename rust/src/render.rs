@@ -41,6 +41,26 @@ pub fn prompt_label(app: &App) -> Option<String> {
     })
 }
 
+/// " 2 linhas, 37 caracteres selecionados" enquanto ha selecao ativa.
+fn selection_summary(app: &App) -> String {
+    let active = app.mode.is_visual() || (app.mode == Mode::Insert && app.buf().is_some_and(|b| b.has_selection));
+    if !active || app.in_preview() {
+        return String::new();
+    }
+    let Some(b) = app.buf() else { return String::new() };
+    let linewise = app.mode == Mode::VisualLine;
+    let Some((sy, _, ey, _)) = b.selection(linewise) else { return String::new() };
+    let chars = b.selection_text(linewise).map_or(0, |t| t.chars().filter(|&c| c != '\n').count());
+    let lines = ey - sy + 1;
+    format!(
+        " {} {}, {} {} selecionados ",
+        lines,
+        if lines == 1 { "linha" } else { "linhas" },
+        chars,
+        if chars == 1 { "caractere" } else { "caracteres" }
+    )
+}
+
 fn prompt_color(th: &Theme, mode: Mode) -> &str {
     match mode {
         Mode::PromptNew | Mode::PromptReplaceWith | Mode::PromptImport | Mode::PromptExport => th.fg_accent,
@@ -680,7 +700,30 @@ impl<'a> Frame<'a> {
         self.p(RESET);
         self.p(line_bg);
 
+        let sel = if !in_preview && (app.mode.is_visual() || (app.mode == Mode::Insert && buf.is_some_and(|b| b.has_selection))) {
+            buf.and_then(|b| b.selection(app.mode == Mode::VisualLine))
+        } else {
+            None
+        };
+        let linewise = app.mode == Mode::VisualLine;
+        // Trecho selecionado nesta linha: (inicio, fim, inclui a quebra de linha).
+        let line_sel: Option<(usize, usize, bool)> = sel.and_then(|(sy, sx, ey, ex)| {
+            let y = vr.line;
+            if y < sy || y > ey {
+                return None;
+            }
+            let a = if linewise || y > sy { 0 } else { sx };
+            let b = if linewise || y < ey { l.text.len() } else { ex };
+            Some((a, b, linewise || y < ey))
+        });
+        let last_subrow = vr.seg.off + vr.seg.len >= l.text.len();
+
         // Cerca de codigo.
+        if l.fence && line_sel.is_some() {
+            // Linha selecionada: sem colorizacao de sintaxe, para o realce ser exato.
+            self.selected_row(&l.text, ew, th.fg_h3, th.bg_cur_line, line_sel.unwrap_or((0, 0, false)), linewise, last_subrow);
+            return;
+        }
         if l.fence {
             self.p(th.bg_cur_line);
             let mut printed = 6;
@@ -711,6 +754,10 @@ impl<'a> Frame<'a> {
             self.p(RESET);
             return;
         }
+        if l.in_code && line_sel.is_some() {
+            self.selected_row(&l.text, ew, th.fg_main, th.bg_cur_line, line_sel.unwrap_or((0, 0, false)), linewise, last_subrow);
+            return;
+        }
         if l.in_code {
             self.p(th.bg_cur_line);
             self.p(th.fg_main);
@@ -737,11 +784,6 @@ impl<'a> Frame<'a> {
             self.p(BOLD);
         }
         let bul = bullet(&l.text, l.heading, l.fence, l.in_code);
-        let sel = if !in_preview && (app.mode.is_visual() || (app.mode == Mode::Insert && buf.is_some_and(|b| b.has_selection))) {
-            buf.and_then(|b| b.selection(app.mode == Mode::VisualLine))
-        } else {
-            None
-        };
 
         let text = l.text.as_str();
         let end = vr.seg.off + vr.seg.len;
@@ -760,18 +802,8 @@ impl<'a> Frame<'a> {
                     continue;
                 }
             }
-            if let Some((sy, sx, ey, ex)) = sel {
-                let y = vr.line;
-                let in_sel = if app.mode == Mode::VisualLine {
-                    y >= sy && y <= ey
-                } else if y < sy || y > ey {
-                    false
-                } else {
-                    let a = if y == sy { sx } else { 0 };
-                    let z = if y == ey { ex } else { usize::MAX };
-                    idx >= a && idx < z
-                };
-                self.p(if in_sel { th.bg_select } else { line_bg });
+            if let Some((a, z, _)) = line_sel {
+                self.p(if idx >= a && idx < z { th.bg_select } else { line_bg });
             }
 
             // Links ocultos: so o titulo, sublinhado.
@@ -835,8 +867,74 @@ impl<'a> Frame<'a> {
             idx += clen;
         }
         self.p(RESET);
-        self.p(line_bg);
-        self.pad(ew - 1 - cols);
+        self.fill_tail(cols, ew, line_bg, line_sel, linewise, last_subrow);
+        self.p("\x1b[K");
+        self.p(RESET);
+    }
+
+    /// Resto da linha apos o texto: no V-Line a linha inteira fica realcada; no
+    /// `v` de varias linhas, a quebra de linha vira uma celula realcada.
+    fn fill_tail(
+        &mut self,
+        cols: i32,
+        ew: i32,
+        base_bg: &str,
+        line_sel: Option<(usize, usize, bool)>,
+        linewise: bool,
+        last_subrow: bool,
+    ) {
+        let th = self.th;
+        let room = (ew - 1 - cols).max(0);
+        match line_sel {
+            Some(_) if linewise => {
+                self.p(th.bg_select);
+                self.pad(room);
+            }
+            Some((_, _, true)) if last_subrow && room > 0 => {
+                self.p(th.bg_select);
+                self.pad(1);
+                self.p(base_bg);
+                self.pad(room - 1);
+            }
+            _ => {
+                self.p(base_bg);
+                self.pad(room);
+            }
+        }
+    }
+
+    /// Linha de codigo/cerca com selecao: texto simples com realce exato.
+    #[allow(clippy::too_many_arguments)]
+    fn selected_row(
+        &mut self,
+        text: &str,
+        ew: i32,
+        fg: &str,
+        base_bg: &str,
+        line_sel: (usize, usize, bool),
+        linewise: bool,
+        last_subrow: bool,
+    ) {
+        let th = self.th;
+        let (a, z, _) = line_sel;
+        let mut cols = 6;
+        self.p(fg);
+        for (i, c) in text.char_indices() {
+            let (cw, piece): (i32, String) = if c == '\t' {
+                let w = 4.min((ew - 1 - cols).max(0));
+                (w, " ".repeat(w as usize))
+            } else {
+                (cp_width(c as u32) as i32, c.to_string())
+            };
+            if cols + cw > ew - 1 {
+                break;
+            }
+            self.p(if i >= a && i < z { th.bg_select } else { base_bg });
+            self.txt(&piece);
+            cols += cw;
+        }
+        self.p(RESET);
+        self.fill_tail(cols, ew, base_bg, Some(line_sel), linewise, last_subrow);
         self.p("\x1b[K");
         self.p(RESET);
     }
@@ -1145,13 +1243,16 @@ impl<'a> Frame<'a> {
         };
         let modified = app.tab().is_some_and(|t| t.modified);
         let cur_name = app.tab().map_or_else(|| "[Sem Arquivo]".to_string(), |t| t.filename.clone());
+        // Resumo do que sera copiado/recortado, para o usuario saber o alcance.
+        let sel_info = selection_summary(app);
         let note_desc_w = if let Some(pn) = &preview_name {
             str_width(&format!("[Prévia] {} (Enter ou duplo clique p/ abrir)", pn))
         } else {
             str_width(&format!(
-                "{}{}",
+                "{}{}{}",
                 if app.tabs.is_empty() { "[Sem Abas Abertas]" } else { cur_name.as_str() },
-                if modified { " [+]" } else { "" }
+                if modified { " [+]" } else { "" },
+                sel_info
             ))
         };
 
@@ -1212,6 +1313,13 @@ impl<'a> Frame<'a> {
             if modified {
                 self.p(th.fg_warn);
                 self.p(" [+]");
+            }
+            if !sel_info.is_empty() {
+                self.p(th.bg_select);
+                self.p(th.fg_white);
+                self.p(&sel_info);
+                self.p(RESET);
+                self.p(th.bg_status);
             }
         }
         self.pad((app.cols - used1 - note_desc_w as i32 - rlen).max(1));
@@ -1483,6 +1591,127 @@ mod tests {
             a.rows = r;
             let _ = draw(&mut a);
         }
+    }
+
+    /// Parte direita (editor) de cada linha do quadro, sem a lista lateral.
+    fn editor_rows(frame: &str) -> Vec<String> {
+        // Linha 0 = barra de abas; so as linhas do editor (o rodape usa a mesma cor).
+        frame
+            .split("\r\n")
+            .take(21)
+            .map(|r| r.split_once("│\x1b[0m").map_or(r.to_string(), |(_, right)| right.to_string()))
+            .collect()
+    }
+
+    fn selected_app(content: &str) -> App {
+        let db = Db::open_memory();
+        db.insert_note("S", content, 10, 0);
+        let mut a = App::new(db);
+        a.cols = 100;
+        a.rows = 24;
+        a.focus = Focus::Right;
+        a
+    }
+
+    #[test]
+    fn visual_line_highlights_entire_rows_including_empty_ones_and_code() {
+        let mut a = selected_app("primeira\n\n```\ncodigo aqui\n```\nultima\n");
+        let key = a.notes[0].key.clone();
+        a.open_note(&key, true);
+        a.focus = Focus::Right;
+        a.mode = Mode::VisualLine;
+        let b = a.buf_mut().unwrap();
+        b.vis_y = 0;
+        b.cy = 4; // da 1a linha ate a cerca final
+        let bg = a.theme().bg_select;
+        let f = draw(&mut a);
+        let rows = editor_rows(&f);
+        // linhas de conteudo do editor: 1..=5 (a 0 e a barra de abas)
+        for (i, name) in ["primeira", "(vazia)", "```", "codigo", "```"].iter().enumerate() {
+            let row = &rows[i + 1];
+            assert!(row.contains(bg), "linha {name} sem realce: {row:?}");
+            // O realce chega ate o fim da area: o ultimo bg e o de selecao.
+            let last_bg = row.rfind("\x1b[48;2;").unwrap();
+            assert!(row[last_bg..].starts_with(bg), "preenchimento nao realcado em {name}");
+        }
+        assert!(!rows[6].contains(bg), "linha fora da selecao nao deve ser realcada");
+        let v = visible(&f);
+        assert!(v.contains("5 linhas") && v.contains("selecionados"), "contador na barra de status");
+    }
+
+    /// Caracteres impressos enquanto o fundo era o de selecao (decodifica o quadro).
+    fn highlighted(row: &str, bg: &str) -> String {
+        let (mut cur_sel, mut out) = (false, String::new());
+        let mut rest = row;
+        while let Some(c) = rest.chars().next() {
+            if rest.starts_with("\x1b[") {
+                let end = rest.find(|ch: char| ('@'..='~').contains(&ch) && ch != '[').map_or(rest.len(), |i| i + 1);
+                let seq = &rest[..end];
+                if seq == bg {
+                    cur_sel = true;
+                } else if seq.starts_with("\x1b[48;2;") || seq == "\x1b[0m" {
+                    cur_sel = false;
+                }
+                rest = &rest[end..];
+                continue;
+            }
+            if cur_sel {
+                out.push(c);
+            }
+            rest = &rest[c.len_utf8()..];
+        }
+        out
+    }
+
+    #[test]
+    fn charwise_selection_shows_line_break_and_exact_range() {
+        let mut a = selected_app("abcdef\nxyz\n");
+        let key = a.notes[0].key.clone();
+        a.open_note(&key, true);
+        a.focus = Focus::Right;
+        a.mode = Mode::VisualChar;
+        let b = a.buf_mut().unwrap();
+        b.vis_y = 0;
+        b.vis_x = 4; // "ef" + quebra de linha + "xy"
+        b.cy = 1;
+        b.cx = 1;
+        let bg = a.theme().bg_select;
+        let f = draw(&mut a);
+        let rows = editor_rows(&f);
+        // O espaco extra e a celula da quebra de linha, realcada.
+        assert_eq!(highlighted(&rows[1], bg).trim_end_matches(' '), "ef");
+        assert!(highlighted(&rows[1], bg).len() > 2, "a quebra de linha tambem e realcada");
+        assert_eq!(highlighted(&rows[2], bg), "xy");
+        let v = visible(&f);
+        assert!(v.contains("2 linhas") && v.contains("4 caracteres"), "{}", v);
+    }
+
+    #[test]
+    fn code_block_charwise_selection_is_exact() {
+        let mut a = selected_app("```\nabcdef\n```\n");
+        let key = a.notes[0].key.clone();
+        a.open_note(&key, true);
+        a.focus = Focus::Right;
+        a.mode = Mode::VisualChar;
+        let b = a.buf_mut().unwrap();
+        b.vis_y = 1;
+        b.vis_x = 1;
+        b.cy = 1;
+        b.cx = 3; // "bcd"
+        let bg = a.theme().bg_select;
+        let rows = editor_rows(&draw(&mut a));
+        assert_eq!(highlighted(&rows[2], bg), "bcd");
+    }
+    #[test]
+    fn no_highlight_or_counter_outside_visual_modes() {
+        let mut a = selected_app("abc\n");
+        let key = a.notes[0].key.clone();
+        a.open_note(&key, true);
+        a.focus = Focus::Right;
+        let bg = a.theme().bg_select;
+        let f = draw(&mut a);
+        assert!(!editor_rows(&f).iter().skip(1).any(|r| r.contains(bg)), "sem selecao nao ha realce no editor");
+        assert!(!visible(&f).contains("selecionados"));
     }
 
     #[test]

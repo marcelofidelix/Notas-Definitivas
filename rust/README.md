@@ -45,6 +45,7 @@ Tudo o que está no [README principal](../README.md) existe aqui: edição modal
 - **Sem nenhuma nota aberta** (banco vazio ou todas as abas fechadas), teclas como `w`, `G`, `dd` são ignoradas com segurança (no C várias leem a linha atual sem checar se há nota aberta).
 - **Colagem sem perda:** colagem multilinha é uma operação única; texto colado nunca é executado como comando; limite de 64 MB.
 - **Cache de busca correto após renomear** (no C o título antigo ficava no índice) e `Esc` na busca lateral **não** abre mais uma nota.
+- **Seleção sempre visível** (`v`/`V`/`Shift+Setas`): V-Line realça a linha inteira (inclusive vazias e blocos de código), `v` realça o trecho exato e a quebra de linha, e a barra de status mostra quantas linhas/caracteres serão copiados.
 - **Quebra de linha por largura real** (ideogramas/emoji = 2 colunas) e blocos de código sem duplicar linhas; recuo e TAB preservados.
 - **Detalhes de edição:** `$` vai ao último caractere (como no Vim); `r`, `dd`, `gg`, `za`… são comandos de várias teclas não bloqueantes; busca lateral com edição completa (`←`, `→`, `Home`, `End`, `Ctrl+←/→`); `PageUp`/`PageDown`; tabelas sem limite de 128 linhas (continuam recusando > 32 colunas, sem perder dados); lista lateral e rolagem com a mesma altura.
 - **Falhas de gravação nunca perdem dados:** gravação atômica (`tmp` + `fsync` + `rename`), `COMMIT`/`ROLLBACK` verificados, fechar/sair salva tudo antes, e um pânico inesperado dispara salvamento de emergência.

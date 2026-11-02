@@ -7194,6 +7194,121 @@ static bool render_cursor_get(bool in_preview, int target_vrow, int avail_w,
 
 /* Render editor content row with visual soft wrap */
 
+/* Selecao ativa (Visual, V-Line ou Shift+Setas no Insert) que toca a linha y.
+ * Devolve o intervalo de bytes [*a, *b) realcado nela, se a quebra de linha
+ * tambem faz parte da selecao (*eol) e se a selecao e por linhas (*lw). A
+ * selecao e inclusiva ate o caractere sob o cursor, como no Vim. */
+static bool line_selection_range(int y, const Line *l, int *a, int *b, bool *eol, bool *lw) {
+    bool active = (E.mode == MODE_VISUAL_CHAR || E.mode == MODE_VISUAL_LINE) ||
+                  (E.mode == MODE_INSERT && E.has_selection);
+    if (!active || !l) return false;
+    int sy = E.visual_start_y, sx = E.visual_start_x, ey = E.cursor_y, ex = E.cursor_x;
+    if (sy > ey || (sy == ey && sx > ex)) {
+        int ty = sy; sy = ey; ey = ty;
+        int tx = sx; sx = ex; ex = tx;
+    }
+    if (y < sy || y > ey) return false;
+    bool linewise = (E.mode == MODE_VISUAL_LINE);
+    int len = l->len;
+    int start = (linewise || y > sy) ? 0 : sx;
+    int end;
+    if (linewise || y < ey) {
+        end = len;
+    } else if (ex >= len) {
+        end = len;
+    } else {
+        int cl = utf8_charlen((unsigned char)l->chars[ex]);
+        end = ex + (cl > 0 ? cl : 1);
+        if (end > len) end = len;
+    }
+    if (start > len) start = len;
+    if (start < 0) start = 0;
+    *a = start;
+    *b = end;
+    *eol = linewise || y < ey;
+    *lw = linewise;
+    return true;
+}
+
+/* Resto da linha depois do texto: no V-Line a linha inteira fica realcada; no
+ * Visual de varias linhas, a quebra de linha vira uma celula realcada. */
+static void render_selection_tail(ABuffer *ab, int pad, const char *base_bg, bool has_sel,
+                                  bool eol, bool lw, bool last_subrow) {
+    if (pad < 0) pad = 0;
+    if (has_sel && lw) {
+        ab_append(ab, TH_BG_SELECT, -1);
+        while (pad-- > 0) ab_append(ab, " ", 1);
+    } else if (has_sel && eol && last_subrow && pad > 0) {
+        ab_append(ab, TH_BG_SELECT, -1);
+        ab_append(ab, " ", 1);
+        pad--;
+        ab_append(ab, base_bg, -1);
+        while (pad-- > 0) ab_append(ab, " ", 1);
+    } else {
+        ab_append(ab, base_bg, -1);
+        while (pad-- > 0) ab_append(ab, " ", 1);
+    }
+}
+
+/* Linha de codigo/cerca com selecao: texto simples (sem colorizacao de
+ * sintaxe) para que o realce seja exato. */
+static void render_selected_plain(ABuffer *ab, const Line *l, const char *fg, const char *base_bg,
+                                  int a, int b, bool eol, bool lw, bool last_subrow, int editor_width) {
+    int cols_printed = 6;
+    ab_append(ab, base_bg, -1);
+    ab_append(ab, fg, -1);
+    int i = 0;
+    while (i < l->len) {
+        int bytes = 1;
+        int cp = utf8_decode_codepoint(&l->chars[i], &bytes);
+        if (bytes <= 0) bytes = 1;
+        bool tab = (l->chars[i] == '\t');
+        int cw = tab ? 4 : utf8_codepoint_width(cp);
+        if (tab && cols_printed + cw > editor_width - 1) cw = editor_width - 1 - cols_printed;
+        if (cols_printed + cw > editor_width - 1) break;
+        ab_append(ab, (i >= a && i < b) ? TH_BG_SELECT : base_bg, -1);
+        if (tab) {
+            for (int k = 0; k < cw; k++) ab_append(ab, " ", 1);
+        } else {
+            ab_append_text(ab, &l->chars[i], bytes);
+        }
+        cols_printed += cw;
+        i += bytes;
+    }
+    ab_append(ab, STYLE_RESET, -1);
+    render_selection_tail(ab, editor_width - 1 - cols_printed, base_bg, true, eol, lw, last_subrow);
+    ab_append(ab, "\x1b[K", 3);
+    ab_append(ab, STYLE_RESET, -1);
+}
+
+/* Resumo do que sera copiado/recortado: " 2 linhas, 37 caracteres selecionados ". */
+static void selection_summary(char *out, size_t sz) {
+    out[0] = '\0';
+    bool active = (E.mode == MODE_VISUAL_CHAR || E.mode == MODE_VISUAL_LINE) ||
+                  (E.mode == MODE_INSERT && E.has_selection);
+    if (!active || E.num_lines <= 0) return;
+    int ay = E.visual_start_y, ax = E.visual_start_x, by = E.cursor_y, bx = E.cursor_x;
+    if (ay > by || (ay == by && ax > bx)) {
+        int ty = ay; ay = by; by = ty;
+        int tx = ax; ax = bx; bx = tx;
+    }
+    if (ay < 0) ay = 0;
+    if (by >= E.num_lines) by = E.num_lines - 1;
+    if (ay > by) return;
+    long chars = 0;
+    for (int y = ay; y <= by; y++) {
+        int a, b;
+        bool eol, lw;
+        if (!line_selection_range(y, &E.lines[y], &a, &b, &eol, &lw)) continue;
+        for (int i = a; i < b && i < E.lines[y].len; i++) {
+            if (((unsigned char)E.lines[y].chars[i] & 0xC0) != 0x80) chars++;
+        }
+    }
+    int lines = by - ay + 1;
+    snprintf(out, sz, " %d %s, %ld %s selecionados ", lines, lines == 1 ? "linha" : "linhas",
+             chars, chars == 1 ? "caractere" : "caracteres");
+}
+
 static void render_right_panel(ABuffer *ab, int screen_row) {
     int editor_width = E.screen_cols - E.left_width - 1;
     if (editor_width <= 0) return;
@@ -7276,6 +7391,18 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
         ab_append(ab, STYLE_RESET, -1);
         if (is_cur_line && (E.mode == MODE_NORMAL || E.mode == MODE_COMMAND)) ab_append(ab, TH_BG_CUR_LINE, -1);
         else ab_append(ab, TH_BG_MAIN, -1);
+
+        int sel_a = 0, sel_b = 0;
+        bool sel_eol = false, sel_lw = false;
+        bool has_sel = !in_preview &&
+                       line_selection_range(visible_line_idx, l, &sel_a, &sel_b, &sel_eol, &sel_lw);
+        bool last_subrow = (seg.byte_offset + seg.byte_len >= l->len);
+
+        if (has_sel && (l->is_code_fence || l->in_code_block)) {
+            render_selected_plain(ab, l, l->is_code_fence ? TH_FG_H3 : TH_FG_MAIN, TH_BG_CUR_LINE,
+                                  sel_a, sel_b, sel_eol, sel_lw, last_subrow, editor_width);
+            return;
+        }
 
         if (l->is_code_fence) {
             ab_append(ab, TH_BG_CUR_LINE, -1);
@@ -7362,23 +7489,8 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
                 char_idx += 1;
                 continue;
             }
-            if (!in_preview && ((E.mode == MODE_VISUAL_CHAR || E.mode == MODE_VISUAL_LINE) || (E.mode == MODE_INSERT && E.has_selection))) {
-                int start_y = E.visual_start_y, end_y = E.cursor_y;
-                int start_x = E.visual_start_x, end_x = E.cursor_x;
-                if (start_y > end_y || (start_y == end_y && start_x > end_x)) {
-                    int ty = start_y; start_y = end_y; end_y = ty;
-                    int tx = start_x; start_x = end_x; end_x = tx;
-                }
-                bool in_sel = false;
-                if (E.mode == MODE_VISUAL_LINE) {
-                    if (visible_line_idx >= start_y && visible_line_idx <= end_y) in_sel = true;
-                } else {
-                    if (visible_line_idx > start_y && visible_line_idx < end_y) in_sel = true;
-                    else if (visible_line_idx == start_y && visible_line_idx == end_y) {
-                        if (char_idx >= start_x && char_idx <= end_x) in_sel = true;
-                    } else if (visible_line_idx == start_y && char_idx >= start_x) in_sel = true;
-                    else if (visible_line_idx == end_y && char_idx <= end_x) in_sel = true;
-                }
+            if (has_sel) {
+                bool in_sel = (char_idx >= sel_a && char_idx < sel_b);
                 if (in_sel) ab_append(ab, TH_BG_SELECT, -1);
                 else {
                     if (is_cur_line && (E.mode == MODE_NORMAL || E.mode == MODE_COMMAND)) ab_append(ab, TH_BG_CUR_LINE, -1);
@@ -7537,11 +7649,9 @@ static void render_right_panel(ABuffer *ab, int screen_row) {
             }
         }
         ab_append(ab, STYLE_RESET, -1);
-        if (is_cur_line && (E.mode == MODE_NORMAL || E.mode == MODE_COMMAND)) ab_append(ab, TH_BG_CUR_LINE, -1);
-        else ab_append(ab, TH_BG_MAIN, -1);
-
-        int pad = editor_width - 1 - cols_printed;
-        while (pad-- > 0) ab_append(ab, " ", 1);
+        const char *tail_bg = (is_cur_line && (E.mode == MODE_NORMAL || E.mode == MODE_COMMAND))
+                                  ? TH_BG_CUR_LINE : TH_BG_MAIN;
+        render_selection_tail(ab, editor_width - 1 - cols_printed, tail_bg, has_sel, sel_eol, sel_lw, last_subrow);
         ab_append(ab, "\x1b[K", 3);
     } else {
         ab_append(ab, TH_BG_MAIN, -1);
@@ -7609,6 +7719,10 @@ static void render_status_bar(ABuffer *ab) {
                  E.modified ? " [+]" : "");
     }
     note_desc_w = utf8_width(note_desc);
+
+    char sel_info[96];
+    sel_info[0] = '\0';
+    if (!(E.focus == FOCUS_LEFT && g_preview.filepath[0])) selection_summary(sel_info, sizeof(sel_info));
 
     char rinfo[64];
     if (E.focus == FOCUS_LEFT && g_preview.lines) {
@@ -7694,8 +7808,16 @@ static void render_status_bar(ABuffer *ab) {
             ab_append(ab, TH_FG_WARN, -1);
             ab_append(ab, " [+]", -1);
         }
+        /* Quanto sera copiado/recortado, enquanto ha selecao ativa. */
+        if (sel_info[0]) {
+            ab_append(ab, TH_BG_SELECT, -1);
+            ab_append(ab, TH_FG_WHITE, -1);
+            ab_append(ab, sel_info, (int)strlen(sel_info));
+            ab_append(ab, STYLE_RESET, -1);
+            ab_append(ab, TH_BG_STATUS, -1);
+        }
     }
-    used1 += note_desc_w;
+    used1 += note_desc_w + utf8_width(sel_info);
 
     int space1 = E.screen_cols - used1 - rlen;
     if (space1 < 1) space1 = 1;

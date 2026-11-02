@@ -85,6 +85,7 @@ O gerenciamento de texto opera sob a mesma convenção intuitiva do Neovim:
 
 2. **Modo Visual** (`v` por caractere, `V` por linha):
    - Ativado com `v`, `V`, `Shift + Setas` ou arrasto com o mouse.
+   - **A seleção fica sempre visível**: no `V` a linha inteira é realçada (até a borda, inclusive linhas vazias e blocos de código); no `v` só o trecho selecionado, com a quebra de linha marcada quando a seleção continua na linha seguinte. A barra de status mostra o que será copiado (ex.: ` 2 linhas, 37 caracteres selecionados `).
    - `y` copia a seleção para o clipboard.
    - `p` cola por cima substituindo a seleção.
    - `x` ou `d` recorta/exclui a seleção.
