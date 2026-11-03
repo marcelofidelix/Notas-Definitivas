@@ -2,7 +2,7 @@
 //! rolagem. As coordenadas seguem a convencao do terminal (1-based).
 
 use crate::app::{App, Focus, Mode};
-use crate::layout::{byte_offset_in_seg, find_visual_row};
+use crate::layout::{click_offset, find_visual_row};
 use crate::render::prompt_label;
 use crate::text::{str_width, width_len};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -50,6 +50,8 @@ fn within(col: i32, range: (i32, i32)) -> bool {
 
 impl App {
     pub fn on_mouse(&mut self, m: Mouse) {
+        self.count = 0;
+        self.count2 = 0;
         self.last_activity = Instant::now();
         self.needs_redraw = true;
         let now = Instant::now();
@@ -389,8 +391,7 @@ impl App {
         let target = screen_row + b.scroll_y;
         if let Some(vr) = find_visual_row(&b.lines, lay, target) {
             b.cy = vr.line;
-            let off = byte_offset_in_seg(&b.lines[vr.line], vr.seg.off, vr.seg.len, col, lay.hide);
-            b.cx = (vr.seg.off + off).min(b.lines[vr.line].len());
+            b.cx = click_offset(&b.lines[vr.line], vr.sub, vr.seg, col, &lay).min(b.lines[vr.line].len());
             b.clamp_cursor();
         }
     }

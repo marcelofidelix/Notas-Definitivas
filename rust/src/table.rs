@@ -16,7 +16,7 @@ struct Row {
     is_delim: bool,
 }
 
-fn is_delimiter_cell(s: &str) -> bool {
+pub(crate) fn is_delimiter_cell(s: &str) -> bool {
     !s.is_empty()
         && s.contains('-')
         && s.chars().all(|c| matches!(c, '-' | ':' | ' ' | '\t'))

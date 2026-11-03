@@ -606,7 +606,7 @@ fn bench_undo_memory_growth() {
         a.on_key(Key::Enter);
     }
     let after = crate::doc::approx_undo_bytes(a.buf().unwrap());
-    eprintln!("memoria do historico de undo: {} KB -> {} MB", before / 1024, after / (1024 * 1024));
+    eprintln!("memoria do historico de undo: {} KB -> {} KB", before / 1024, after / 1024);
 }
 
 // ---- fuzz deterministico -----------------------------------------------------
@@ -637,6 +637,10 @@ fn check_invariants(a: &App, step: usize, seed: u64, log: &[String]) {
             let line = &b.lines[b.cy].text;
             assert!(b.cx <= line.len(), "seed {seed} passo {step}: cx > len ({}) modo {:?}; ultimas acoes: {}", b.cx, a.mode, recent());
             assert!(line.is_char_boundary(b.cx), "seed {seed} passo {step}: cursor no meio de um caractere; ultimas acoes: {}", recent());
+            // O cursor sempre cai numa linha da tela que existe (tabelas incluidas).
+            let lay = a.layout(false);
+            let (vrow, _) = crate::layout::cursor_visual_pos(b, &lay);
+            assert!(b.cur().hidden || vrow < crate::layout::total_vrows(&b.lines, &lay).max(1), "seed {seed} passo {step}: cursor fora da tela virtual; ultimas acoes: {}", recent());
         }
     }
     if let Some(i) = a.active {
@@ -649,7 +653,7 @@ fn check_invariants(a: &App, step: usize, seed: u64, log: &[String]) {
 }
 
 fn fuzz(seed: u64, steps: usize) {
-    let body = "# Titulo\n\nTexto com **negrito** e *itálico* ação 😀 日本語 \u{9}tab.\n- item\n\n|a|b|\n|-|-|\n|ççç|d|\n\n```\ncodigo # c\n```\n## Sub\n[[Outra]]\nlinha comprida ".to_string()
+    let body = "# Titulo\n\nTexto com **negrito** e *itálico* ação 😀 日本語 \u{9}tab.\n- item\n\n|a|b|\n|-|-|\n|ççç|d|\n\n|Nome|Descrição|\n|:--|--:|\n|日本語 😀|**negrito** [[Outra]] texto bem comprido que precisa quebrar dentro da celula|\n|x||\n\n```\ncodigo # c\n```\n## Sub\n[[Outra]]\nlinha comprida ".to_string()
         + &"palavra ".repeat(40)
         + "\n";
     let mut a = app_with(&[("Fuzz", &body), ("Outra", "# Outra\n\ncorpo\n"), ("Terceira", "x\n")]);
@@ -955,7 +959,7 @@ fn link_button_command_and_key_copy_the_wikilink() {
     // O texto copiado funciona como link: o cursor sobre ele abre a nota.
     open(&mut a, "Beta Nota");
     keys(&mut a, "Go<Esc>");
-    a.paste_normal(); // cola o yank interno ([[Alfa]])
+    a.paste_normal_n(1); // cola o yank interno ([[Alfa]])
     keys(&mut a, "0<CR>");
     assert_eq!(a.tab().unwrap().title, "Alfa", "o link copiado abre a nota");
 
@@ -1057,4 +1061,414 @@ fn file_argument_creates_missing_files_on_save() {
     keys(&mut a, "ioi nota<Esc>:w<CR>");
     assert_eq!(std::fs::read_to_string(&p).unwrap().trim(), "oi nota");
     assert!(matches!(a.tab().unwrap().key, NoteKey::File(_)));
+}
+
+#[test]
+fn task_list_renders_boxes_outside_insert_mode() {
+    let mut a = app_with(&[("Tarefas", "# Hoje\n\n- [ ] lavar o carro\n- [x] pagar conta\n- [X] ligar\n* [ ] outro marcador\n- [x](http://x.com) link\n- [ ]colado\n")]);
+    open(&mut a, "Tarefas");
+    let v = visible(&draw(&mut a));
+    assert!(v.contains("\u{25A1} lavar o carro"), "tarefa aberta vira caixa vazia");
+    assert!(v.contains("\u{25A3} pagar conta") && v.contains("\u{25A3} ligar"), "concluida vira caixa marcada");
+    assert!(v.contains("\u{25A1} outro marcador"));
+    assert!(!v.contains("[ ] lavar") && !v.contains("[x] pagar"), "colchetes ocultos no modo normal");
+    assert!(v.contains("- [ ]colado"), "sem espaco depois de ] nao e tarefa");
+    assert!(!v.contains("\u{25A3} link") && !v.contains("[x] link"), "link nao e tarefa");
+
+    // Insercao: texto cru.
+    keys(&mut a, "jji");
+    assert_eq!(a.mode, Mode::Insert);
+    let v = visible(&draw(&mut a));
+    assert!(v.contains("- [ ] lavar o carro") && v.contains("- [x] pagar conta"), "insercao mostra o texto cru");
+    assert!(!v.contains('\u{25A1}') && !v.contains('\u{25A3}'));
+    keys(&mut a, "<Esc>");
+    let v = visible(&draw(&mut a));
+    assert!(v.contains("\u{25A1} lavar o carro"), "volta a renderizar ao sair da insercao");
+    // O documento nunca e alterado pela renderizacao.
+    assert_eq!(lines(&a)[2], "- [ ] lavar o carro");
+}
+
+#[test]
+fn task_list_cursor_and_clicks_stay_aligned() {
+    let mut a = app_with(&[("T", "- [x] feito\n")]);
+    open(&mut a, "T");
+    // `$` vai ao ultimo caractere: nao pode quebrar nem sair do quadro.
+    keys(&mut a, "$");
+    assert_eq!(a.buf().unwrap().cx, "- [x] feito".len() - 1);
+    keys(&mut a, "0lll");
+    // Texto editado dentro da caixa continua funcionando: x troca [x] por [ ].
+    keys(&mut a, "0lllrr<Esc>");
+    let v = visible(&draw(&mut a));
+    assert!(!v.contains('\u{25A3}'), "[r] nao e mais uma tarefa valida");
+}
+/// Posicao (linha, coluna) em que o quadro deixa o cursor do terminal.
+fn cursor_at(frame: &str) -> (usize, usize) {
+    let end = frame.rfind("\x1b[?25h").expect("cursor visivel");
+    let head = &frame[..end];
+    let h = head.rfind('H').expect("posicionamento");
+    let start = head[..h].rfind("\x1b[").expect("posicionamento");
+    let body = &head[start + 2..h];
+    let (r, c) = body.split_once(';').expect("linha;coluna");
+    (r.parse().unwrap(), c.parse().unwrap())
+}
+
+const TABLE_NOTE: &str = "# Tabelas\n\n|a|b|c|\n|1|2|3|\n\ndepois\n";
+
+#[test]
+#[ignore]
+fn dump_tables() {
+    let long = "Esta e uma descricao bem longa que precisa quebrar em varias linhas dentro da celula para caber na janela.";
+    let note = format!(
+        "# Tabelas\n\n|a|b|c|\n|1|2|3|\n\n| Item | Qtd | Descricao |\n|:--|--:|---|\n| Cafe | 10 | {long} |\n| **Pao** | 2 | [site](http://x.com) e [[Nota]] |\n| Leite | 1.250 | curto |\n\nfim\n"
+    );
+    for cols in [100, 60, 40] {
+        let mut a = app_with(&[("T", &note)]);
+        a.cols = cols;
+        open(&mut a, "T");
+        keys(&mut a, "jjj");
+        let v = visible(&draw(&mut a));
+        println!("===== {cols} colunas =====\n{v}");
+    }
+}
+
+#[test]
+fn tables_are_drawn_as_grids_outside_insert_mode() {
+    let mut a = app_with(&[("T", TABLE_NOTE)]);
+    open(&mut a, "T");
+    let v = visible(&draw(&mut a));
+    assert!(v.contains("╭───┬───┬───╮"), "borda superior:\n{v}");
+    assert!(v.contains("│ a │ b │ c │") && v.contains("│ 1 │ 2 │ 3 │"), "celulas:\n{v}");
+    assert!(v.contains("╰───┴───┴───╯"), "borda inferior");
+    assert!(!v.contains("|a|b|c|"), "texto cru escondido");
+    // Insercao: texto cru, sem grade.
+    keys(&mut a, "jji");
+    let v = visible(&draw(&mut a));
+    assert!(v.contains("|a|b|c|") && !v.contains('╭'), "insercao mostra o texto:\n{v}");
+    keys(&mut a, "<Esc>");
+    assert!(visible(&draw(&mut a)).contains("╭───┬───┬───╮"));
+}
+
+#[test]
+fn wide_tables_wrap_cells_to_fit_the_window() {
+    let long = "palavra ".repeat(20);
+    let note = format!("| Nome | Texto |\n|---|---|\n| x | {} |\n| y | curto |\n", long.trim());
+    for cols in [120, 70, 50] {
+        let mut a = app_with(&[("T", &note)]);
+        a.cols = cols;
+        a.left_width = crate::app::MIN_LEFT_WIDTH;
+        open(&mut a, "T");
+        let frame = draw(&mut a);
+        let v = visible(&frame);
+        let mut words = 0;
+        for line in v.lines() {
+            // Parte do editor: depois do divisor do painel lateral.
+            let Some((_, editor)) = line.split_once('│') else { continue };
+            if !editor.contains('│') && !editor.contains('╭') {
+                continue;
+            }
+            let w = crate::text::str_width(editor.trim_end());
+            assert!(w <= cols as usize - 19, "grade larga demais ({cols}): {editor}");
+            words += editor.matches("palavra").count();
+        }
+        assert_eq!(words, 20, "nenhuma palavra se perde ({cols} colunas)");
+    }
+}
+
+#[test]
+fn cursor_moves_through_table_cells_and_clicks_land_on_text() {
+    let note = "| Nome | Descricao |\n|---|---|\n| Ana | texto bem longo que quebra em varias linhas aqui |\n| Beto | b |\n";
+    let mut a = app_with(&[("T", note)]);
+    a.cols = 50;
+    a.left_width = crate::app::MIN_LEFT_WIDTH;
+    open(&mut a, "T");
+    keys(&mut a, "jj");
+    let mut last = (0, 0);
+    // Descer pelas linhas da tela: o cursor nunca sai da area da tabela nem recua.
+    for _ in 0..12 {
+        let (r, c) = cursor_at(&draw(&mut a));
+        assert!(r >= last.0, "linha da tela nao pode recuar: {last:?} -> {r}");
+        assert!(c >= 8, "dentro da grade (apos o numero da linha): {c}");
+        last = (r, c);
+        keys(&mut a, "j");
+    }
+    assert_eq!(a.buf().unwrap().cy, 3, "chegou a ultima linha");
+    // Clicar numa celula coloca o cursor no texto dela.
+    let frame = draw(&mut a);
+    let v = visible(&frame);
+    let (row, col) = v
+        .lines()
+        .enumerate()
+        .find_map(|(i, l)| l.find("Beto").map(|b| (i, crate::text::str_width(&l[..b]))))
+        .expect("Beto na tela");
+    click(&mut a, col as i32 + 1, row as i32 + 1);
+    let b = a.buf().unwrap();
+    assert_eq!((b.cy, &b.cur().text[b.cx..b.cx + 1]), (3, "B"));
+}
+
+#[test]
+fn table_selection_and_line_highlight_do_not_break_the_grid() {
+    let mut a = app_with(&[("T", TABLE_NOTE)]);
+    open(&mut a, "T");
+    keys(&mut a, "jjV");
+    let v = visible(&draw(&mut a));
+    assert!(v.contains("│ a │ b │ c │"));
+    keys(&mut a, "<Esc>jvl");
+    assert!(visible(&draw(&mut a)).contains("│ 1 │ 2 │ 3 │"));
+}
+#[test]
+fn tables_align_automatically_when_leaving_the_line_or_insert_mode() {
+    let aligned = ["| a   | b   | c   |", "| 1   | 2   | 3   |"];
+    // Esc do modo Insercao.
+    let mut a = app_with(&[("T", "|a|b|c|\n|1|2|3|\n")]);
+    open(&mut a, "T");
+    keys(&mut a, "jlll");
+    keys(&mut a, "i<Esc>");
+    assert_eq!(lines(&a), aligned);
+    assert!(a.tab().unwrap().modified);
+    let b = a.buf().unwrap();
+    assert_eq!(b.cy, 1);
+    assert!(b.cx > 0 && b.cx < b.cur().len(), "cursor continua dentro da linha");
+
+    // Mudar de linha com as setas, no Insert, depois de alargar uma celula.
+    let mut a = app_with(&[("T", "|a|b|c|\n|1|2|3|\n")]);
+    open(&mut a, "T");
+    keys(&mut a, "jli");
+    keys(&mut a, "mais largo<Up>");
+    assert_eq!(a.mode, Mode::Insert);
+    let l = lines(&a);
+    assert_eq!(l[0].len(), l[1].len(), "linhas do mesmo tamanho: {l:?}");
+    assert!(l[1].starts_with("| 1mais largo"), "{l:?}");
+    // O cursor permanece na linha de destino.
+    assert_eq!(a.buf().unwrap().cy, 0);
+
+    // Tabela ja alinhada: nada muda e a nota nao fica "modificada" a toa.
+    let mut a = app_with(&[("T", "| a   | b   |\n| c   | d   |\n")]);
+    open(&mut a, "T");
+    keys(&mut a, "ji<Esc>");
+    assert!(!a.tab().unwrap().modified, "sem mudanca, sem modificacao");
+    assert_eq!(lines(&a), ["| a   | b   |", "| c   | d   |"]);
+
+    // Fora de tabelas nada acontece.
+    let mut a = app_with(&[("T", "texto\n|a|b|\n")]);
+    open(&mut a, "T");
+    keys(&mut a, "i<Esc>");
+    assert_eq!(lines(&a), ["texto", "|a|b|"], "linha de tabela isolada nao e tabela");
+}
+
+#[test]
+fn enter_in_a_table_inserts_an_aligned_row_below() {
+    let mut a = app_with(&[("T", "|a|b|c|\n|1|2|3|\n")]);
+    open(&mut a, "T");
+    keys(&mut a, "ji<CR>");
+    let l = lines(&a);
+    assert_eq!(l.len(), 3, "{l:?}");
+    assert_eq!(l[0], "| a   | b   | c   |");
+    assert_eq!(l[1], "| 1   | 2   | 3   |");
+    assert_eq!(l[2], "|     |     |     |", "linha nova ja alinhada");
+    let b = a.buf().unwrap();
+    assert_eq!((b.cy, b.cx), (2, 2), "cursor na primeira celula da linha nova");
+    assert_eq!(a.mode, Mode::Insert);
+    // Digitar a primeira celula e Enter de novo mantem tudo alinhado.
+    keys(&mut a, "novo<CR>");
+    let l = lines(&a);
+    assert_eq!(l.len(), 4);
+    assert!(l.iter().all(|x| x.len() == l[0].len()), "{l:?}");
+
+    // Tabela de uma unica linha tambem ganha a linha alinhada.
+    let mut a = app_with(&[("T", "|x|yy|\n")]);
+    open(&mut a, "T");
+    keys(&mut a, "i<CR>");
+    assert_eq!(lines(&a), ["| x   | yy  |", "|     |     |"]);
+}
+
+
+// ---- prefixo numerico (como no Vim) ------------------------------------------------
+
+fn digits_note() -> String {
+    format!("{}\nsegunda linha\nterceira\nquarta\nquinta\nsexta\n", "0123456789".repeat(20))
+}
+
+fn pos(a: &App) -> (usize, usize) {
+    let b = a.buf().unwrap();
+    (b.cy, b.cx)
+}
+
+#[test]
+fn count_repeats_horizontal_and_vertical_motions() {
+    let mut a = app_with(&[("N", &digits_note())]);
+    open(&mut a, "N");
+    keys(&mut a, "100l");
+    assert_eq!(pos(&a), (0, 100), "100l desloca 100 casas");
+    keys(&mut a, "0");
+    assert_eq!(pos(&a), (0, 0), "0 sozinho continua indo ao inicio");
+    keys(&mut a, "10l");
+    assert_eq!(pos(&a), (0, 10), "o 0 de 10 faz parte do numero");
+    keys(&mut a, "3h");
+    assert_eq!(pos(&a), (0, 7));
+
+    // `j`/`k` andam por linhas da tela; aqui cada linha cabe em uma.
+    let mut a = app_with(&[("V", "a\nb\nc\nd\ne\nf\n")]);
+    open(&mut a, "V");
+    keys(&mut a, "3j");
+    assert_eq!(pos(&a).0, 3);
+    keys(&mut a, "2k");
+    assert_eq!(pos(&a).0, 1);
+    keys(&mut a, "999j");
+    assert_eq!(pos(&a).0, 5, "para na ultima linha");
+    keys(&mut a, "999k");
+    assert_eq!(pos(&a).0, 0, "e na primeira");
+}
+
+#[test]
+fn count_stops_at_line_edges_and_never_changes_the_pane() {
+    let mut a = app_with(&[("N", &digits_note())]);
+    open(&mut a, "N");
+    keys(&mut a, "5l");
+    keys(&mut a, "100h");
+    assert_eq!(pos(&a), (0, 0));
+    assert_eq!(a.focus, Focus::Right, "100h nao passa o foco para a lista de notas");
+    keys(&mut a, "99999999999l");
+    assert_eq!(pos(&a).0, 0, "numero enorme: para no fim da linha, sem travar");
+    assert!(pos(&a).1 >= 199);
+    keys(&mut a, "h");
+    keys(&mut a, "0h");
+    assert_eq!(a.focus, Focus::Left, "h simples na coluna 0 continua levando a lista");
+}
+
+#[test]
+fn count_with_words_lines_and_goto() {
+    let mut a = app_with(&[("N", "um dois tres quatro cinco\nsegunda\nterceira\nquarta\nquinta\n")]);
+    open(&mut a, "N");
+    keys(&mut a, "3w");
+    assert_eq!(&a.buf().unwrap().cur().text[pos(&a).1..], "quatro cinco");
+    keys(&mut a, "2b");
+    assert_eq!(&a.buf().unwrap().cur().text[pos(&a).1..], "dois tres quatro cinco");
+    keys(&mut a, "4G");
+    assert_eq!(pos(&a), (3, 0), "4G vai a linha 4");
+    keys(&mut a, "2gg");
+    assert_eq!(pos(&a), (1, 0), "2gg vai a linha 2");
+    keys(&mut a, "1000G");
+    assert_eq!(pos(&a).0, 4, "alem do fim: ultima linha");
+    keys(&mut a, "G");
+    assert_eq!(pos(&a).0, 4);
+    keys(&mut a, "gg");
+    assert_eq!(pos(&a), (0, 0));
+    keys(&mut a, "2$");
+    assert_eq!(pos(&a).0, 1, "2$ desce uma linha e vai ao fim");
+}
+
+#[test]
+fn count_with_delete_yank_and_cut() {
+    let mut a = app_with(&[("N", "abcdefgh\nl2\nl3\nl4\nl5\n")]);
+    open(&mut a, "N");
+    keys(&mut a, "3x");
+    assert_eq!(lines(&a)[0], "defgh");
+    assert_eq!(a.yank, "abc");
+    keys(&mut a, "u");
+    assert_eq!(lines(&a)[0], "abcdefgh", "3x e um unico passo de desfazer");
+
+    keys(&mut a, "2dd");
+    assert_eq!(lines(&a), ["l3", "l4", "l5"]);
+    assert_eq!(a.yank, "abcdefgh\nl2");
+    keys(&mut a, "u");
+    assert_eq!(lines(&a).len(), 5, "2dd e um unico passo de desfazer");
+    keys(&mut a, "d2d");
+    assert_eq!(lines(&a), ["l3", "l4", "l5"], "d2d == 2dd");
+    keys(&mut a, "u");
+    keys(&mut a, "2d2d");
+    assert_eq!(lines(&a), ["l5"], "2d2d apaga 4 linhas (os numeros se multiplicam)");
+    keys(&mut a, "u");
+    keys(&mut a, "gg9dd");
+    assert_eq!(lines(&a), [""], "alem do fim: apaga ate o fim, sem restar nada invalido");
+
+    let mut a = app_with(&[("N", "a\nb\nc\nd\n")]);
+    open(&mut a, "N");
+    keys(&mut a, "3y");
+    assert_eq!(a.yank, "a\nb\nc");
+    assert!(a.yank_linewise);
+    assert_eq!(lines(&a).len(), 4, "y nao altera a nota");
+}
+
+#[test]
+fn count_with_undo_redo_replace_and_paste() {
+    let mut a = app_with(&[("N", "abcdef\n")]);
+    open(&mut a, "N");
+    for c in ["x", "x", "x"] {
+        keys(&mut a, c);
+    }
+    assert_eq!(lines(&a)[0], "def");
+    keys(&mut a, "2u");
+    assert_eq!(lines(&a)[0], "bcdef", "2u desfaz dois passos");
+    keys(&mut a, "9u");
+    assert_eq!(lines(&a)[0], "abcdef", "para quando o historico acaba");
+    keys(&mut a, "2<C-r>");
+    assert_eq!(lines(&a)[0], "cdef");
+
+    keys(&mut a, "u");
+    keys(&mut a, "u");
+    keys(&mut a, "3rz");
+    assert_eq!(lines(&a)[0], "zzzdef");
+    assert_eq!(pos(&a), (0, 2), "cursor no ultimo caractere trocado");
+    keys(&mut a, "$");
+    keys(&mut a, "5rq");
+    assert_eq!(lines(&a)[0], "zzzdef", "linha curta demais: nada acontece");
+
+    keys(&mut a, "0");
+    a.set_yank("ab".into(), false);
+    keys(&mut a, "3p");
+    assert_eq!(lines(&a)[0], "abababzzzdef");
+    keys(&mut a, "u");
+    assert_eq!(lines(&a)[0], "zzzdef", "3p e um unico passo de desfazer");
+}
+
+#[test]
+fn count_repeats_what_was_typed_on_leaving_insert() {
+    let mut a = app_with(&[("N", "fim\n")]);
+    open(&mut a, "N");
+    keys(&mut a, "3ia<Esc>");
+    assert_eq!(lines(&a)[0], "aaafim");
+    assert_eq!(a.mode, Mode::Normal);
+    keys(&mut a, "u");
+    assert_eq!(lines(&a)[0], "fim", "o texto repetido volta junto com a digitacao");
+
+    keys(&mut a, "2Axy<Esc>");
+    assert_eq!(lines(&a)[0], "fimxyxy");
+
+    keys(&mut a, "3ol<Esc>");
+    assert_eq!(lines(&a), ["fimxyxy", "l", "l", "l"]);
+    keys(&mut a, "2Ob<Esc>");
+    assert_eq!(lines(&a).iter().filter(|l| *l == "b").count(), 2);
+
+    // Digitou mais de uma linha: nao repete (edicao complexa).
+    let mut a = app_with(&[("N", "z\n")]);
+    open(&mut a, "N");
+    keys(&mut a, "3ia<CR>b<Esc>");
+    assert_eq!(lines(&a), ["a", "bz"]);
+    // Prefixo 1 e sem prefixo se comportam igual.
+    keys(&mut a, "1ic<Esc>");
+    assert_eq!(a.buf().unwrap().cur().text.matches('c').count(), 1);
+}
+
+#[test]
+fn count_is_cancelled_and_works_in_visual_mode_and_tabs() {
+    let mut a = app_with(&[("N", &digits_note()), ("M", "um\n"), ("P", "dois\n")]);
+    open(&mut a, "N");
+    keys(&mut a, "5<Esc>l");
+    assert_eq!(pos(&a), (0, 1), "Esc cancela o prefixo");
+    keys(&mut a, "0v3l");
+    assert_eq!(a.mode, Mode::VisualChar);
+    assert_eq!(pos(&a), (0, 3), "contagem tambem vale no Visual");
+    keys(&mut a, "<Esc>");
+    // `:` e outros comandos descartam o prefixo em vez de deixa-lo para depois.
+    keys(&mut a, "7:<Esc>l");
+    assert_eq!(pos(&a).1, 4, "o prefixo nao sobrevive a um comando que nao o usa (l anda so 1)");
+
+    open(&mut a, "M");
+    open(&mut a, "P");
+    keys(&mut a, "1gt");
+    assert_eq!(a.active, Some(0), "1gt vai para a primeira aba");
+    keys(&mut a, "2gt");
+    assert_eq!(a.active, Some(1));
+    keys(&mut a, "9gt");
+    assert_eq!(a.active, Some(1), "aba inexistente: continua onde estava");
 }

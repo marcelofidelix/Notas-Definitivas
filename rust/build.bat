@@ -29,6 +29,11 @@ if errorlevel 1 (
     exit /b 1
 )
 copy /y "target\release\notas.exe" "..\notas_rs.exe" >nul
+if errorlevel 1 (
+    echo AVISO: nao foi possivel atualizar ..\notas_rs.exe ^(o programa esta aberto?^).
+    echo        Feche-o e rode build.bat de novo. O binario novo esta em rust\target\release\notas.exe
+    exit /b 1
+)
 echo     OK -^> ..\notas_rs.exe
 if /I "%~1"=="run" "..\notas_rs.exe"
 goto end

@@ -2,7 +2,8 @@
 //! posicao na tela. Com links/estilos ocultos, so o texto visivel ocupa colunas.
 
 use crate::doc::{Buffer, Line, RowMemo};
-use crate::md::{find_links, find_styles, is_table_line, LinkSpan, StyleSpan};
+use crate::md::{find_links, find_styles, is_table_line, task_item, LinkSpan, StyleSpan, Task};
+use crate::tbl::{self, TView};
 use crate::text::{cp_width, str_width, width_len};
 
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +28,8 @@ pub struct Seg {
 struct Spans {
     links: Vec<LinkSpan>,
     styles: Vec<StyleSpan>,
+    /// Caixa de tarefa desenhada como 1 coluna (3 bytes `[ ]`/`[x]`).
+    task: Option<Task>,
 }
 
 impl Spans {
@@ -35,6 +38,11 @@ impl Spans {
         Spans {
             links: if hide.links && t.contains('[') { find_links(t) } else { Vec::new() },
             styles: if !l.fence && hide.styles && t.contains('*') { find_styles(t) } else { Vec::new() },
+            task: if hide.styles && t.contains('[') {
+                task_item(t, l.heading, l.fence, l.in_code)
+            } else {
+                None
+            },
         }
     }
     fn link_at(&self, p: usize) -> Option<&LinkSpan> {
@@ -74,6 +82,15 @@ fn glyph(text: &str, p: usize) -> (usize, usize) {
     (len, w)
 }
 
+/// Visao de grade da linha, quando tabelas sao desenhadas (fora da insercao, com
+/// quebra de linha ligada, e a grade cabe na janela).
+pub fn table_view(l: &Line, lay: &Layout) -> Option<TView> {
+    if l.tb.is_none() || !lay.hide.styles || !lay.wrap {
+        return None;
+    }
+    tbl::view(l, lay.avail_w)
+}
+
 fn plain_single(l: &Line, lay: &Layout) -> bool {
     // Cercas, blocos de codigo e tabelas nao quebram: sao cortados na borda.
     !lay.wrap
@@ -110,6 +127,9 @@ fn layout_key(lay: &Layout) -> u32 {
 /// calcular a posicao do cursor refazia a quebra de TODAS as linhas anteriores
 /// a cada quadro (centenas de ms em notas grandes).
 pub fn nsegs(l: &Line, lay: &Layout) -> usize {
+    if let Some(tv) = table_view(l, lay) {
+        return tv.nsub();
+    }
     if plain_single(l, lay) {
         return 1;
     }
@@ -126,6 +146,11 @@ pub fn nsegs(l: &Line, lay: &Layout) -> usize {
 /// Segmentos (linhas visuais) de uma linha do documento.
 pub fn segments(l: &Line, lay: &Layout) -> Vec<Seg> {
     let len = l.text.len();
+    if let Some(tv) = table_view(l, lay) {
+        // Linhas da tela de uma tabela nao sao trechos de bytes: o indice `sub`
+        // decide o que desenhar (ver `tbl`).
+        return vec![Seg { off: 0, len }; tv.nsub()];
+    }
     if len == 0 || plain_single(l, lay) {
         return vec![Seg { off: 0, len }];
     }
@@ -162,6 +187,14 @@ pub fn segments(l: &Line, lay: &Layout) -> Vec<Seg> {
                         last_space = Some((p, p + 1));
                     }
                 }
+                continue;
+            }
+            if sp.task.is_some_and(|t| t.box_start == p) {
+                if cols + 1 > max_cols {
+                    break;
+                }
+                cols += 1;
+                p += 3;
                 continue;
             }
             if b[p] == b' ' && p > seg_start {
@@ -237,6 +270,14 @@ pub fn visual_col(l: &Line, seg_start: usize, x_in_seg: usize, hide: Hide) -> us
             }
             continue;
         }
+        if let Some(t) = sp.task.filter(|t| t.box_start == p) {
+            if target < t.box_start + 3 {
+                break; // cursor dentro da caixa: fica na coluna do glifo
+            }
+            cols += 1;
+            p += 3;
+            continue;
+        }
         let (clen, w) = glyph(s, p);
         cols += w;
         p += clen;
@@ -272,6 +313,14 @@ pub fn byte_offset_in_seg(l: &Line, seg_start: usize, seg_len: usize, target_col
         }
         if let Some((opening, st)) = sp.style_delim_at(p) {
             p = if opening { st.content_start } else { st.close_start + st.close_len };
+            continue;
+        }
+        if sp.task.is_some_and(|t| t.box_start == p) {
+            if cur + 1 > target_col {
+                break;
+            }
+            cur += 1;
+            p += 3;
             continue;
         }
         let (clen, w) = glyph(s, p);
@@ -389,6 +438,10 @@ pub fn cursor_visual_pos(buf: &Buffer, lay: &Layout) -> (usize, usize) {
             continue;
         }
         if i == buf.cy {
+            if let Some(tv) = table_view(l, lay) {
+                let (sub, col) = tbl::cursor_pos(&tv, buf.cx);
+                return (vrow + sub, col);
+            }
             let segs = segments(l, lay);
             let cur_sub = sub_for_cursor(&segs, buf.cx);
             let seg = segs[cur_sub];
@@ -400,22 +453,87 @@ pub fn cursor_visual_pos(buf: &Buffer, lay: &Layout) -> (usize, usize) {
     (vrow, 0)
 }
 
+/// Byte da linha sob a coluna `col` da linha da tela `sub` (cuja fatia e `seg`).
+pub fn click_offset(l: &Line, sub: usize, seg: Seg, col: usize, lay: &Layout) -> usize {
+    if let Some(tv) = table_view(l, lay) {
+        return tbl::offset_at(&tv, sub, col).min(l.text.len());
+    }
+    seg.off + byte_offset_in_seg(l, seg.off, seg.len, col, lay.hide)
+}
+
+/// Coluna visual do cursor na linha da tela em que ele esta.
+fn cursor_col(l: &Line, cx: usize, lay: &Layout) -> usize {
+    if let Some(tv) = table_view(l, lay) {
+        return tbl::cursor_pos(&tv, cx).1;
+    }
+    let segs = segments(l, lay);
+    let s = segs[sub_for_cursor(&segs, cx)];
+    visual_col(l, s.off, cx.saturating_sub(s.off), lay.hide)
+}
+
+/// Passa para a linha de baixo/cima do documento. Entre uma tabela e qualquer
+/// outra linha o cursor conserva a coluna da tela; fora disso conserva o byte.
+fn cross_line(buf: &mut Buffer, lay: &Layout, down: bool) {
+    let from = &buf.lines[buf.cy];
+    let from_table = table_view(from, lay).is_some();
+    let col_src = buf.cx;
+    let col_from = if from_table || buf.lines.get(if down { buf.cy + 1 } else { buf.cy.wrapping_sub(1) }).is_some_and(|l| l.tb.is_some()) {
+        Some(cursor_col(from, col_src, lay))
+    } else {
+        None
+    };
+    if down {
+        if buf.cy + 1 >= buf.lines.len() {
+            return;
+        }
+        buf.cy += 1;
+        while buf.cy + 1 < buf.lines.len() && buf.lines[buf.cy].hidden {
+            buf.cy += 1;
+        }
+    } else {
+        if buf.cy == 0 {
+            return;
+        }
+        buf.cy -= 1;
+        while buf.cy > 0 && buf.lines[buf.cy].hidden {
+            buf.cy -= 1;
+        }
+    }
+    let dest = &buf.lines[buf.cy];
+    buf.cx = match (table_view(dest, lay), col_from) {
+        (Some(tv), Some(col)) => {
+            let (lo, hi) = tv.content_range();
+            tbl::offset_at(&tv, if down { lo } else { hi - 1 }, col)
+        }
+        (None, Some(col)) if from_table => {
+            let segs = segments(dest, lay);
+            let seg = if down { segs[0] } else { segs[segs.len() - 1] };
+            seg.off + byte_offset_in_seg(dest, seg.off, seg.len, col, lay.hide)
+        }
+        _ => buf.cx.min(dest.len()),
+    };
+}
+
 /// Seta para baixo seguindo as linhas visuais.
 pub fn move_down(buf: &mut Buffer, lay: &Layout) {
     buf.clamp_cursor();
     let l = &buf.lines[buf.cy];
+    if let Some(tv) = table_view(l, lay) {
+        match tbl::step_in_cell(&tv, buf.cx, true) {
+            Some(cx) => buf.cx = cx,
+            None => cross_line(buf, lay, true),
+        }
+        buf.clamp_cursor();
+        return;
+    }
     let segs = segments(l, lay);
     let cur_sub = sub_for_cursor(&segs, buf.cx);
     if cur_sub + 1 < segs.len() {
         let col = visual_col(l, segs[cur_sub].off, buf.cx.saturating_sub(segs[cur_sub].off), lay.hide);
         let next = segs[cur_sub + 1];
         buf.cx = next.off + byte_offset_in_seg(l, next.off, next.len, col, lay.hide);
-    } else if buf.cy + 1 < buf.lines.len() {
-        buf.cy += 1;
-        while buf.cy + 1 < buf.lines.len() && buf.lines[buf.cy].hidden {
-            buf.cy += 1;
-        }
-        buf.cx = buf.cx.min(buf.lines[buf.cy].len());
+    } else {
+        cross_line(buf, lay, true);
     }
     buf.clamp_cursor();
 }
@@ -424,22 +542,25 @@ pub fn move_down(buf: &mut Buffer, lay: &Layout) {
 pub fn move_up(buf: &mut Buffer, lay: &Layout) {
     buf.clamp_cursor();
     let l = &buf.lines[buf.cy];
+    if let Some(tv) = table_view(l, lay) {
+        match tbl::step_in_cell(&tv, buf.cx, false) {
+            Some(cx) => buf.cx = cx,
+            None => cross_line(buf, lay, false),
+        }
+        buf.clamp_cursor();
+        return;
+    }
     let segs = segments(l, lay);
     let cur_sub = sub_for_cursor(&segs, buf.cx);
     if cur_sub > 0 {
         let col = visual_col(l, segs[cur_sub].off, buf.cx.saturating_sub(segs[cur_sub].off), lay.hide);
         let prev = segs[cur_sub - 1];
         buf.cx = prev.off + byte_offset_in_seg(l, prev.off, prev.len, col, lay.hide);
-    } else if buf.cy > 0 {
-        buf.cy -= 1;
-        while buf.cy > 0 && buf.lines[buf.cy].hidden {
-            buf.cy -= 1;
-        }
-        buf.cx = buf.cx.min(buf.lines[buf.cy].len());
+    } else {
+        cross_line(buf, lay, false);
     }
     buf.clamp_cursor();
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +631,27 @@ mod tests {
         let nohide = Hide { links: false, styles: false };
         assert_eq!(byte_offset_in_seg(&w, 0, w.len(), 2, nohide), 3);
         assert_eq!(byte_offset_in_seg(&w, 0, w.len(), 1, nohide), 0, "meio do glifo largo fica antes");
+    }
+
+    #[test]
+    fn task_box_takes_one_column_when_rendered() {
+        let hide = Hide { links: true, styles: true };
+        let raw = Hide { links: false, styles: false };
+        let l = Line::new("- [x] feito");
+        // "- [x] " = 6 bytes: renderizado "- ☑ " = 4 colunas.
+        assert_eq!(visual_col(&l, 0, 6, hide), 4);
+        assert_eq!(visual_col(&l, 0, 6, raw), 6);
+        // Cursor sobre o "x" (dentro da caixa) fica na coluna do glifo.
+        assert_eq!(visual_col(&l, 0, 3, hide), 2);
+        // Clique: coluna 2 = glifo (inicio da caixa), coluna 4 = "f".
+        assert_eq!(byte_offset_in_seg(&l, 0, l.len(), 2, hide), 2);
+        assert_eq!(byte_offset_in_seg(&l, 0, l.len(), 4, hide), 6);
+        assert_eq!(byte_offset_in_seg(&l, 0, l.len(), 4, raw), 4);
+        // A quebra conta 1 coluna para a caixa.
+        let long = Line::new("- [ ] aaaa bbbb cccc");
+        assert_eq!(segments(&long, &lay(15, true)).len(), 2); // "- ☐ aaaa bbbb cccc" = 18 col
+        assert_eq!(segments(&long, &lay(18, true)).len(), 1);
+        assert_eq!(segments(&long, &lay(18, false)).len(), 2); // cru: 20 colunas
     }
 
     #[test]

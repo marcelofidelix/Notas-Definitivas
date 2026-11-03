@@ -7,8 +7,9 @@
 use crate::app::{App, Focus, HitMap, Mode, MIN_LEFT_WIDTH};
 use crate::db::now_secs;
 use crate::doc::Line;
-use crate::layout::{VRowIter, VisRow};
-use crate::md::{bullet, find_links, find_styles, LinkSpan, StyleKind, StyleSpan};
+use crate::layout::{table_view, VRowIter, VisRow};
+use crate::tbl::{SubKind, TView, A_BOLD, A_ITALIC, A_LINK, A_WIKI};
+use crate::md::{bullet, find_links, find_styles, task_item, LinkSpan, StyleKind, StyleSpan};
 use crate::text::{
     cp_width, format_rel_time, marquee_slice, sanitize_for_terminal, str_width, truncate_display, width_len,
 };
@@ -24,6 +25,22 @@ pub const CURSOR_BAR: &str = "\x1b[?12l\x1b[6 q";
 pub const SYNC_BEGIN: &str = "\x1b[?2026h";
 pub const SYNC_END: &str = "\x1b[?2026l";
 
+/// Glifos da lista de tarefas. Precisam existir na fonte do terminal (Cascadia e
+/// Consolas tem □ U+25A1 e ▣ U+25A3): ☐/☑ nao existem nelas, o terminal os pede a
+/// outra fonte e eles saem bem mais largos que uma celula.
+/// `NOTAS_TASK_GLYPHS=ab` troca os dois (cada um com 1 coluna de largura).
+fn task_glyphs() -> &'static (String, String) {
+    static G: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let custom: Vec<char> = std::env::var("NOTAS_TASK_GLYPHS").unwrap_or_default().chars().collect();
+        let ok = |c: char| !c.is_control() && cp_width(c as u32) == 1;
+        if custom.len() == 2 && ok(custom[0]) && ok(custom[1]) {
+            (custom[0].to_string(), custom[1].to_string())
+        } else {
+            ("\u{25A1}".to_string(), "\u{25A3}".to_string())
+        }
+    })
+}
 const PROMPT_IMPORT: &str = " ⬇ Importar de: ";
 const PROMPT_EXPORT: &str = " ⬆ Exportar para: ";
 
@@ -711,6 +728,7 @@ impl<'a> Frame<'a> {
             return;
         };
         let l = &lines[vr.line];
+        let tv = table_view(l, &app.layout(in_preview));
         let buf = app.buf();
         let is_cur_line = !in_preview && buf.is_some_and(|b| vr.line == b.cy);
         let cur_bg = is_cur_line && matches!(app.mode, Mode::Normal | Mode::Command);
@@ -720,7 +738,8 @@ impl<'a> Frame<'a> {
         }
 
         // Numero da linha e indicador de dobra.
-        let lnum = if vr.sub == 0 {
+        // Numero da linha no primeiro trecho de conteudo (numa tabela, depois da borda).
+        let lnum = if vr.sub == tv.as_ref().map_or(0, |t| t.content_range().0) {
             if l.heading > 0 {
                 format!("{:>4} {}", vr.line + 1, if l.folded { "▸" } else { "▾" })
             } else {
@@ -809,15 +828,26 @@ impl<'a> Frame<'a> {
             return;
         }
 
+        if let Some(tv) = &tv {
+            let last = vr.sub + 1 >= tv.nsub();
+            self.table_sub(tv, vr.sub, cur_bg, line_bg, ew, line_sel, linewise, last);
+            return;
+        }
+
         let hide = app.hide(in_preview);
         let links = if hide.links { find_links(&l.text) } else { Vec::new() };
         let styles = if l.fence { Vec::new() } else { find_styles(&l.text) };
-        let line_fg = match l.heading {
+        let mut line_fg = match l.heading {
             1 => th.fg_h1,
             2 => th.fg_h2,
             0 => th.fg_main,
             _ => th.fg_h3,
         };
+        // Lista de tarefas: fora da insercao, `[ ]`/`[x]` viram um glifo de 1 coluna.
+        let task = if hide.styles { task_item(&l.text, l.heading, l.fence, l.in_code) } else { None };
+        if task.is_some_and(|t| t.checked) {
+            line_fg = th.fg_muted;
+        }
         self.p(line_fg);
         if l.heading >= 1 {
             self.p(BOLD);
@@ -843,6 +873,21 @@ impl<'a> Frame<'a> {
             }
             if let Some((a, z, _)) = line_sel {
                 self.p(if idx >= a && idx < z { th.bg_select } else { line_bg });
+            }
+
+            if let Some(t) = task.filter(|t| t.box_start == idx) {
+                if cols + 1 > ew - 1 {
+                    break;
+                }
+                self.p(if t.checked { th.fg_accent } else { th.fg_yellow });
+                self.p(BOLD);
+                let (open, done) = task_glyphs();
+                self.p(if t.checked { done } else { open });
+                self.p("\x1b[22m");
+                self.p(line_fg);
+                cols += 1;
+                idx += 3;
+                continue;
             }
 
             // Links ocultos: so o titulo, sublinhado.
@@ -907,6 +952,105 @@ impl<'a> Frame<'a> {
         }
         self.p(RESET);
         self.fill_tail(cols, ew, line_bg, line_sel, linewise, last_subrow);
+        self.p("\x1b[K");
+        self.p(RESET);
+    }
+
+    /// Uma linha da tela de uma tabela desenhada como grade: bordas, filetes ou
+    /// uma linha de conteudo (celulas ja quebradas e alinhadas por `tbl`).
+    #[allow(clippy::too_many_arguments)]
+    fn table_sub(
+        &mut self,
+        tv: &TView,
+        sub: usize,
+        cur_bg: bool,
+        line_bg: &str,
+        ew: i32,
+        line_sel: Option<(usize, usize, bool)>,
+        linewise: bool,
+        last_subrow: bool,
+    ) {
+        const K_SEL: u16 = 1 << 4;
+        const K_BORDER: u16 = 1 << 5;
+        let th = self.th;
+        let geo = tv.geo.clone();
+        let kind = tv.sub_kind(sub);
+        let zebra = !cur_bg && tv.row % 2 == 1 && !tv.is_delim() && !tv.is_header();
+        let row_bg = if zebra && matches!(kind, SubKind::Content(_)) { th.bg_sidebar } else { line_bg };
+
+        self.p(row_bg);
+        if let SubKind::Content(ci) = kind {
+            let header = tv.is_header();
+            let mut pieces: Vec<(u16, String)> = Vec::new();
+            fn push(pieces: &mut Vec<(u16, String)>, key: u16, s: &str) {
+                match pieces.last_mut() {
+                    Some((k, t)) if *k == key => t.push_str(s),
+                    _ => pieces.push((key, s.to_string())),
+                }
+            }
+            let all_sel = linewise && line_sel.is_some();
+            let pad_key = if all_sel { K_SEL } else { 0 };
+            push(&mut pieces, K_BORDER, "│");
+            for c in 0..geo.widths.len() {
+                let cl = tv.cell_line(c, ci);
+                push(&mut pieces, pad_key, &" ".repeat(1 + cl.pad_l));
+                for g in cl.glyphs {
+                    let sel = all_sel || line_sel.is_some_and(|(a, z, _)| (g.b as usize) >= a && (g.b as usize) < z);
+                    let mut s = String::with_capacity(4);
+                    s.push(g.ch);
+                    if g.vs16 {
+                        s.push('\u{FE0F}');
+                    }
+                    push(&mut pieces, u16::from(g.attr) | if sel { K_SEL } else { 0 }, &s);
+                }
+                push(&mut pieces, pad_key, &" ".repeat(cl.pad_r + 1));
+                push(&mut pieces, K_BORDER, "│");
+            }
+            for (key, text) in &pieces {
+                self.p(RESET);
+                self.p(if key & K_SEL != 0 { th.bg_select } else { row_bg });
+                if key & K_BORDER != 0 {
+                    self.p(th.fg_border);
+                } else {
+                    let attr = (*key & 0x0F) as u8;
+                    if attr & A_WIKI != 0 {
+                        self.p(th.fg_wiki);
+                        self.p(BOLD);
+                    } else if attr & A_LINK != 0 {
+                        self.p(th.fg_link);
+                        self.p(UNDERLINE);
+                    } else {
+                        self.p(if header { th.fg_accent } else { th.fg_main });
+                    }
+                    if header || attr & A_BOLD != 0 {
+                        self.p(BOLD);
+                    }
+                    if attr & A_ITALIC != 0 {
+                        self.p(ITALIC);
+                    }
+                }
+                self.txt(text);
+            }
+        } else {
+            let (l, h, x, r) = match kind {
+                SubKind::Top => ("╭", "─", "┬", "╮"),
+                SubKind::Mid => ("├", "─", "┼", "┤"),
+                SubKind::Bottom => ("╰", "─", "┴", "╯"),
+                _ => ("╞", "═", "╪", "╡"),
+            };
+            let mut s = String::from(l);
+            for (i, w) in geo.widths.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(x);
+                }
+                s.push_str(&h.repeat(w + 2));
+            }
+            s.push_str(r);
+            self.p(th.fg_border);
+            self.p(&s);
+        }
+        self.p(RESET);
+        self.fill_tail(6 + geo.total as i32, ew, line_bg, line_sel, linewise, last_subrow);
         self.p("\x1b[K");
         self.p(RESET);
     }

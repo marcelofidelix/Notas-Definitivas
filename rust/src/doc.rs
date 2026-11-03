@@ -2,6 +2,9 @@
 //! operacoes de edicao. Todas as posicoes de cursor sao deslocamentos em bytes
 //! e ficam sempre em limites de caractere UTF-8 (nunca no meio de um caractere).
 
+use crate::history::{Snapshot, Stack};
+use crate::md::is_table_line;
+use crate::tbl::TableBlock;
 use crate::text::{ceil_boundary, floor_boundary, next_char_end, prev_char_start};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -33,6 +36,9 @@ pub struct Line {
     pub fence: bool,
     pub in_code: bool,
     pub memo: Cell<RowMemo>,
+    /// Bloco de tabela (2+ linhas seguidas) a que a linha pertence, e seu indice nele.
+    pub tb: Option<Rc<TableBlock>>,
+    pub trow: u16,
 }
 
 impl Line {
@@ -114,6 +120,44 @@ pub fn update_lines_syntax(lines: &mut [Line]) {
             l.hidden = hide_lvl > 0;
         }
     }
+    assign_table_blocks(lines);
+}
+
+/// Agrupa linhas de tabela consecutivas (fora de blocos de codigo) em blocos de
+/// 2+ linhas. Um bloco igual ao anterior e reaproveitado, com a geometria ja
+/// calculada; digitar fora de tabelas nao custa mais que uma varredura.
+fn assign_table_blocks(lines: &mut [Line]) {
+    let n = lines.len();
+    let mut i = 0;
+    while i < n {
+        let is_tbl = |l: &Line| !l.fence && !l.in_code && is_table_line(&l.text);
+        if !is_tbl(&lines[i]) {
+            if lines[i].tb.is_some() {
+                lines[i].tb = None;
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && is_tbl(&lines[i]) {
+            i += 1;
+        }
+        let run = &mut lines[start..i];
+        if run.len() < 2 || run.len() > usize::from(u16::MAX) {
+            for l in run.iter_mut() {
+                l.tb = None;
+            }
+            continue;
+        }
+        let reuse = run[0].tb.clone().filter(|b| b.same_rows(run));
+        let blk = reuse.unwrap_or_else(|| TableBlock::new(run.iter().map(|l| l.text.clone()).collect()));
+        for (k, l) in run.iter_mut().enumerate() {
+            l.trow = k as u16;
+            if !l.tb.as_ref().is_some_and(|b| Rc::ptr_eq(b, &blk)) {
+                l.tb = Some(blk.clone());
+            }
+        }
+    }
 }
 
 /// Divide texto em linhas aceitando LF, CRLF e CR isolado.
@@ -141,13 +185,6 @@ pub fn split_any_newline(text: &str) -> Vec<&str> {
     out
 }
 
-#[derive(Clone)]
-struct Snapshot {
-    lines: Vec<Line>,
-    cy: usize,
-    cx: usize,
-}
-
 struct Typing {
     deadline: Instant,
     line: usize,
@@ -163,24 +200,19 @@ pub struct Buffer {
     pub vis_y: usize,
     pub vis_x: usize,
     pub has_selection: bool,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: Stack,
+    redo: Stack,
     typing: Option<Typing>,
 }
 
-#[cfg(test)]
-fn snap_bytes(s: &Snapshot) -> usize {
-    // O texto e compartilhado entre snapshots: o custo proprio e a estrutura.
-    s.lines.len() * std::mem::size_of::<Line>()
-}
-
-/// Teto de linhas somadas em todos os snapshots (rede de seguranca de memoria).
+/// Teto de linhas guardadas no historico de desfazer (rede de seguranca de memoria).
 const MAX_UNDO_LINES: usize = 2_000_000;
 
 /// Memoria aproximada ocupada pelos historicos de desfazer/refazer.
 #[cfg(test)]
 pub fn approx_undo_bytes(b: &Buffer) -> usize {
-    b.undo.iter().chain(b.redo.iter()).map(snap_bytes).sum()
+    // O texto e compartilhado entre estados: o custo proprio e a estrutura das linhas.
+    (b.undo.stored_lines() + b.redo.stored_lines()) * std::mem::size_of::<Line>()
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -269,15 +301,14 @@ impl Buffer {
     pub fn save_undo(&mut self) {
         self.typing = None;
         if self.undo.len() >= MAX_UNDO {
-            self.undo.remove(0);
+            self.undo.drop_oldest();
         }
         let s = self.snapshot();
         self.undo.push(s);
         self.redo.clear();
         // Documentos enormes: descarta os niveis mais antigos alem do teto.
-        let mut total: usize = self.undo.iter().map(|s| s.lines.len()).sum();
-        while total > MAX_UNDO_LINES && self.undo.len() > 1 {
-            total -= self.undo.remove(0).lines.len();
+        while self.undo.stored_lines() > MAX_UNDO_LINES && self.undo.len() > 1 {
+            self.undo.drop_oldest();
         }
     }
 
@@ -326,7 +357,7 @@ impl Buffer {
             return UndoResult::Nothing;
         };
         if self.redo.len() >= MAX_UNDO {
-            self.redo.remove(0);
+            self.redo.drop_oldest();
         }
         let cur = self.snapshot();
         self.redo.push(cur);
@@ -340,7 +371,7 @@ impl Buffer {
             return UndoResult::Nothing;
         };
         if self.undo.len() >= MAX_UNDO {
-            self.undo.remove(0);
+            self.undo.drop_oldest();
         }
         let cur = self.snapshot();
         self.undo.push(cur);
@@ -712,6 +743,74 @@ mod tests {
         }
         assert_eq!(b.undo_depth(), MAX_UNDO);
         assert_eq!(b.redo_depth(), 0, "nova edicao descarta o redo");
+    }
+
+    /// O historico por diferencas se comporta como copias completas: edicoes
+    /// aleatorias com desfazer/refazer, comparadas a um modelo ingenuo.
+    #[test]
+    fn undo_redo_matches_full_copies_under_random_edits() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut b = buf("# T\n\n|a|b|\n|1|2|\n\nfim\n");
+        let model = |b: &Buffer| -> Vec<String> { b.lines.iter().map(|l| l.text.to_string()).collect() };
+        let (mut undo, mut redo): (Vec<Vec<String>>, Vec<Vec<String>>) = (Vec::new(), Vec::new());
+        for step in 0..3000 {
+            match rnd(8) {
+                0..=3 => {
+                    undo.push(model(&b));
+                    redo.clear();
+                    if undo.len() > MAX_UNDO {
+                        undo.remove(0);
+                    }
+                    b.save_undo();
+                    let n = b.lines.len();
+                    match rnd(4) {
+                        0 => b.lines[rnd(n)].set_text(format!("edit {step}")),
+                        1 => b.insert_line(rnd(n + 1), &format!("nova {step}")),
+                        2 if n > 1 => {
+                            b.cy = rnd(n);
+                            b.delete_lines(b.cy, 1);
+                        }
+                        _ => {
+                            b.lines[rnd(n)].set_text(format!("| x{step} | y |"));
+                        }
+                    }
+                    b.update_folding();
+                    b.clamp_cursor();
+                }
+                4 | 5 => {
+                    let before = model(&b);
+                    let got = b.apply_undo();
+                    match undo.pop() {
+                        Some(prev) => {
+                            assert_eq!(got, UndoResult::Done);
+                            redo.push(before);
+                            assert_eq!(model(&b), prev, "undo no passo {step}");
+                        }
+                        None => assert_eq!(got, UndoResult::Nothing),
+                    }
+                }
+                _ => {
+                    let before = model(&b);
+                    let got = b.apply_redo();
+                    match redo.pop() {
+                        Some(next) => {
+                            assert_eq!(got, UndoResult::Done);
+                            assert_eq!(model(&b), next, "redo no passo {step}");
+                            undo.push(before);
+                        }
+                        None => assert_eq!(got, UndoResult::Nothing),
+                    }
+                }
+            }
+            assert_eq!(b.undo_depth(), undo.len(), "passo {step}");
+            assert_eq!(b.redo_depth(), redo.len(), "passo {step}");
+        }
     }
 
     #[test]

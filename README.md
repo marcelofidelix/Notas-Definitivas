@@ -6,6 +6,8 @@
 [![Interface](https://img.shields.io/badge/Interface-TUI%20%28Vim%20%2F%20Neovim%20Modal%29-green)](https://neovim.io)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **Atenção:** a versão em C descrita abaixo foi abandonada; a versão mantida é a de [Rust](rust/).
+
 Editor de texto e gerenciador de notas Markdown para terminal (**TUI**), minimalista, ultrarrápido, de arquivo único em C (`notas.c`), com banco de dados embutido **SQLite 3** (`notas.db`), compatibilidade total multiplataforma (**Linux** e **Windows** nativos) e fluxo de trabalho inspirado no **Vim / Neovim** e **Vimwiki**.
 
 Projetado para oferecer velocidade extrema (0 ms de latência), independência de dependências externas complexas e ergonomia profissional para desenvolvedores, escritores e administradores de sistemas.
@@ -355,13 +357,13 @@ O projeto conta com testes automatizados compilados diretamente com o próprio `
 
 ---
 
-## 🦀 Versão alternativa em Rust
+## 🦀 Versão em Rust (a mantida)
 
-A pasta [ust/](rust/) contém uma **reescrita completa em Rust** com as mesmas funcionalidades e o **mesmo 
-otas.db** (as duas versões podem alternar sobre o mesmo banco). Ela adiciona segurança de memória, SQLite embutido, ~120 testes, um fuzz de milhões de entradas, redesenho incremental, proteção contra sobrescrita por outra instância e o botão **`[🔗 Link]`** (copia `[[Nota]]` para criar links). Veja [ust/README.md](rust/README.md) para compilar, a arquitetura e as diferenças.
+> **A versão em C (`notas.c`) foi abandonada**: continua aqui como referência histórica, mas não recebe mais correções nem novidades. Tudo o que for desenvolvido daqui para frente acontece na versão em Rust.
+
+A pasta [rust/](rust/) contém a **reescrita completa em Rust**, com todas as funcionalidades da versão em C e o **mesmo `notas.db`**. Ela adiciona segurança de memória, SQLite embutido, uma suíte de testes com fuzz de milhões de entradas, redesenho incremental, proteção contra sobrescrita por outra instância, o botão **`[🔗 Link]`** (copia `[[Nota]]` para criar links), listas de tarefas (□ / ▣), **tabelas desenhadas com quebra de linha dentro das células e alinhamento automático**, e um histórico de desfazer por diferenças (memória ~100× menor). Veja [rust/README.md](rust/README.md) para compilar, a arquitetura e os detalhes.
 
 ---
-
 ## 📄 Licença
 
 Distribuído sob a licença **MIT**. Consulte o arquivo [LICENSE](LICENSE) para mais detalhes.

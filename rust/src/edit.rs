@@ -51,18 +51,74 @@ fn align_range(b: &mut Buffer, start: usize, end: usize) -> bool {
     }
 }
 
-/// Posicao logo depois do primeiro `|` (pulando espacos) numa linha.
-fn after_first_bar(text: &str) -> usize {
-    match text.find('|') {
-        Some(i) => {
-            let mut pos = i + 1;
-            while pos < text.len() && text.as_bytes()[pos] == b' ' {
-                pos += 1;
-            }
-            pos
+/// (celula, deslocamento no conteudo) do byte `cx`, para achar o mesmo ponto depois
+/// de o alinhamento mudar o preenchimento das celulas.
+fn cell_coords(text: &str, cx: usize) -> (usize, usize) {
+    let (mut cell, mut start) = (0usize, text.find('|').map_or(0, |i| i + 1));
+    loop {
+        let end = text[start..].find('|').map_or(text.len(), |i| start + i);
+        if cx <= end || end >= text.len() {
+            let content = text[start..end].trim_start_matches([' ', '\t']);
+            let cs = end - content.len();
+            return (cell, cx.saturating_sub(cs).min(content.trim_end_matches([' ', '\t']).len()));
         }
-        None => 0,
+        cell += 1;
+        start = end + 1;
     }
+}
+
+fn cx_from_coords(text: &str, cell: usize, off: usize) -> usize {
+    let mut start = text.find('|').map_or(0, |i| i + 1);
+    for _ in 0..cell {
+        match text[start..].find('|') {
+            Some(i) => start += i + 1,
+            None => break,
+        }
+    }
+    let end = text[start..].find('|').map_or(text.len(), |i| start + i);
+    let content = text[start..end].trim_start_matches([' ', '\t']);
+    let cs = end - content.len();
+    floor_boundary(text, (cs + off).min(end))
+}
+
+/// Realinha `start..=end` so se algo mudar, conservando o cursor na mesma celula
+/// e no mesmo caractere. `Some(true)` se o texto mudou.
+fn align_range_keep_cursor(b: &mut Buffer, start: usize, end: usize) -> Option<bool> {
+    let refs: Vec<&str> = b.lines[start..=end].iter().map(|l| &*l.text).collect();
+    let new = table::align_table(&refs)?;
+    if new.iter().zip(&refs).all(|(n, o)| n == o) {
+        return Some(false);
+    }
+    let coords = (start..=end).contains(&b.cy).then(|| cell_coords(&b.lines[b.cy].text, b.cx));
+    b.save_undo();
+    for (i, t) in new.into_iter().enumerate() {
+        b.lines[start + i].set_text(t);
+    }
+    if let Some((cell, off)) = coords {
+        b.cx = cx_from_coords(&b.lines[b.cy].text, cell, off);
+    }
+    b.update_folding();
+    Some(true)
+}
+
+/// Inicio do texto da celula que comeca em `pos` (logo depois de um `|`): pula o
+/// recuo; numa celula vazia fica depois do primeiro espaco, pronto para digitar.
+fn cell_text_start(text: &str, pos: usize) -> usize {
+    let b = text.as_bytes();
+    let mut p = pos;
+    while p < b.len() && b[p] == b' ' {
+        p += 1;
+    }
+    if p < b.len() && b[p] == b'|' {
+        (pos + 1).min(p)
+    } else {
+        p
+    }
+}
+
+/// Posicao do texto da primeira celula de uma linha.
+fn after_first_bar(text: &str) -> usize {
+    text.find('|').map_or(0, |i| cell_text_start(text, i + 1))
 }
 
 impl App {
@@ -149,7 +205,7 @@ impl App {
     }
 
     /// `p` / `P` sem selecao: cola o clipboard do sistema (ou o ultimo yank).
-    pub fn paste_normal(&mut self) {
+    pub fn paste_normal_n(&mut self, n: usize) {
         if let Some(t) = clip::paste() {
             self.yank_linewise = t.contains('\n');
             self.yank = t;
@@ -158,7 +214,7 @@ impl App {
             self.set_status("Área de transferência vazia.");
             return;
         }
-        let t = self.yank.clone();
+        let t = self.repeated_register(n);
         self.paste_text(&t);
         self.set_status("Colado da área de transferência");
     }
@@ -291,6 +347,20 @@ impl App {
         true
     }
 
+    /// Alinhamento silencioso da tabela que contem a linha `y` (ao deixa-la no modo
+    /// Insercao). Nao faz nada se a tabela ja esta alinhada ou nao pode ser alinhada.
+    pub fn table_autoalign(&mut self, y: usize) {
+        let Some(b) = self.buf_mut() else { return };
+        let y = y.min(b.lines.len().saturating_sub(1));
+        let Some(y) = [y, y.saturating_sub(1)].into_iter().find(|&i| is_table_line(&b.lines[i].text)) else {
+            return;
+        };
+        let (start, end) = table_bounds(b, y);
+        if end > start && align_range_keep_cursor(b, start, end) == Some(true) {
+            self.mark_modified();
+        }
+    }
+
     pub fn table_align_all(&mut self) {
         let Some(b) = self.buf_mut() else { return };
         let has_table = (0..b.lines.len()).any(|y| {
@@ -344,11 +414,7 @@ impl App {
             if let Some(rel) = cur_text[b.cx..].find('|') {
                 let p = b.cx + rel;
                 if p + 1 < cur_text.len() && cur_text[p + 1..].contains('|') {
-                    let mut next = p + 1;
-                    while next < cur_text.len() && cur_text.as_bytes()[next] == b' ' {
-                        next += 1;
-                    }
-                    b.cx = next;
+                    b.cx = cell_text_start(&cur_text, p + 1);
                     self.mark_modified();
                     return;
                 }

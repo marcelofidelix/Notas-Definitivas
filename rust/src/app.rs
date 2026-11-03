@@ -66,6 +66,16 @@ pub enum Focus {
     Right,
 }
 
+/// `3i`, `5o`: repete o que for digitado quando o modo Insercao termina (Esc).
+#[derive(Clone, Copy, Debug)]
+pub struct InsertRepeat {
+    pub times: usize,
+    pub cy: usize,
+    pub cx: usize,
+    /// `o`/`O`: repete a linha inteira em vez do trecho digitado.
+    pub lines: bool,
+}
+
 /// Comando de varias teclas aguardando a proxima (gg, gt, gq, za, dd, r<char>).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pending {
@@ -134,6 +144,11 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub pending: Pending,
+    /// Prefixo numerico do modo Normal/Visual (`100l`); 0 = nenhum.
+    pub count: usize,
+    /// Segundo numero de `d3d`; 0 = nenhum.
+    pub count2: usize,
+    pub insert_repeat: Option<InsertRepeat>,
     pub theme: usize,
     pub wrap: bool,
     pub left_width: i32,
@@ -196,6 +211,9 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Right,
             pending: Pending::None,
+            count: 0,
+            count2: 0,
+            insert_repeat: None,
             theme: 0,
             wrap: true,
             left_width: DEFAULT_LEFT_WIDTH,

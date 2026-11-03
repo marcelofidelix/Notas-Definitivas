@@ -50,6 +50,63 @@ Tudo o que está no [README principal](../README.md) existe aqui: edição modal
 - **Detalhes de edição:** `$` vai ao último caractere (como no Vim); `r`, `dd`, `gg`, `za`… são comandos de várias teclas não bloqueantes; busca lateral com edição completa (`←`, `→`, `Home`, `End`, `Ctrl+←/→`); `PageUp`/`PageDown`; tabelas sem limite de 128 linhas (continuam recusando > 32 colunas, sem perder dados); lista lateral e rolagem com a mesma altura.
 - **Falhas de gravação nunca perdem dados:** gravação atômica (`tmp` + `fsync` + `rename`), `COMMIT`/`ROLLBACK` verificados, fechar/sair salva tudo antes, e um pânico inesperado dispara salvamento de emergência.
 
+## ☑ Lista de tarefas
+
+`- [ ] tarefa` aparece como **□ tarefa** (caixa vazia) e `- [x] tarefa` (ou `[X]`, também com `*`) como **▣ tarefa** (caixa marcada, texto esmaecido). A renderização vale nos modos Normal, Visual, Comando e na prévia; em **Inserção** o texto aparece cru (`- [ ] tarefa`) para você editar. O arquivo nunca é alterado pela exibição, então continua Markdown padrão (GitHub, Obsidian…). Para marcar/desmarcar, entre em Inserção (ou use `r` sobre o espaço/`x` dentro dos colchetes).
+
+**Largura de uma célula, de verdade.** Os símbolos "óbvios" ☐ (U+2610) e ☑ (U+2611) **não existem** no Cascadia nem no Consolas: o terminal os pede à fonte *Segoe UI Symbol*, que os desenha ~45 % mais largos que uma célula (a caixa marcada "invadia" o texto). □ (U+25A1) e ▣ (U+25A3) existem nas duas fontes com a largura exata da célula, então foram os escolhidos. Se preferir outros, `NOTAS_TASK_GLYPHS=ab` (dois caracteres de 1 coluna cada: vazio e marcado) os troca. Cursor, cliques e quebra de linha levam em conta que `[ ]` ocupa 1 coluna quando renderizado. Não conta como tarefa: `- [x](url)` (é um link), `- [ ]texto` (sem espaço) e linhas em blocos de código.
+
+## ▦ Tabelas
+
+Duas linhas ou mais começando por `|` formam uma tabela (`|a|b|c|` na primeira linha e `|1|2|3|` na seguinte já bastam; a linha `|---|---|` é opcional).
+
+**Edição (modo Inserção)**
+
+- **Alinhamento automático:** ao sair de uma linha de tabela (setas, clique) ou do Inserção (`Esc`), a tabela é realinhada — só se algo mudar, com o cursor na mesma célula e no mesmo caractere, e como um passo próprio do `u`. `Tab` (alinha e vai à próxima célula, criando linha no fim), `gqq`, `:table` e `:tableall` continuam funcionando.
+- **`Enter` numa tabela** cria uma linha nova **já alinhada**, com o cursor na primeira célula (também numa tabela de uma só linha).
+
+**Visualização (fora do modo Inserção)** — o texto da nota não muda, só a exibição:
+
+```
+╭───────┬───────┬──────────────────────────────────╮
+│ Item  │   Qtd │ Descricao                        │
+╞═══════╪═══════╪══════════════════════════════════╡
+│ Cafe  │    10 │ Esta e uma descricao bem longa   │
+│       │       │ que precisa quebrar em varias    │
+│       │       │ linhas dentro da celula para     │
+│       │       │ caber na janela.                 │
+├───────┼───────┼──────────────────────────────────┤
+│ Pao   │     2 │ site e [Nota]                    │
+╰───────┴───────┴──────────────────────────────────╯
+```
+
+- **Quebra de linha dentro da célula:** as colunas ocupam a largura natural; se a tabela não cabe na janela, as mais largas encolhem (preservando palavras inteiras sempre que possível) e o texto quebra em várias linhas. Quando alguma célula quebra, filetes separam as linhas para a leitura ficar clara. Palavras maiores que a coluna são cortadas; nada se perde.
+- **Cabeçalho** em negrito e cor de destaque, com filete duplo, quando a segunda linha é `|---|---|`.
+- **Alinhamento** pela linha delimitadora (`:--` esquerda, `:-:` centro, `--:` direita); colunas só de números ficam à direita sozinhas.
+- **Marcação dentro das células:** `**negrito**`, `*itálico*`, `[link](url)` e `[[wikilink]]` são exibidos como no resto da nota (sem os delimitadores).
+- **Cursor e mouse** seguem as células: `j`/`k` percorrem o texto quebrado da célula e depois passam para a linha seguinte/anterior mantendo a coluna; um clique cai no texto sob o ponteiro; seleção `v`/`V` realça normalmente.
+- Linhas alternadas ganham um fundo suave; a linha do cursor é realçada.
+- Se a janela é tão estreita que nem a largura mínima de cada coluna cabe, ou com `:nowrap`, a tabela volta ao texto cru (cortado na borda) em vez de ficar ilegível. Tabelas com mais de 32 colunas também.
+## 🔢 Prefixo numérico (como no Vim)
+
+No modo Normal (e no Visual), um número antes do comando o repete: `100l` anda 100 casas à direita, `5j` desce 5 linhas, `3w` avança 3 palavras. O número aparece na barra de status enquanto você digita; `Esc` (ou um clique) o cancela. O `0` sozinho continua indo ao início da linha; depois de outro dígito (`10l`) ele faz parte do número.
+
+| Comando | Com prefixo `N` |
+| :-- | :-- |
+| `h` `l` `j` `k` `w` `b`, setas, `PageUp/PageDown` | repete `N` vezes (para ao esbarrar no fim da linha/nota — `j`/`k` andam por linhas da tela) |
+| `G` / `gg` | vai para a linha `N` (`5G`, `2gg`); além do fim, a última |
+| `$` | desce `N-1` linhas e vai ao fim |
+| `x` | recorta `N` caracteres (um só passo de desfazer) |
+| `dd`, `d3d`, `3d2d` | apaga `N` linhas; os dois números se multiplicam; um só passo de desfazer |
+| `y` | copia `N` linhas |
+| `p` | cola `N` cópias do registro (um só passo) |
+| `u` / `Ctrl+R` | desfaz/refaz `N` passos |
+| `n` | `N`-ésima próxima ocorrência da busca |
+| `rx` | `3rx` troca `N` caracteres (se a linha não tiver `N`, nada acontece) |
+| `i` `a` `I` `A` `o` `O` | `3ia<Esc>` repete o texto digitado `N` vezes ao sair da Inserção (`3ox<Esc>` cria 3 linhas); se você digitou mais de uma linha, não repete |
+| `gt` / `gT` | `2gt` vai para a aba 2; `3gT` volta 3 abas |
+
+Os demais comandos ignoram o prefixo. Números enormes são seguros (limite de 1.000.000; toda repetição para quando deixa de ter efeito, e `3p`/`5ix` produzem no máximo 16 MB). Na lista de notas os dígitos continuam sendo os filtros de urgência (`0`–`6`).
 ## 🔗 Copiar o link da nota
 
 O botão **`[🔗 Link]`** (barra de botões), o comando **`:link`** (`:copylink`, `:cl`) e a tecla **`y`** na lista lateral copiam o link da nota para a área de transferência — e também para o registrador interno, então `p`/`Ctrl+V` colam na hora:
@@ -68,14 +125,15 @@ A revisão começou **medindo** (nota de 20 mil linhas longas, cursor no meio; `
 | Quadro 120×30 | 234 ms | ~3 ms |
 | Tecla digitada + quadro | 188 ms | ~3 ms |
 | `Enter` (ponto de desfazer) | 4 ms | 0,5 ms |
-| Memória de 100 níveis de desfazer | 358 MB | 75 MB (teto de 2 mi de linhas) |
+| Memória de 100 níveis de desfazer | 358 MB | **~1 MB** (só o último estado fica completo) |
 | Bytes por tecla no terminal | 34 KB | ~1,3 KB |
 | Início com 2.000 notas de 10 KB | 349 ms | ~80–110 ms |
 
 O que foi feito:
 
 - **Posição do cursor sem refazer a quebra de todas as linhas** — o número de linhas visuais de cada linha é memorizado (validado por hash do conteúdo, correto para qualquer forma de edição). Era o gargalo dos 234 ms.
-- **Texto das linhas compartilhado (`Rc<str>`)** entre os snapshots de desfazer: copiar o documento custa um contador por linha, não o texto.
+- **Texto das linhas compartilhado (`Rc<str>`)** entre os estados de desfazer: copiar o documento custa um contador por linha, não o texto.
+- **Histórico de desfazer por diferenças (`history.rs`):** em cada pilha (desfazer e refazer) só o estado mais recente é completo; os anteriores guardam apenas o trecho que mudou (linhas iguais no início e no fim são reconhecidas por ponteiro, sem comparar texto) e são reconstruídos ao desfazer. Uma nota de 20 mil linhas com 150 passos passou de 91 MB para ~1 MB, e o ponto de desfazer ficou mais barato. Verificado contra um modelo de cópias completas em edições aleatórias.
 - **Redesenho incremental:** só as linhas da tela que mudaram são enviadas (ótimo em SSH); o batimento de 30 s, o redimensionamento e a limpeza repintam tudo. Testado: nenhuma linha alterada é omitida, nenhuma igual é reenviada.
 - **Índice de busca:** normalização ASCII por bytes e sem cópia intermediária.
 - **Linhas gigantes** (> 20 mil bytes) são tratadas como texto simples (sem varrer links/estilos a cada quadro).
@@ -83,7 +141,7 @@ O que foi feito:
 - **Autosave que falha não entra em laço** (antes repetiria a cada 100 ms): tenta de novo em 1 minuto.
 - **Fechar a janela do console (Windows)** salva as notas pendentes antes de sair (logoff/desligamento também).
 
-Oportunidades ainda abertas (não feitas, por serem maiores ou não testáveis aqui): indexar a busca em segundo plano para bancos com dezenas de milhares de notas; tratar `SIGTERM`/`SIGHUP` no Linux/macOS (o tratador de encerramento atual é só Windows); reduzir o tamanho de `Line`.
+Oportunidades ainda abertas (não feitas, por serem maiores ou não testáveis aqui): indexar a busca em segundo plano para bancos com dezenas de milhares de notas; tratar `SIGTERM`/`SIGHUP` no Linux/macOS (o tratador de encerramento atual é só Windows).
 
 ## Arquitetura (`src/`)
 
@@ -92,9 +150,12 @@ Oportunidades ainda abertas (não feitas, por serem maiores ou não testáveis a
 | `main.rs` | entrada, terminal (raw/alternativa/mouse/colagem, restaurado por `Drop`), laço de eventos, salvamento de emergência |
 | `app.rs` | estado global, catálogo de notas, abas, histórico, criar/renomear/excluir, importar/exportar |
 | `doc.rs` | `Buffer`/`Line`: edição, dobras, seleção, desfazer/refazer (com agrupamento de digitação) |
+| `history.rs` | pilhas de desfazer/refazer por diferenças (só o último estado é completo) |
 | `layout.rs` | quebra visual, coluna do cursor, mapeamento clique → byte, `VRowIter` (varredura O(linhas) por quadro) |
-| `md.rs` / `table.rs` | links, negrito/itálico, listas; alinhamento de tabelas |
+| `md.rs` / `table.rs` | links, negrito/itálico, listas, tarefas; alinhamento de tabelas (texto) |
+| `tbl.rs` | tabelas desenhadas: análise das células, larguras, quebra por célula, cursor/clique ↔ byte |
 | `input.rs` / `cmd.rs` / `mouse.rs` | teclado por modo/foco, comandos `:`, mouse |
+| `count.rs` | prefixo numérico do Vim (`100l`, `3dd`, `5G`...): repetição segura de comandos |
 | `edit.rs` | copiar/colar, substituir, tabelas, links, busca no texto |
 | `render.rs` | desenho TrueColor de um quadro inteiro, geometria de cliques, cursor |
 | `db.rs` / `fsio.rs` | SQLite (`rusqlite`), arquivos, importação/exportação atômicas |

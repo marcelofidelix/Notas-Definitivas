@@ -247,6 +247,40 @@ pub fn bullet(text: &str, heading: u8, fence: bool, in_code: bool) -> Option<(us
     Some((i, ch as char))
 }
 
+/// Item de lista de tarefas: `- [ ] texto` (aberta) ou `- [x] texto` (concluida).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Task {
+    /// Posicao do `[` da caixa; ela ocupa `box_start..box_start + 3`.
+    pub box_start: usize,
+    pub checked: bool,
+}
+
+/// Reconhece `- [ ]`, `- [x]` e `- [X]` (tambem com `*`), seguidos de espaco ou
+/// fim de linha. `- [x](url)` e um link, nao uma tarefa.
+pub fn task_item(text: &str, heading: u8, fence: bool, in_code: bool) -> Option<Task> {
+    let (pos, _) = bullet(text, heading, fence, in_code)?;
+    let b = text.as_bytes();
+    let mut i = pos + 1;
+    if i >= b.len() || !matches!(b[i], b' ' | b'\t') {
+        return None;
+    }
+    while i < b.len() && matches!(b[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i + 3 > b.len() || b[i] != b'[' || b[i + 2] != b']' {
+        return None;
+    }
+    let checked = match b[i + 1] {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return None,
+    };
+    if i + 3 < b.len() && !matches!(b[i + 3], b' ' | b'\t') {
+        return None;
+    }
+    Some(Task { box_start: i, checked })
+}
+
 /// Linha de tabela Markdown: comeca com `|` e tem outro `|` depois.
 pub fn is_table_line(text: &str) -> bool {
     let t = text.trim_start_matches([' ', '\t']);
@@ -302,6 +336,22 @@ mod tests {
         assert_eq!(bullet("- - -", 0, false, false), None);
         assert_eq!(bullet("-x", 0, false, false), None);
         assert_eq!(bullet("- a", 1, false, false), None);
+    }
+
+    #[test]
+    fn task_items() {
+        let t = |s: &str| task_item(s, 0, false, false);
+        assert_eq!(t("- [ ] a fazer"), Some(Task { box_start: 2, checked: false }));
+        assert_eq!(t("  * [x] feito"), Some(Task { box_start: 4, checked: true }));
+        assert_eq!(t("- [X]"), Some(Task { box_start: 2, checked: true }));
+        assert_eq!(t("-   [ ] varios espacos"), Some(Task { box_start: 4, checked: false }));
+        assert_eq!(t("- [x](http://l.com)"), None, "link, nao tarefa");
+        assert_eq!(t("- [] vazio"), None);
+        assert_eq!(t("- [y] outro"), None);
+        assert_eq!(t("[ ] sem marcador"), None);
+        assert_eq!(t("- [ ]colado"), None);
+        assert_eq!(task_item("- [ ] x", 1, false, false), None, "titulo nao e lista");
+        assert_eq!(task_item("- [ ] x", 0, false, true), None, "codigo nao e lista");
     }
 
     #[test]

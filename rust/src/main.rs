@@ -6,10 +6,12 @@
 mod app;
 mod clip;
 mod cmd;
+mod count;
 mod db;
 mod doc;
 mod edit;
 mod fsio;
+mod history;
 mod input;
 mod layout;
 mod life;
@@ -19,6 +21,7 @@ mod mouse;
 mod notes;
 mod render;
 mod table;
+mod tbl;
 mod text;
 mod theme;
 

@@ -3,7 +3,7 @@
 //! pendente em vez de bloquear a leitura.
 
 use crate::app::{App, Focus, Mode, Pending, FIELD_MAX, MIN_LEFT_WIDTH};
-use crate::doc::{Buffer, UndoResult};
+use crate::doc::Buffer;
 use crate::layout;
 use crate::md::{find_styles, is_table_line};
 use crate::text::{floor_boundary, next_char_end, prev_char_start};
@@ -149,7 +149,7 @@ fn is_space(b: u8) -> bool {
 }
 
 impl App {
-    fn with_buf<R>(&mut self, f: impl FnOnce(&mut Buffer) -> R) -> Option<R> {
+    pub(crate) fn with_buf<R>(&mut self, f: impl FnOnce(&mut Buffer) -> R) -> Option<R> {
         Some(f(self.buf_mut()?))
     }
 
@@ -158,10 +158,29 @@ impl App {
         self.set_status(msg);
     }
 
-    /// Ponto de entrada: processa uma tecla.
+    /// Ponto de entrada: processa uma tecla. Ao sair de uma linha de tabela (ou do
+    /// modo Insercao) com o cursor nela, a tabela e realinhada.
     pub fn on_key(&mut self, key: Key) {
+        let in_table = self.mode == Mode::Insert
+            && self.focus == Focus::Right
+            && self.buf().is_some_and(|b| is_table_line(&b.cur().text));
+        let before = in_table.then(|| (self.active, self.buf().map_or(0, |b| b.cy)));
+        self.on_key_inner(key);
+        if let Some((active, y)) = before {
+            let moved = self.buf().is_some_and(|b| b.cy != y);
+            if self.active == active && (self.mode != Mode::Insert || moved) {
+                self.table_autoalign(y);
+            }
+        }
+    }
+
+    fn on_key_inner(&mut self, key: Key) {
         self.last_activity = Instant::now();
         self.needs_redraw = true;
+        // O prefixo numerico so existe no editor, em Normal/Visual.
+        if self.focus != Focus::Right || !matches!(self.mode, Mode::Normal | Mode::VisualChar | Mode::VisualLine) {
+            self.clear_count();
+        }
 
         if self.pending != Pending::None {
             self.handle_pending(key);
@@ -273,12 +292,15 @@ impl App {
                 self.cmd_cursor = 0;
             }
             Mode::Insert => {
+                self.apply_insert_repeat();
                 self.with_buf(|b| {
                     b.cx = prev_char_start(&b.cur().text, b.cx);
                 });
             }
             _ => {}
         }
+        self.clear_count();
+        self.insert_repeat = None;
         self.with_buf(|b| b.has_selection = false);
         self.mode = Mode::Normal;
         self.focus = Focus::Right;
@@ -307,6 +329,7 @@ impl App {
     fn handle_pending(&mut self, key: Key) {
         let pending = std::mem::replace(&mut self.pending, Pending::None);
         if key == Key::Esc {
+            self.clear_count();
             if matches!(pending, Pending::ReplaceChar | Pending::ReplaceVisual) {
                 self.set_status(if self.mode == Mode::VisualLine {
                     "-- VISUAL LINHA --"
@@ -318,6 +341,20 @@ impl App {
             }
             return;
         }
+        // `d3d`: um segundo numero depois do `d` (multiplica o primeiro).
+        if pending == Pending::D {
+            if let Key::Char(c @ '0'..='9') = key {
+                if c != '0' || self.count2 > 0 {
+                    let d = c as usize - '0' as usize;
+                    self.count2 = (self.count2 * 10 + d).min(crate::count::MAX_COUNT);
+                    self.set_status(format!("Contagem: {}", self.count.max(1).saturating_mul(self.count2)));
+                    self.pending = Pending::D;
+                    return;
+                }
+            }
+        }
+        let (count, count2) = (self.count, self.count2);
+        self.clear_count();
         match pending {
             Pending::G => match key {
                 Key::Char('g') if self.focus == Focus::Left => {
@@ -328,6 +365,7 @@ impl App {
                         self.set_status(format!("Primeira nota (1 de {})", self.filtered.len()));
                     }
                 }
+                Key::Char('g') if count > 0 => self.goto_line(count),
                 Key::Char('g') => {
                     self.with_buf(|b| {
                         b.cy = 0;
@@ -343,8 +381,13 @@ impl App {
                     self.set_status(format!("Topo da nota (linha {})", y));
                 }
                 Key::Char('q') => self.pending = Pending::Gq,
+                Key::Char('t') if count > 0 => self.tab_switch(count - 1),
                 Key::Char('t') => self.tab_next(),
-                Key::Char('T') => self.tab_prev(),
+                Key::Char('T') => {
+                    for _ in 0..count.clamp(1, self.tabs.len().max(1)) {
+                        self.tab_prev();
+                    }
+                }
                 Key::Char('l') | Key::Tab => self.jump_to_next_link(),
                 other => self.on_key(other),
             },
@@ -386,10 +429,10 @@ impl App {
             },
             Pending::D => {
                 if key == Key::Char('d') {
-                    self.delete_current_line();
+                    self.delete_lines_at_cursor(count.max(1).saturating_mul(count2.max(1)));
                 }
             }
-            Pending::ReplaceChar => self.replace_under_cursor(key),
+            Pending::ReplaceChar => self.replace_under_cursor(key, count.max(1)),
             Pending::ReplaceVisual => self.replace_selection_chars(key),
             Pending::None => {}
         }
@@ -408,23 +451,8 @@ impl App {
         }
     }
 
-    fn delete_current_line(&mut self) {
-        let Some(b) = self.buf() else { return };
-        let text = b.cur().text.to_string();
-        self.set_yank(text, true);
-        self.with_buf(|b| b.save_undo());
-        self.edit(|b| {
-            let cy = b.cy;
-            b.delete_lines(cy, 1);
-            if b.cy >= b.lines.len() {
-                b.cy = b.lines.len() - 1;
-            }
-            b.clamp_cursor();
-        });
-        self.set_status("1 linha excluída");
-    }
 
-    fn replace_under_cursor(&mut self, key: Key) {
+    fn replace_under_cursor(&mut self, key: Key, n: usize) {
         let Some(b) = self.buf() else { return };
         if b.cx >= b.cur().len() {
             return;
@@ -447,16 +475,7 @@ impl App {
                 });
                 self.set_status("-- MODO NORMAL --");
             }
-            Key::Char(c) if !c.is_control() => {
-                self.with_buf(|b| b.save_undo());
-                self.edit(|b| {
-                    let (cy, cx) = (b.cy, b.cx);
-                    let end = next_char_end(&b.lines[cy].text, cx);
-                    let mut s = [0u8; 4];
-                    b.lines[cy].edit(|t| t.replace_range(cx..end, c.encode_utf8(&mut s)));
-                });
-                self.set_status("-- MODO NORMAL --");
-            }
+            Key::Char(c) if !c.is_control() => self.replace_chars(n, c),
             _ => self.set_status("-- MODO NORMAL --"),
         }
     }
@@ -983,6 +1002,21 @@ impl App {
         }
         let lay = self.layout(false);
 
+        // Prefixo numerico (como no Vim): `3j`, `100l`, `5dd`. O `0` so conta
+        // depois de outro digito; sozinho continua indo ao inicio da linha.
+        if let Key::Char(c @ '0'..='9') = key {
+            if c != '0' || self.count > 0 {
+                self.push_count_digit(c);
+                return;
+            }
+        }
+        let count = self.count; // 0 = sem prefixo
+        if !matches!(key, Key::Char('g' | 'd' | 'r')) {
+            // g, d e r esperam uma segunda tecla e passam o prefixo adiante.
+            self.clear_count();
+        }
+        let n = count.max(1);
+
         // Shift+Setas no modo Normal iniciam a selecao visual.
         if self.mode == Mode::Normal
             && matches!(key, Key::ShiftLeft | Key::ShiftRight | Key::ShiftUp | Key::ShiftDown)
@@ -1016,40 +1050,20 @@ impl App {
         let has_sel = self.mode.is_visual() || self.buf().is_some_and(|b| b.has_selection);
         match key {
             Key::Char('g') => self.pending = Pending::G,
-            Key::Char('G') => {
-                self.with_buf(|b| {
-                    b.cy = b.lines.len() - 1;
-                    while b.cy > 0 && b.lines[b.cy].hidden {
-                        b.cy -= 1;
-                    }
-                    b.cx = 0;
-                });
-                self.editor_scroll();
-                self.clear_needed = true;
-                let y = self.buf().map_or(1, |b| b.cy + 1);
-                self.set_status(format!("Fim da nota (linha {})", y));
-            }
+            Key::Char('G') => self.goto_line(if count > 0 { count } else { usize::MAX }),
             Key::Backspace => self.navigate_history(1),
             Key::CtrlBackspace => self.navigate_history(3),
-            Key::Char('h') | Key::Left => self.normal_left(),
-            Key::Char('l') | Key::Right => self.normal_right(),
-            Key::Char('j') | Key::Down => {
-                self.with_buf(|b| layout::move_down(b, &lay));
-            }
-            Key::Char('k') | Key::Up => {
-                self.with_buf(|b| layout::move_up(b, &lay));
-            }
+            Key::Char('h') | Key::Left => self.repeat_left(n),
+            Key::Char('l') | Key::Right => self.repeat_right(n),
+            Key::Char('j') | Key::Down => self.repeat_cursor(n, |b| layout::move_down(b, &lay)),
+            Key::Char('k') | Key::Up => self.repeat_cursor(n, |b| layout::move_up(b, &lay)),
             Key::PageUp | Key::PageDown => {
-                let (n, down) = (self.visible_rows().saturating_sub(1).max(1), key == Key::PageDown);
-                self.with_buf(|b| {
-                    for _ in 0..n {
-                        if down {
-                            layout::move_down(b, &lay);
-                        } else {
-                            layout::move_up(b, &lay);
-                        }
-                    }
-                });
+                let steps = self.visible_rows().saturating_sub(1).max(1).saturating_mul(n);
+                if key == Key::PageDown {
+                    self.repeat_cursor(steps, |b| layout::move_down(b, &lay));
+                } else {
+                    self.repeat_cursor(steps, |b| layout::move_up(b, &lay));
+                }
             }
             Key::Char('c') if self.mode == Mode::Normal => {
                 if let Some(i) = self.active {
@@ -1061,72 +1075,66 @@ impl App {
             }
             Key::Char(' ') if self.mode == Mode::Normal => {
                 self.with_buf(|b| b.save_undo());
-                self.edit(|b| b.insert_at_cursor(" "));
+                self.edit(|b| b.insert_at_cursor(&" ".repeat(n.min(4096))));
                 self.set_status("Espaço inserido");
             }
             Key::Char('w') => {
-                self.with_buf(|b| {
-                    b.clamp_cursor();
-                    let t = b.cur().text.as_bytes();
-                    let mut x = b.cx;
-                    while x < t.len() && !is_space(t[x]) {
-                        x += 1;
+                for _ in 0..n {
+                    let before = self.buf().map(|b| (b.cy, b.cx));
+                    self.word_forward();
+                    if self.buf().map(|b| (b.cy, b.cx)) == before {
+                        break;
                     }
-                    while x < t.len() && is_space(t[x]) {
-                        x += 1;
-                    }
-                    b.cx = x;
-                    if b.cx >= b.cur().len() && b.cy + 1 < b.lines.len() {
-                        b.cy += 1;
-                        b.cx = 0;
-                    }
-                });
+                }
             }
             Key::Char('b') => {
-                self.with_buf(|b| {
-                    b.clamp_cursor();
-                    if b.cx > 0 {
-                        let t = b.cur().text.as_bytes();
-                        let mut x = b.cx;
-                        while x > 0 && is_space(t[x - 1]) {
-                            x -= 1;
-                        }
-                        while x > 0 && !is_space(t[x - 1]) {
-                            x -= 1;
-                        }
-                        b.cx = x;
-                    } else if b.cy > 0 {
-                        b.cy -= 1;
-                        b.cx = b.cur().len();
+                for _ in 0..n {
+                    let before = self.buf().map(|b| (b.cy, b.cx));
+                    self.word_back();
+                    if self.buf().map(|b| (b.cy, b.cx)) == before {
+                        break;
                     }
-                    b.clamp_cursor();
-                });
+                }
             }
             Key::Char('0') | Key::Home => {
                 self.with_buf(|b| b.cx = 0);
             }
             Key::Char('$') | Key::End => {
+                // `2$` desce uma linha antes de ir ao fim.
+                self.repeat_cursor(n - 1, |b| layout::move_down(b, &lay));
                 // Como no Vim: ultimo caractere da linha (e nao depois dele).
                 self.with_buf(|b| {
                     let t = &b.cur().text;
                     b.cx = if t.is_empty() { 0 } else { prev_char_start(t, t.len()) };
                 });
             }
-            Key::Char('i') => self.begin_insert(|_| {}),
-            Key::Char('I') => self.begin_insert(|b| {
-                let t = b.cur().text.as_bytes();
-                let mut x = 0;
-                while x < t.len() && is_space(t[x]) {
-                    x += 1;
-                }
-                b.cx = x;
-            }),
-            Key::Char('a') => self.begin_insert(|b| {
-                if b.cx < b.cur().len() {
-                    b.move_right_char();
-                }
-            }),
-            Key::Char('A') => self.begin_insert(|b| b.cx = b.cur().len()),
+            Key::Char('i') => {
+                self.begin_insert(|_| {});
+                self.arm_insert_repeat(n, false);
+            }
+            Key::Char('I') => {
+                self.begin_insert(|b| {
+                    let t = b.cur().text.as_bytes();
+                    let mut x = 0;
+                    while x < t.len() && is_space(t[x]) {
+                        x += 1;
+                    }
+                    b.cx = x;
+                });
+                self.arm_insert_repeat(n, false);
+            }
+            Key::Char('a') => {
+                self.begin_insert(|b| {
+                    if b.cx < b.cur().len() {
+                        b.move_right_char();
+                    }
+                });
+                self.arm_insert_repeat(n, false);
+            }
+            Key::Char('A') => {
+                self.begin_insert(|b| b.cx = b.cur().len());
+                self.arm_insert_repeat(n, false);
+            }
             Key::Char('o') => {
                 self.with_buf(|b| b.save_undo());
                 self.edit(|b| {
@@ -1135,6 +1143,7 @@ impl App {
                     b.cx = 0;
                 });
                 self.mode = Mode::Insert;
+                self.arm_insert_repeat(n, true);
                 self.set_status("-- MODO INSERÇÃO --");
             }
             Key::Char('O') => {
@@ -1144,6 +1153,7 @@ impl App {
                     b.cx = 0;
                 });
                 self.mode = Mode::Insert;
+                self.arm_insert_repeat(n, true);
                 self.set_status("-- MODO INSERÇÃO --");
             }
             Key::Char('v') => match self.mode {
@@ -1199,7 +1209,7 @@ impl App {
                     self.with_buf(|b| b.has_selection = false);
                     self.set_status("Texto selecionado recortado para a área de transferência! (x)");
                 } else {
-                    self.cut_char();
+                    self.cut_chars(n);
                 }
             }
             Key::Char('d') => {
@@ -1215,34 +1225,21 @@ impl App {
                     self.mode = Mode::Normal;
                     self.with_buf(|b| b.has_selection = false);
                     self.set_status("Texto selecionado copiado para a área de transferência! (y)");
-                } else if let Some(t) = self.buf().map(|b| b.cur().text.to_string()) {
-                    self.set_yank(t, true);
-                    self.set_status("1 linha copiada para a área de transferência (y)");
+                } else {
+                    self.yank_lines_at_cursor(n);
                 }
             }
             Key::Char('p' | 'P') => {
                 if has_sel {
                     self.paste_replace_selection();
                 } else {
-                    self.paste_normal();
+                    self.paste_normal_n(n);
                 }
             }
-            Key::Char('u') => match self.with_buf(|b| b.apply_undo()) {
-                Some(UndoResult::Done) => {
-                    self.mark_modified();
-                    self.set_status("Desfazer (u)");
-                }
-                _ => self.set_status("Já está na alteração mais antiga"),
-            },
-            Key::Ctrl('r') => match self.with_buf(|b| b.apply_redo()) {
-                Some(UndoResult::Done) => {
-                    self.mark_modified();
-                    self.set_status("Refazer (Ctrl+R)");
-                }
-                _ => self.set_status("Já está na alteração mais recente"),
-            },
+            Key::Char('u') => self.repeat_undo(n, false),
+            Key::Ctrl('r') => self.repeat_undo(n, true),
             Key::Char('z') => self.pending = Pending::Z,
-            Key::Char('n') => self.search_next(),
+            Key::Char('n') => self.repeat_search(n),
             Key::Enter => self.activate_link(),
             Key::Char(':') => {
                 self.cmd_buf.clear();
@@ -1267,30 +1264,8 @@ impl App {
         self.set_status("-- MODO INSERÇÃO --");
     }
 
-    fn cut_char(&mut self) {
-        let Some(b) = self.buf() else { return };
-        let t = &b.cur().text;
-        if b.cx >= t.len() {
-            return;
-        }
-        let end = next_char_end(t, b.cx);
-        let ch = t[b.cx..end].to_string();
-        self.set_yank(ch, false);
-        self.with_buf(|b| b.save_undo());
-        self.edit(|b| {
-            let (cy, cx) = (b.cy, b.cx);
-            let end = next_char_end(&b.lines[cy].text, cx);
-            b.lines[cy].delete_range(cx, end);
-            let len = b.lines[cy].len();
-            if b.cx >= len && b.cx > 0 {
-                b.cx = prev_char_start(&b.lines[cy].text, b.cx);
-            }
-        });
-        self.set_status("Caractere recortado para a área de transferência (x)");
-    }
-
     /// `h`: esquerda; pula os delimitadores ocultos de negrito/italico.
-    fn normal_left(&mut self) {
+    pub(crate) fn normal_left(&mut self, allow_focus_switch: bool) {
         let in_normal = self.mode == Mode::Normal;
         let Some(b) = self.buf_mut() else { return };
         b.clamp_cursor();
@@ -1316,7 +1291,7 @@ impl App {
                     }
                 }
             }
-        } else if in_normal {
+        } else if in_normal && allow_focus_switch {
             self.focus = Focus::Left;
             self.sync_preview_to_selection();
             self.set_status("Foco na lista de notas (use j/k para navegar)");
@@ -1324,7 +1299,7 @@ impl App {
     }
 
     /// `l`: direita; pula os delimitadores ocultos de negrito/italico.
-    fn normal_right(&mut self) {
+    pub(crate) fn normal_right(&mut self) {
         let Some(b) = self.buf_mut() else { return };
         b.clamp_cursor();
         if b.cx < b.cur().len() {
