@@ -3,6 +3,9 @@
 //! linha, sempre em limites de caractere (os delimitadores sao ASCII).
 
 pub const MAX_SPANS: usize = 16;
+/// Linhas maiores que isto sao tratadas como texto simples (sem links/estilos):
+/// analisa-las a cada quadro travaria a interface.
+pub const MAX_STYLED_LINE: usize = 20_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinkSpan {
@@ -32,6 +35,9 @@ pub struct StyleSpan {
 
 /// Procura links Markdown e wikilinks (no maximo `MAX_SPANS`).
 pub fn find_links(s: &str) -> Vec<LinkSpan> {
+    if s.len() > MAX_STYLED_LINE {
+        return Vec::new();
+    }
     let b = s.as_bytes();
     let len = b.len();
     let mut out = Vec::new();
@@ -137,6 +143,9 @@ pub fn find_links(s: &str) -> Vec<LinkSpan> {
 
 /// Procura trechos `*italico*`, `**negrito**` e `***ambos***` (ignora `codigo`).
 pub fn find_styles(s: &str) -> Vec<StyleSpan> {
+    if s.len() > MAX_STYLED_LINE {
+        return Vec::new();
+    }
     let b = s.as_bytes();
     let len = b.len();
     let mut out = Vec::new();

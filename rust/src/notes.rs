@@ -73,7 +73,14 @@ pub fn first_heading(content: &str) -> &str {
 
 pub fn build_search_norm(filename: &str, title: &str, content: &str) -> String {
     let header = first_heading(content);
-    normalize_text(&format!("{} {} {} {}", filename, title, header, content))
+    let mut out = String::with_capacity(filename.len() + title.len() + header.len() + content.len() + 3);
+    for (i, part) in [filename, title, header, content].into_iter().enumerate() {
+        if i > 0 {
+            out.push(char::from(b' '));
+        }
+        crate::text::normalize_into(&mut out, part);
+    }
+    out
 }
 
 /// Ordem da lista: grupo de urgencia (1..6, depois sem marcacao), mais

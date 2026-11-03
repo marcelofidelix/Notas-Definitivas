@@ -3,31 +3,55 @@
 //! e ficam sempre em limites de caractere UTF-8 (nunca no meio de um caractere).
 
 use crate::text::{ceil_boundary, floor_boundary, next_char_end, prev_char_start};
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub const MAX_UNDO: usize = 100;
 /// Janela para agrupar digitacao continua em um unico passo de undo.
 pub const TYPING_UNDO_COALESCE: Duration = Duration::from_millis(800);
 
+/// Memoria do numero de linhas visuais de uma linha, valida enquanto o conteudo
+/// (hash) e a configuracao de layout (chave) forem os mesmos.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowMemo {
+    pub hash: u64,
+    pub key: u32,
+    pub n: u32,
+}
+
+/// Uma linha do documento. O texto e compartilhado (`Rc<str>`): copiar o
+/// documento para o historico de desfazer custa um contador por linha, nao uma
+/// copia do texto. Para editar, use `edit`/`set_text`/`insert_str`/`delete_range`.
 #[derive(Clone, Debug, Default)]
 pub struct Line {
-    pub text: String,
+    pub text: Rc<str>,
     /// 1..=6 se a linha comeca com `#`..`######` seguido de espaco, senao 0.
     pub heading: u8,
     pub folded: bool,
     pub hidden: bool,
     pub fence: bool,
     pub in_code: bool,
+    pub memo: Cell<RowMemo>,
 }
 
 impl Line {
-    pub fn new(s: impl Into<String>) -> Line {
+    pub fn new(s: impl AsRef<str>) -> Line {
         let mut l = Line {
-            text: s.into(),
+            text: Rc::from(s.as_ref()),
             ..Default::default()
         };
         l.detect_heading();
         l
+    }
+
+    /// Edita o texto como `String`. Custa uma copia da linha (nao do documento).
+    pub fn edit<R>(&mut self, f: impl FnOnce(&mut String) -> R) -> R {
+        let mut s = String::from(&*self.text);
+        let r = f(&mut s);
+        self.text = Rc::from(s);
+        self.detect_heading();
+        r
     }
 
     pub fn detect_heading(&mut self) {
@@ -41,7 +65,7 @@ impl Line {
     }
 
     pub fn set_text(&mut self, s: String) {
-        self.text = s;
+        self.text = Rc::from(s);
         self.detect_heading();
     }
 
@@ -51,15 +75,13 @@ impl Line {
 
     pub fn insert_str(&mut self, at: usize, s: &str) {
         let at = floor_boundary(&self.text, at);
-        self.text.insert_str(at, s);
-        self.detect_heading();
+        self.edit(|t| t.insert_str(at, s));
     }
 
     pub fn delete_range(&mut self, a: usize, b: usize) {
         let a = floor_boundary(&self.text, a);
         let b = ceil_boundary(&self.text, b.max(a));
-        self.text.replace_range(a..b, "");
-        self.detect_heading();
+        self.edit(|t| t.replace_range(a..b, ""));
     }
 }
 
@@ -144,6 +166,21 @@ pub struct Buffer {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     typing: Option<Typing>,
+}
+
+#[cfg(test)]
+fn snap_bytes(s: &Snapshot) -> usize {
+    // O texto e compartilhado entre snapshots: o custo proprio e a estrutura.
+    s.lines.len() * std::mem::size_of::<Line>()
+}
+
+/// Teto de linhas somadas em todos os snapshots (rede de seguranca de memoria).
+const MAX_UNDO_LINES: usize = 2_000_000;
+
+/// Memoria aproximada ocupada pelos historicos de desfazer/refazer.
+#[cfg(test)]
+pub fn approx_undo_bytes(b: &Buffer) -> usize {
+    b.undo.iter().chain(b.redo.iter()).map(snap_bytes).sum()
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -237,6 +274,11 @@ impl Buffer {
         let s = self.snapshot();
         self.undo.push(s);
         self.redo.clear();
+        // Documentos enormes: descarta os niveis mais antigos alem do teto.
+        let mut total: usize = self.undo.iter().map(|s| s.lines.len()).sum();
+        while total > MAX_UNDO_LINES && self.undo.len() > 1 {
+            total -= self.undo.remove(0).lines.len();
+        }
     }
 
     /// Antes de inserir um caractere: teclas seguidas na mesma linha/posicao,
@@ -389,8 +431,8 @@ impl Buffer {
     /// Enter: divide a linha no cursor.
     pub fn split_line(&mut self) {
         self.clamp_cursor();
-        let tail = self.lines[self.cy].text.split_off(self.cx);
-        self.lines[self.cy].detect_heading();
+        let cx = self.cx;
+        let tail = self.lines[self.cy].edit(|t| t.split_off(cx));
         self.lines.insert(self.cy + 1, Line::new(tail));
         self.cy += 1;
         self.cx = 0;
@@ -406,9 +448,11 @@ impl Buffer {
             return;
         }
         let (cy, cx) = (self.cy, self.cx);
-        let tail = self.lines[cy].text.split_off(cx);
-        self.lines[cy].text.push_str(segs[0]);
-        self.lines[cy].detect_heading();
+        let tail = self.lines[cy].edit(|t| {
+            let tail = t.split_off(cx);
+            t.push_str(segs[0]);
+            tail
+        });
         let last = segs.len() - 1;
         let mut new_lines: Vec<Line> = segs[1..last].iter().map(|s| Line::new(*s)).collect();
         let last_len = segs[last].len();
@@ -432,8 +476,8 @@ impl Buffer {
             let cur = self.lines.remove(self.cy);
             self.cy -= 1;
             self.cx = self.lines[self.cy].len();
-            self.lines[self.cy].text.push_str(&cur.text);
-            self.lines[self.cy].detect_heading();
+            let cy = self.cy;
+            self.lines[cy].edit(|t| t.push_str(&cur.text));
             self.update_folding();
         }
     }
@@ -448,8 +492,8 @@ impl Buffer {
             self.lines[self.cy].delete_range(cx, end);
         } else if self.cy + 1 < self.lines.len() {
             let next = self.lines.remove(self.cy + 1);
-            self.lines[self.cy].text.push_str(&next.text);
-            self.lines[self.cy].detect_heading();
+            let cy = self.cy;
+            self.lines[cy].edit(|t| t.push_str(&next.text));
             self.update_folding();
         }
     }
@@ -610,7 +654,7 @@ mod tests {
         Buffer::from_content(s)
     }
     fn texts(b: &Buffer) -> Vec<&str> {
-        b.lines.iter().map(|l| l.text.as_str()).collect()
+        b.lines.iter().map(|l| &*l.text).collect()
     }
 
     #[test]

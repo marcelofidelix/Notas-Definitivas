@@ -410,7 +410,7 @@ impl App {
 
     fn delete_current_line(&mut self) {
         let Some(b) = self.buf() else { return };
-        let text = b.cur().text.clone();
+        let text = b.cur().text.to_string();
         self.set_yank(text, true);
         self.with_buf(|b| b.save_undo());
         self.edit(|b| {
@@ -436,9 +436,11 @@ impl App {
                 self.edit(|b| {
                     let (cy, cx) = (b.cy, b.cx);
                     let end = next_char_end(&b.lines[cy].text, cx);
-                    let rest = b.lines[cy].text.split_off(end);
-                    b.lines[cy].text.truncate(cx);
-                    b.lines[cy].detect_heading();
+                    let rest = b.lines[cy].edit(|t| {
+                        let rest = t.split_off(end);
+                        t.truncate(cx);
+                        rest
+                    });
                     b.insert_line(cy + 1, &rest);
                     b.cy += 1;
                     b.cx = 0;
@@ -451,8 +453,7 @@ impl App {
                     let (cy, cx) = (b.cy, b.cx);
                     let end = next_char_end(&b.lines[cy].text, cx);
                     let mut s = [0u8; 4];
-                    b.lines[cy].text.replace_range(cx..end, c.encode_utf8(&mut s));
-                    b.lines[cy].detect_heading();
+                    b.lines[cy].edit(|t| t.replace_range(cx..end, c.encode_utf8(&mut s)));
                 });
                 self.set_status("-- MODO NORMAL --");
             }
@@ -706,13 +707,7 @@ impl App {
             Key::Char('C') => {
                 self.close_all_tabs();
             }
-            Key::Char('y' | 'Y') => match self.selected_note().map(|n| n.title.clone()) {
-                Some(title) => {
-                    crate::clip::copy(&title);
-                    self.set_status(format!("Nome copiado p/ clipboard: {} (use [[{}]])", title, title));
-                }
-                None => self.set_status("Nenhuma nota selecionada para copiar."),
-            },
+            Key::Char('y' | 'Y') => self.copy_note_link(),
             Key::Char('d') => {
                 if self.selected_note().is_some() {
                     self.mode = Mode::ConfirmDelete;
@@ -1220,7 +1215,7 @@ impl App {
                     self.mode = Mode::Normal;
                     self.with_buf(|b| b.has_selection = false);
                     self.set_status("Texto selecionado copiado para a área de transferência! (y)");
-                } else if let Some(t) = self.buf().map(|b| b.cur().text.clone()) {
+                } else if let Some(t) = self.buf().map(|b| b.cur().text.to_string()) {
                     self.set_yank(t, true);
                     self.set_status("1 linha copiada para a área de transferência (y)");
                 }

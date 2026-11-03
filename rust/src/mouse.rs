@@ -238,6 +238,8 @@ impl App {
                 }
                 None => self.set_status("Nenhuma nota aberta para renomear."),
             }
+        } else if within(col, h.btn_link) {
+            self.copy_note_link();
         } else if within(col, h.btn_delete) {
             if self.selected_note().is_some() {
                 self.mode = Mode::ConfirmDelete;

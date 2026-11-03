@@ -204,7 +204,19 @@ fn fold_char(c: char) -> char {
 
 /// Minusculas e sem acentos, para busca insensivel a maiusculas e diacriticos.
 pub fn normalize_text(s: &str) -> String {
-    s.chars().map(fold_char).collect()
+    let mut out = String::with_capacity(s.len());
+    normalize_into(&mut out, s);
+    out
+}
+
+/// Como `normalize_text`, acrescentando a `out`. O texto ASCII (a grande maioria)
+/// e convertido por bytes, sem decodificar caractere a caractere.
+pub fn normalize_into(out: &mut String, s: &str) {
+    if s.is_ascii() {
+        out.extend(s.bytes().map(|b| b.to_ascii_lowercase() as char));
+        return;
+    }
+    out.extend(s.chars().map(|c| if c.is_ascii() { c.to_ascii_lowercase() } else { fold_char(c) }));
 }
 
 /// Remove bytes de controle (C0, DEL e C1 U+0080..U+009F) de texto de origem

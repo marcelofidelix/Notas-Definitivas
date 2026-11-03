@@ -42,6 +42,10 @@ impl App {
             "w" => {
                 self.save_current();
             }
+            "w!" => {
+                self.save_current_ex(true);
+            }
+            "e!" | "reload" => self.reload_current(),
             "autosave" => self.set_status("Autosave: ATIVADO (salvamento automático a cada 1 minuto de edições)"),
             "closeall" | "tabcloseall" | "ca" | "fechartudo" | "close_all" | "bdall" => {
                 self.close_all_tabs();
@@ -84,6 +88,7 @@ impl App {
                 }
             }
             "tableall" => self.table_align_all(),
+            "link" | "copylink" | "cl" => self.copy_note_link(),
             "wrapbar" | "barwrap" | "statusbar" => {
                 self.force_status_wrap = match self.force_status_wrap {
                     0 => {

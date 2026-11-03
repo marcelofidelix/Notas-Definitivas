@@ -39,7 +39,7 @@ fn table_bounds(b: &Buffer, y: usize) -> (usize, usize) {
 
 /// Realinha `start..=end`; `false` se a tabela nao puder ser alinhada.
 fn align_range(b: &mut Buffer, start: usize, end: usize) -> bool {
-    let refs: Vec<&str> = b.lines[start..=end].iter().map(|l| l.text.as_str()).collect();
+    let refs: Vec<&str> = b.lines[start..=end].iter().map(|l| &*l.text).collect();
     match table::align_table(&refs) {
         Some(new) => {
             for (i, t) in new.into_iter().enumerate() {
@@ -337,7 +337,7 @@ impl App {
         align_range(b, start, end);
         b.clamp_cursor(); // o realinhamento pode ter mudado o texto sob o cursor
         let cols = table::count_columns(&b.lines[b.cy].text);
-        let cur_text = b.lines[b.cy].text.clone();
+        let cur_text = b.lines[b.cy].text.to_string();
 
         // Proxima celula na mesma linha.
         if b.cx < cur_text.len() {
@@ -416,7 +416,7 @@ impl App {
 
     pub fn activate_link(&mut self) {
         let Some(b) = self.buf() else { return };
-        let (cx, text) = (b.cx, b.cur().text.clone());
+        let (cx, text) = (b.cx, b.cur().text.to_string());
         let found = find_links(&text).into_iter().find(|s| cx >= s.start && cx <= s.end);
         let Some(span) = found else {
             self.set_status("Nenhum link sob o cursor (Enter em [título](url) ou [[nota]])");

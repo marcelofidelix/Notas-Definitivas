@@ -1,7 +1,7 @@
 //! Quebra de linha visual (soft wrap) e mapeamento entre posicao no texto e
 //! posicao na tela. Com links/estilos ocultos, so o texto visivel ocupa colunas.
 
-use crate::doc::{Buffer, Line};
+use crate::doc::{Buffer, Line, RowMemo};
 use crate::md::{find_links, find_styles, is_table_line, LinkSpan, StyleSpan};
 use crate::text::{cp_width, str_width, width_len};
 
@@ -83,6 +83,46 @@ fn plain_single(l: &Line, lay: &Layout) -> bool {
         || is_table_line(&l.text)
 }
 
+/// Hash rapido (nao criptografico) do conteudo, para validar a memoria de layout.
+fn fast_hash(b: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = K ^ b.len() as u64;
+    let mut chunks = b.chunks_exact(8);
+    for c in &mut chunks {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K).rotate_left(31);
+    }
+    let mut last = 0u64;
+    for (i, &x) in chunks.remainder().iter().enumerate() {
+        last |= u64::from(x) << (8 * i);
+    }
+    (h ^ last).wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (h >> 29)
+}
+
+fn layout_key(lay: &Layout) -> u32 {
+    1 | ((lay.avail_w.min(1 << 20) as u32) << 4) | (u32::from(lay.hide.links) << 3) | (u32::from(lay.hide.styles) << 2)
+        | (u32::from(lay.wrap) << 1)
+}
+
+/// Numero de linhas visuais de uma linha. Linhas longas (que precisam de quebra)
+/// guardam o resultado numa memoria validada pelo hash do conteudo: sem ela,
+/// calcular a posicao do cursor refazia a quebra de TODAS as linhas anteriores
+/// a cada quadro (centenas de ms em notas grandes).
+pub fn nsegs(l: &Line, lay: &Layout) -> usize {
+    if plain_single(l, lay) {
+        return 1;
+    }
+    let (key, hash) = (layout_key(lay), fast_hash(l.text.as_bytes()));
+    let m = l.memo.get();
+    if m.n > 0 && m.key == key && m.hash == hash {
+        return m.n as usize;
+    }
+    let n = segments(l, lay).len();
+    l.memo.set(RowMemo { hash, key, n: n.min(u32::MAX as usize) as u32 });
+    n
+}
+
 /// Segmentos (linhas visuais) de uma linha do documento.
 pub fn segments(l: &Line, lay: &Layout) -> Vec<Seg> {
     let len = l.text.len();
@@ -91,7 +131,7 @@ pub fn segments(l: &Line, lay: &Layout) -> Vec<Seg> {
     }
     let max_cols = lay.avail_w.max(5);
     let sp = Spans::of(l, lay.hide);
-    let s = l.text.as_str();
+    let s: &str = &l.text;
     let b = s.as_bytes();
     let mut segs = Vec::new();
     let mut i = 0;
@@ -165,7 +205,7 @@ pub fn visual_col(l: &Line, seg_start: usize, x_in_seg: usize, hide: Hide) -> us
         return 0;
     }
     let sp = Spans::of(l, hide);
-    let s = l.text.as_str();
+    let s: &str = &l.text;
     let target = (seg_start + x_in_seg).min(s.len());
     let mut p = seg_start;
     let mut cols = 0;
@@ -210,7 +250,7 @@ pub fn byte_offset_in_seg(l: &Line, seg_start: usize, seg_len: usize, target_col
         return 0;
     }
     let sp = Spans::of(l, hide);
-    let s = l.text.as_str();
+    let s: &str = &l.text;
     let end = (seg_start + seg_len).min(s.len());
     let mut cur = 0;
     let mut p = seg_start;
@@ -269,8 +309,7 @@ impl<'a> VRowIter<'a> {
             if l.hidden {
                 continue;
             }
-            // Caminho rapido: so calcula os segmentos da linha alvo.
-            let n = if plain_single(l, &lay) { 1 } else { segments(l, &lay).len() };
+            let n = nsegs(l, &lay);
             if target_vrow < vrow + n {
                 let segs = segments(l, &lay);
                 return Some(VRowIter {
@@ -319,7 +358,7 @@ pub fn total_vrows(lines: &[Line], lay: &Layout) -> usize {
     lines
         .iter()
         .filter(|l| !l.hidden)
-        .map(|l| if plain_single(l, lay) { 1 } else { segments(l, lay).len() })
+        .map(|l| nsegs(l, lay))
         .sum()
 }
 
@@ -356,7 +395,7 @@ pub fn cursor_visual_pos(buf: &Buffer, lay: &Layout) -> (usize, usize) {
             let x_in = buf.cx.saturating_sub(seg.off).min(seg.len);
             return (vrow + cur_sub, visual_col(l, seg.off, x_in, lay.hide));
         }
-        vrow += if plain_single(l, lay) { 1 } else { segments(l, lay).len() };
+        vrow += nsegs(l, lay);
     }
     (vrow, 0)
 }

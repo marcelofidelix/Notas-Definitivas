@@ -114,31 +114,68 @@ pub fn draw(app: &mut App) -> String {
     }
     app.editor_scroll();
 
-    let (s, hit, marquee, tick) = {
+    let (rows, cursor, hit, marquee, tick) = {
         let mut f = Frame {
             app: &*app,
             th: app.theme(),
-            s: String::with_capacity(64 * 1024),
+            s: String::with_capacity(4096),
+            rows: Vec::with_capacity((app.rows.max(0) as usize) + 1),
+            cursor: String::new(),
             hit: HitMap::default(),
             marquee: false,
             tick: 0,
         };
         f.run();
-        (f.s, f.hit, f.marquee, f.tick)
+        (f.rows, f.cursor, f.hit, f.marquee, f.tick)
     };
+
+    let clear = app.clear_needed;
+    let mut out = String::with_capacity(8 * 1024);
+    out.push_str(SYNC_BEGIN);
+    if app.diff_render {
+        // Redesenho incremental: so as linhas que mudaram desde o quadro anterior
+        // (tudo, apos limpeza, redimensionamento ou no batimento de manutencao).
+        // Cada linha e autocontida e posicionada, entao pular as iguais e seguro.
+        let full = clear || app.force_full || app.prev_rows.len() != rows.len();
+        if clear {
+            out.push_str("\x1b[2J\x1b[3J");
+        }
+        out.push_str("\x1b[?25l");
+        for (i, row) in rows.iter().enumerate() {
+            if full || app.prev_rows.get(i) != Some(row) {
+                out.push_str(&format!("\x1b[{};1H\x1b[0m", i + 1));
+                out.push_str(row);
+            }
+        }
+    } else {
+        // Formato de quadro completo (usado pelos testes).
+        out.push_str(if clear { "\x1b[2J\x1b[3J\x1b[H" } else { "\x1b[H" });
+        out.push_str("\x1b[?25l");
+        out.push_str(&rows.join("\r\n"));
+    }
+    out.push_str(&cursor);
+    out.push_str(SYNC_END);
+
+    app.prev_rows = rows;
+    app.force_full = false;
     app.hit = hit;
     app.marquee_active = marquee;
     app.last_marquee_tick = tick;
     app.clear_needed = false;
     app.needs_redraw = false;
     app.last_draw = std::time::Instant::now();
-    s
+    out
 }
 
 struct Frame<'a> {
     app: &'a App,
     th: &'static Theme,
+    /// Linha em construcao.
     s: String,
+    /// Linhas ja prontas (uma por linha da tela).
+    rows: Vec<String>,
+    /// Posicionamento e formato do cursor, depois das linhas.
+    cursor: String,
     hit: HitMap,
     marquee: bool,
     tick: u128,
@@ -158,17 +195,19 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// Fecha a linha em construcao e a guarda.
+    fn end_row(&mut self) {
+        let row = self.s.clone();
+        self.s.clear();
+        self.rows.push(row);
+    }
+
     fn run(&mut self) {
         let app = self.app;
-        self.p(SYNC_BEGIN);
-        self.p(if app.clear_needed { "\x1b[2J\x1b[3J\x1b[H" } else { "\x1b[H" });
-        self.p("\x1b[?25l");
-
         let editor_rows = (app.rows - 3).max(0);
         let in_preview = app.in_preview();
         let lay = app.layout(in_preview);
-        let (lines, scroll): (&[Line], usize) = if in_preview {
-            let p = app.preview.as_ref().expect("in_preview implica previa");
+        let (lines, scroll): (&[Line], usize) = if let (true, Some(p)) = (in_preview, app.preview.as_ref()) {
             (&p.lines, p.scroll_y)
         } else if let Some(b) = app.buf() {
             (&b.lines, b.scroll_y)
@@ -191,13 +230,13 @@ impl<'a> Frame<'a> {
                 }
                 self.right_panel((r - 1) as usize, cur, lines, in_preview);
             }
-            self.p("\r\n");
+            self.end_row();
         }
-        self.status_bar();
-        self.p("\r\n");
+        self.status_bar(); // fecha as suas duas linhas
         self.command_line();
+        self.end_row();
         self.place_cursor(editor_rows);
-        self.p(SYNC_END);
+        self.cursor = std::mem::take(&mut self.s);
     }
 
     // ---- painel esquerdo ---------------------------------------------------
@@ -785,7 +824,7 @@ impl<'a> Frame<'a> {
         }
         let bul = bullet(&l.text, l.heading, l.fence, l.in_code);
 
-        let text = l.text.as_str();
+        let text: &str = &l.text;
         let end = vr.seg.off + vr.seg.len;
         let mut idx = vr.seg.off;
         let mut cols = 6;
@@ -1265,26 +1304,45 @@ impl<'a> Frame<'a> {
         };
         let rlen = str_width(&rinfo) as i32;
 
-        let compact = app.force_status_wrap == 1 || (app.force_status_wrap == 0 && app.cols < 108);
-        let c = |full: &'static str, short: &'static str| if compact { short } else { full };
-        let new_btn = c(" [➕ Nova] ", " [➕] ");
-        let ren_btn = c(" [✏️ Renomear] ", " [✏️] ");
-        let del_btn = c(" [🗑️ Excluir] ", " [🗑️] ");
-        let wrap_btn = if compact {
-            format!(" [W:{}] ", if app.wrap { "ON" } else { "OFF" })
-        } else {
-            format!(" [{}] ", if app.wrap { "Wrap:ON" } else { "Wrap:OFF" })
+        // Tres niveis de rotulo: completo, curto (texto abreviado) e so icones. No
+        // modo automatico vale o primeiro que cabe na largura da janela.
+        let labels = |level: u8| -> [String; 11] {
+            let c = |full: &str, mid: &str, short: &str| match level {
+                0 => full.to_string(),
+                1 => mid.to_string(),
+                _ => short.to_string(),
+            };
+            [
+                c(" [➕ Nova] ", " [➕ Nova] ", " [➕] "),
+                c(" [✏️ Renomear] ", " [✏️ Ren.] ", " [✏️] "),
+                c(" [🔗 Link] ", " [🔗 Link] ", " [🔗] "),
+                c(" [🗑️ Excluir] ", " [🗑️ Excl.] ", " [🗑️] "),
+                match level {
+                    0 | 1 => format!(" [{}] ", if app.wrap { "Wrap:ON" } else { "Wrap:OFF" }),
+                    _ => format!(" [W:{}] ", if app.wrap { "ON" } else { "OFF" }),
+                },
+                c(" [🔍 Buscar] ", " [🔍 Busca] ", " [🔍] "),
+                c(" [🔄 Subst] ", " [🔄 Subst] ", " [🔄] "),
+                match level {
+                    0 => format!(" [🎨 {}] ", th.name),
+                    _ => " [🎨] ".to_string(),
+                },
+                c(" [🧬 Life] ", " [🧬 Life] ", " [🧬] "),
+                c(" [⬇ Importar] ", " [⬇ Imp.] ", " [⬇] "),
+                c(" [⬆ Exportar] ", " [⬆ Exp.] ", " [⬆] "),
+            ]
         };
-        let find_btn = c(" [🔍 Buscar] ", " [🔍] ");
-        let rep_btn = c(" [🔄 Subst] ", " [🔄] ");
-        let theme_btn = if compact { " [🎨] ".to_string() } else { format!(" [🎨 {}] ", th.name) };
-        let life_btn = c(" [🧬 Life] ", " [🧬] ");
-        let imp_btn = c(" [⬇ Importar] ", " [⬇] ");
-        let exp_btn = c(" [⬆ Exportar] ", " [⬆] ");
-        let widths: Vec<i32> = [new_btn, ren_btn, del_btn, wrap_btn.as_str(), find_btn, rep_btn, theme_btn.as_str(), life_btn, imp_btn, exp_btn]
-            .iter()
-            .map(|b| str_width(b) as i32)
-            .collect();
+        let total_w = |l: &[String; 11]| l.iter().map(|b| str_width(b) as i32).sum::<i32>();
+        let level = match app.force_status_wrap {
+            1 => 2,
+            2 => 0,
+            _ => [0u8, 1, 2]
+                .into_iter()
+                .find(|&lv| total_w(&labels(lv)) <= app.cols)
+                .unwrap_or(2),
+        };
+        let btns = labels(level);
+        let widths: Vec<i32> = btns.iter().map(|b| str_width(b) as i32).collect();
         let btns_w: i32 = widths.iter().sum();
 
         // Linha 1: badge, nome da nota e posicao do cursor.
@@ -1328,7 +1386,7 @@ impl<'a> Frame<'a> {
         // Sem "\x1b[K": a linha ja preenche a largura e o apagamento comeria a
         // ultima coluna (a quebra automatica esta desligada).
         self.p(RESET);
-        self.p("\r\n");
+        self.end_row();
 
         // Linha 2: botoes centralizados.
         self.p(th.bg_select);
@@ -1348,19 +1406,21 @@ impl<'a> Frame<'a> {
             cur_col += widths[slot];
             (start, cur_col)
         };
-        self.hit.btn_new = place(self, new_btn, &[th.fg_accent, BOLD], 0);
-        self.hit.btn_rename = place(self, ren_btn, &[th.fg_white, BOLD], 1);
-        self.hit.btn_delete = place(self, del_btn, &[th.fg_warn, BOLD], 2);
-        self.hit.btn_wrap = place(self, &wrap_btn, &[th.fg_white, BOLD], 3);
-        self.hit.btn_find = place(self, find_btn, &[], 4);
-        self.hit.btn_replace = place(self, rep_btn, &[], 5);
-        self.hit.btn_theme = place(self, &theme_btn, &[], 6);
-        self.hit.btn_life = place(self, life_btn, &[th.fg_h1, BOLD], 7);
-        self.hit.btn_import = place(self, imp_btn, &[th.fg_h2, BOLD], 8);
-        self.hit.btn_export = place(self, exp_btn, &[th.fg_h2, BOLD], 9);
+        self.hit.btn_new = place(self, &btns[0], &[th.fg_accent, BOLD], 0);
+        self.hit.btn_rename = place(self, &btns[1], &[th.fg_white, BOLD], 1);
+        self.hit.btn_link = place(self, &btns[2], &[th.fg_link, BOLD], 2);
+        self.hit.btn_delete = place(self, &btns[3], &[th.fg_warn, BOLD], 3);
+        self.hit.btn_wrap = place(self, &btns[4], &[th.fg_white, BOLD], 4);
+        self.hit.btn_find = place(self, &btns[5], &[], 5);
+        self.hit.btn_replace = place(self, &btns[6], &[], 6);
+        self.hit.btn_theme = place(self, &btns[7], &[], 7);
+        self.hit.btn_life = place(self, &btns[8], &[th.fg_h1, BOLD], 8);
+        self.hit.btn_import = place(self, &btns[9], &[th.fg_h2, BOLD], 9);
+        self.hit.btn_export = place(self, &btns[10], &[th.fg_h2, BOLD], 10);
         self.pad(app.cols - cur_col + 1);
         self.p("\x1b[K");
         self.p(RESET);
+        self.end_row();
     }
 
     fn command_line(&mut self) {
@@ -1566,7 +1626,7 @@ mod tests {
         let mut a = app_with_notes();
         draw(&mut a);
         let h = &a.hit;
-        let order = [h.btn_new, h.btn_rename, h.btn_delete, h.btn_wrap, h.btn_find, h.btn_replace, h.btn_theme, h.btn_life, h.btn_import, h.btn_export];
+        let order = [h.btn_new, h.btn_rename, h.btn_link, h.btn_delete, h.btn_wrap, h.btn_find, h.btn_replace, h.btn_theme, h.btn_life, h.btn_import, h.btn_export];
         for w in order.windows(2) {
             assert_eq!(w[0].1, w[1].0, "botoes contiguos");
             assert!(w[0].0 < w[0].1);

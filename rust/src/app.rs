@@ -85,6 +85,9 @@ pub struct Tab {
     pub buf: Buffer,
     pub modified: bool,
     pub first_unsaved: Option<Instant>,
+    /// `mtime` da nota no banco quando foi carregada/gravada por ultimo. Se o
+    /// banco mudar (outra instancia, importacao), gravar por cima exige `:w!`.
+    pub loaded_mtime: i64,
 }
 
 pub struct Preview {
@@ -99,6 +102,7 @@ pub struct Preview {
 pub struct HitMap {
     pub btn_new: (i32, i32),
     pub btn_rename: (i32, i32),
+    pub btn_link: (i32, i32),
     pub btn_delete: (i32, i32),
     pub btn_wrap: (i32, i32),
     pub btn_find: (i32, i32),
@@ -152,6 +156,12 @@ pub struct App {
 
     pub status: Option<(String, Instant)>,
     pub hit: HitMap,
+    /// Linhas do ultimo quadro desenhado (base do redesenho incremental).
+    pub prev_rows: Vec<String>,
+    /// Redesenho incremental ligado (desligado nos testes, que leem quadros completos).
+    pub diff_render: bool,
+    /// Forca repintar todas as linhas no proximo quadro (sem limpar a tela).
+    pub force_full: bool,
     pub quit: bool,
 
     // Controle de redesenho e inatividade.
@@ -205,6 +215,9 @@ impl App {
             history_idx: 0,
             status: None,
             hit: HitMap::default(),
+            prev_rows: Vec::new(),
+            diff_render: !cfg!(test),
+            force_full: false,
             quit: false,
             needs_redraw: true,
             clear_needed: true,
@@ -556,6 +569,7 @@ impl App {
             buf: Buffer::from_content(&content),
             modified: false,
             first_unsaved: None,
+            loaded_mtime: key.db_id().and_then(|id| self.db.get_mtime(id)).unwrap_or(0),
         });
         self.active = Some(self.tabs.len() - 1);
         if record_history {
@@ -584,6 +598,7 @@ impl App {
                 buf: Buffer::new_empty(),
                 modified: false,
                 first_unsaved: None,
+                loaded_mtime: 0,
             });
             self.active = Some(self.tabs.len() - 1);
             self.push_history(&key);
@@ -629,7 +644,7 @@ impl App {
             return;
         }
         if self.tabs[idx].modified && !self.save_tab(idx) {
-            self.set_status("Aba nao fechada: falha ao salvar as alteracoes");
+            self.save_failed_status("Aba nao fechada: falha ao salvar as alteracoes".to_string());
             return;
         }
         self.tabs.remove(idx);
@@ -655,7 +670,7 @@ impl App {
         for i in 0..self.tabs.len() {
             if self.tabs[i].modified && !self.save_tab(i) {
                 let name = self.tabs[i].filename.clone();
-                self.set_status(format!("Nao foi possivel salvar '{}'; abas mantidas abertas", name));
+                self.save_failed_status(format!("Nao foi possivel salvar '{}'; abas mantidas abertas", name));
                 return false;
             }
         }
@@ -670,11 +685,36 @@ impl App {
 
     /// Grava a aba `idx`. Atualiza o catalogo em memoria; nao reordena a lista.
     pub fn save_tab(&mut self, idx: usize) -> bool {
+        self.save_tab_ex(idx, false)
+    }
+
+    /// Como `save_tab`; com `force` grava mesmo que a nota tenha sido alterada
+    /// por outra instancia desde que foi carregada (`:w!`).
+    pub fn save_tab_ex(&mut self, idx: usize, force: bool) -> bool {
         let Some(t) = self.tabs.get(idx) else { return false };
         let content = t.buf.to_content();
         let key = t.key.clone();
+        if let (NoteKey::Db(id), false) = (&key, force) {
+            let current = self.db.get_mtime(*id);
+            if current != Some(t.loaded_mtime) {
+                let name = t.filename.clone();
+                if current.is_none() {
+                    self.set_status(format!("⚠ \"{}\" nao existe mais no banco; use :w! para recria-la", name));
+                } else {
+                    self.set_status(format!(
+                        "⚠ \"{}\" foi alterada em outro lugar; :w! sobrescreve ou :e! recarrega",
+                        name
+                    ));
+                }
+                return false;
+            }
+        }
         if !self.write_note(&key, &content) {
             return false;
+        }
+        if let NoteKey::Db(id) = &key {
+            let m = self.db.get_mtime(*id).unwrap_or(0);
+            self.tabs[idx].loaded_mtime = m;
         }
         let now = now_secs();
         if let Some(n) = self.notes.iter_mut().find(|n| n.key == key) {
@@ -688,13 +728,18 @@ impl App {
     }
 
     pub fn save_current(&mut self) -> bool {
+        self.save_current_ex(false)
+    }
+
+    pub fn save_current_ex(&mut self, force: bool) -> bool {
         let Some(idx) = self.active else {
             self.set_status("Nenhuma nota aberta para salvar.");
             return false;
         };
         let name = self.tabs[idx].filename.clone();
-        if !self.save_tab(idx) {
-            self.set_status(format!("Erro salvando nota: {}", name));
+        if !self.save_tab_ex(idx, force) {
+            // Conflito ja explicou o motivo no status; senao, erro generico.
+            self.save_failed_status(format!("Erro salvando nota: {}", name));
             return false;
         }
         let key = self.tabs[idx].key.clone();
@@ -708,6 +753,36 @@ impl App {
         true
     }
 
+    /// `:e!` — descarta as alteracoes da aba ativa e recarrega a nota do banco.
+    pub fn reload_current(&mut self) {
+        let Some(idx) = self.active else { return };
+        let key = self.tabs[idx].key.clone();
+        let Some(content) = self.read_note(&key) else {
+            self.set_status("Nao foi possivel recarregar: a nota nao existe mais.");
+            return;
+        };
+        let mtime = key.db_id().and_then(|id| self.db.get_mtime(id)).unwrap_or(0);
+        let t = &mut self.tabs[idx];
+        let (cy, cx) = (t.buf.cy, t.buf.cx);
+        t.buf = Buffer::from_content(&content);
+        t.buf.cy = cy;
+        t.buf.cx = cx;
+        t.buf.clamp_cursor();
+        t.modified = false;
+        t.first_unsaved = None;
+        t.loaded_mtime = mtime;
+        self.clear_needed = true;
+        let name = self.tabs[idx].filename.clone();
+        self.set_status(format!("\"{}\" recarregada do banco", name));
+    }
+
+    /// Mensagem de falha ao salvar, sem esconder o motivo ("⚠ ...") ja informado.
+    fn save_failed_status(&mut self, generic: String) {
+        if !self.status_text().is_some_and(|s| s.starts_with('⚠')) {
+            self.set_status(generic);
+        }
+    }
+
     pub fn any_tab_modified(&self) -> bool {
         self.tabs.iter().any(|t| t.modified)
     }
@@ -716,7 +791,7 @@ impl App {
         for i in 0..self.tabs.len() {
             if self.tabs[i].modified && !self.save_tab(i) {
                 let name = self.tabs[i].filename.clone();
-                self.set_status(format!("Erro salvando nota: {}", name));
+                self.save_failed_status(format!("Erro salvando nota: {}", name));
                 return false;
             }
         }
@@ -730,9 +805,15 @@ impl App {
         for i in 0..self.tabs.len() {
             let due = self.tabs[i].modified
                 && self.tabs[i].first_unsaved.is_some_and(|t| t.elapsed() >= AUTOSAVE_DELAY);
-            if due && self.save_tab(i) {
-                saved += 1;
-                last = self.tabs[i].filename.clone();
+            if due {
+                if self.save_tab(i) {
+                    saved += 1;
+                    last = self.tabs[i].filename.clone();
+                } else {
+                    // Falhou (conflito, disco...): tenta de novo so em 1 minuto, em vez
+                    // de martelar o banco e a mensagem de status a cada 100 ms.
+                    self.tabs[i].first_unsaved = Some(Instant::now());
+                }
             }
         }
         if saved > 0 {
@@ -955,6 +1036,54 @@ impl App {
         }
         self.sync_preview_to_selection();
         self.set_status("Nota excluída com sucesso.");
+    }
+
+    // ---- link da nota ------------------------------------------------------
+
+    /// Nota-alvo das acoes sobre "a nota atual": a selecionada na lista (se o
+    /// foco esta nela) ou a da aba ativa.
+    pub fn target_note_key(&self) -> Option<NoteKey> {
+        if self.focus == Focus::Left {
+            self.selected_key().or_else(|| self.cur_key().cloned())
+        } else {
+            self.cur_key().cloned().or_else(|| self.selected_key())
+        }
+    }
+
+    /// Texto de link para a nota: `[[Titulo]]` (wikilink) para notas do banco e
+    /// `[nome](<caminho>)` para arquivos avulsos.
+    pub fn link_text_for(&self, key: &NoteKey) -> Option<String> {
+        match key {
+            NoteKey::Db(_) => {
+                let title = self
+                    .notes
+                    .iter()
+                    .find(|n| &n.key == key)
+                    .map(|n| n.title.clone())
+                    .or_else(|| self.tabs.iter().find(|t| &t.key == key).map(|t| t.title.clone()))?;
+                Some(format!("[[{}]]", title))
+            }
+            NoteKey::File(p) => {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                Some(format!("[{}](<{}>)", title_from_filename(&name), p.display()))
+            }
+        }
+    }
+
+    /// Copia o link da nota para a area de transferencia (e para o buffer de
+    /// yank, entao `p` tambem cola). Facilita criar links entre notas.
+    pub fn copy_note_link(&mut self) {
+        let Some(key) = self.target_note_key() else {
+            self.set_status("Nenhuma nota para copiar o link.");
+            return;
+        };
+        match self.link_text_for(&key) {
+            Some(link) => {
+                self.set_yank(link.clone(), false);
+                self.set_status(format!("🔗 Link copiado: {} (cole com p ou Ctrl+V)", link));
+            }
+            None => self.set_status("Nao foi possivel montar o link desta nota."),
+        }
     }
 
     // ---- importar / exportar ----------------------------------------------

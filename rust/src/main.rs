@@ -30,7 +30,45 @@ use crossterm::event::{self, Event};
 use crossterm::terminal;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Pedido de encerramento vindo do sistema (fechar a janela do console, logoff,
+/// desligamento): o laco principal salva tudo e sai.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// O programa terminou de salvar; o tratador pode devolver o controle ao Windows.
+static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> i32 {
+    // 0 Ctrl+C, 1 Ctrl+Break, 2 fechar janela, 5 logoff, 6 desligamento.
+    if matches!(ctrl, 0 | 1 | 2 | 5 | 6) {
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        // O Windows encerra o processo quando o tratador retorna: espera (ate ~4 s)
+        // o laco principal gravar as notas pendentes.
+        for _ in 0..200 {
+            if SHUTDOWN_DONE.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn install_shutdown_handler() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: registra uma funcao `extern "system"` valida durante todo o processo.
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn install_shutdown_handler() {}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -151,7 +189,13 @@ fn should_draw(app: &mut App) -> bool {
         }
         return false;
     }
-    app.last_draw.elapsed() >= app::IDLE_HEARTBEAT
+    if app.last_draw.elapsed() >= app::IDLE_HEARTBEAT {
+        // Batimento: repinta tudo (sem limpar) para corrigir qualquer sujeira que
+        // o terminal tenha deixado e manter "5m", "2h" atualizados.
+        app.force_full = true;
+        return true;
+    }
+    false
 }
 
 fn run(app: &mut App) {
@@ -186,6 +230,11 @@ fn run(app: &mut App) {
             }
             Ok(false) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            app.emergency_save();
+            app.quit = true;
+            return;
         }
         app.check_autosave();
         if app.last_activity.elapsed() >= app::IDLE_LIFE {
@@ -228,6 +277,7 @@ fn main() {
         }
     };
 
+    install_shutdown_handler();
     let guard = match TerminalGuard::new() {
         Ok(g) => g,
         Err(e) => {
@@ -251,6 +301,7 @@ fn main() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut app)));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.emergency_save()));
     drop(guard);
+    SHUTDOWN_DONE.store(true, Ordering::SeqCst);
     if result.is_err() {
         eprintln!("Erro interno inesperado; as alteracoes pendentes foram salvas.");
         std::process::exit(2);

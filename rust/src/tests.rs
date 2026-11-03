@@ -76,7 +76,7 @@ fn db_text(a: &App, title: &str) -> String {
 }
 
 fn lines(a: &App) -> Vec<String> {
-    a.buf().unwrap().lines.iter().map(|l| l.text.clone()).collect()
+    a.buf().unwrap().lines.iter().map(|l| l.text.to_string()).collect()
 }
 
 fn visible(frame: &str) -> String {
@@ -543,6 +543,72 @@ fn rename_and_autosave_bookkeeping() {
     assert!(db_text(&a, "A").starts_with("x# A") || db_text(&a, "A").contains('x'));
 }
 
+// ---- medicoes (cargo test --release bench_ -- --ignored --nocapture) -----------
+
+fn big_body(lines: usize) -> String {
+    let mut s = String::from("# Grande\n");
+    for i in 0..lines {
+        s.push_str(&format!(
+            "- linha {i} com texto suficiente para ocupar bastante a tela, **negrito**, *italico* e [l](http://x/{i}) ação 日本語\n"
+        ));
+    }
+    s
+}
+
+#[test]
+#[ignore]
+fn bench_frame_and_typing() {
+    let mut a = app_with(&[("Grande", &big_body(20_000))]);
+    open(&mut a, "Grande");
+    keys(&mut a, "10000G");
+    let t = std::time::Instant::now();
+    let mut bytes = 0;
+    for _ in 0..200 {
+        a.needs_redraw = true;
+        bytes += draw(&mut a).len();
+    }
+    eprintln!("quadro 120x30: {:.0} us, {} bytes/quadro", t.elapsed().as_micros() as f64 / 200.0, bytes / 200);
+    keys(&mut a, "i");
+    let t = std::time::Instant::now();
+    for i in 0..500 {
+        a.on_key(Key::Char(if i % 2 == 0 { 'a' } else { 'b' }));
+        let _ = draw(&mut a);
+    }
+    eprintln!("tecla+quadro (digitar, 20k linhas): {:.0} us", t.elapsed().as_micros() as f64 / 500.0);
+    let t = std::time::Instant::now();
+    for _ in 0..100 {
+        a.on_key(Key::Enter);
+    }
+    eprintln!("Enter (snapshot de undo, 20k linhas): {:.0} us", t.elapsed().as_micros() as f64 / 100.0);
+}
+
+#[test]
+#[ignore]
+fn bench_startup_with_many_notes() {
+    let db = Db::open_memory();
+    let body = "# Nota\n".to_string() + &"texto de exemplo com palavras variadas para indexar. ".repeat(200);
+    for i in 0..2_000 {
+        db.insert_note(&format!("Nota {i}"), &body, 1_000 + i, 0).unwrap();
+    }
+    let t = std::time::Instant::now();
+    let a = App::new(db);
+    eprintln!("App::new com {} notas de {} KB: {} ms", a.notes.len(), body.len() / 1024, t.elapsed().as_millis());
+}
+
+#[test]
+#[ignore]
+fn bench_undo_memory_growth() {
+    let mut a = app_with(&[("Grande", &big_body(20_000))]);
+    open(&mut a, "Grande");
+    let before = crate::doc::approx_undo_bytes(a.buf().unwrap());
+    keys(&mut a, "i");
+    for _ in 0..150 {
+        a.on_key(Key::Enter);
+    }
+    let after = crate::doc::approx_undo_bytes(a.buf().unwrap());
+    eprintln!("memoria do historico de undo: {} KB -> {} MB", before / 1024, after / (1024 * 1024));
+}
+
 // ---- fuzz deterministico -----------------------------------------------------
 
 struct Xs(u64);
@@ -588,6 +654,7 @@ fn fuzz(seed: u64, steps: usize) {
         + "\n";
     let mut a = app_with(&[("Fuzz", &body), ("Outra", "# Outra\n\ncorpo\n"), ("Terceira", "x\n")]);
     open(&mut a, "Fuzz");
+    a.diff_render = true; // caminho de producao
     let mut rng = Xs(seed | 1);
     let chars: Vec<char> = "abc xyz日本😀ç*[]()#|-:`\"'./\\0123$%&~gGdyYpPuvVrRxXwbhjklaAiIoOnNzmM!".chars().collect();
     let specials = [
@@ -598,7 +665,7 @@ fn fuzz(seed: u64, steps: usize) {
     let cmds = [
         ":w<CR>", ":wrap<CR>", ":zM<CR>", ":zR<CR>", ":table<CR>", ":tableall<CR>", ":nextlink<CR>", ":5<CR>",
         ":%s/a/b/g<CR>", ":s/x/yy<CR>", ":theme<CR>", ":filter 2<CR>", ":filter<CR>", ":atencao 3<CR>", ":rename Zzz<CR>",
-        ":tabnext<CR>", ":rescan<CR>", ":/texto<CR>", ":e Fuzz2<CR>", ":nowrap<CR>", ":set wrap<CR>", ":wrapbar<CR>",
+        ":tabnext<CR>", ":rescan<CR>", ":w!<CR>", ":e!<CR>", ":link<CR>", ":nextlink<CR>", ":/texto<CR>", ":e Fuzz2<CR>", ":nowrap<CR>", ":set wrap<CR>", ":wrapbar<CR>",
     ];
     let mut log: Vec<String> = Vec::new();
     for step in 0..steps {
@@ -633,10 +700,9 @@ fn fuzz(seed: u64, steps: usize) {
                 let btn = *rng.pick(&[Btn::Left, Btn::Left, Btn::Drag, Btn::WheelUp, Btn::WheelDown, Btn::Middle]);
                 let (col, row) = ((rng.next() % 130) as i32, (rng.next() % 34) as i32);
                 let released = rng.next() % 3 == 0;
-                // Cliques nos botoes [Importar]/[Exportar]/[Life] abririam prompts ou
-                // bloqueariam o teste; o resto do mouse e exercitado normalmente.
-                let on_btn_row = row == a.rows - 1;
-                if !on_btn_row {
+                // So o botao [Life] fica de fora: ele bloquearia o teste esperando uma tecla.
+                let on_life = row == a.rows - 1 && col >= a.hit.btn_life.0 && col < a.hit.btn_life.1;
+                if !on_life {
                     log.push(format!("mouse {btn:?} {col},{row} rel={released}"));
                     a.on_mouse(Mouse { btn, col, row, released });
                 }
@@ -725,6 +791,237 @@ fn seed_demo_db() {
         let id = db.insert_note(name, content, *mt, *att).unwrap();
         assert!(id > 0);
     }
+}
+
+/// Numeros (1-based) das linhas da tela repintadas por um quadro incremental.
+fn emitted_rows(out: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    for (i, _) in out.match_indices(";1H\x1b[0m") {
+        let head = &out[..i];
+        let digits: String = head.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            if head[..head.len() - digits.len()].ends_with("\x1b[") {
+                v.push(n);
+            }
+        }
+    }
+    v
+}
+
+#[test]
+fn incremental_render_repaints_exactly_the_changed_rows() {
+    let body = "# Titulo\n\nTexto **negrito** e [[Outra]] ação 日本語.\n- item\n\n|a|b|\n|-|-|\n|ç|d|\n";
+    let mut a = app_with(&[("Alfa", body), ("Outra", "# Outra\ncorpo\n")]);
+    a.diff_render = true;
+    open(&mut a, "Alfa");
+    let first = draw(&mut a);
+    assert_eq!(emitted_rows(&first).len() as i32, a.rows, "o primeiro quadro pinta tudo");
+
+    let mut rng = Xs(0xC0FFEE);
+    let keys_pool = ["i", "x", "ab ", "<CR>", "<BS>", "<Esc>", "j", "k", "v", "V", "<Down>", "<Up>", "u", "<C-t>", "dd", "G", "gg", "zM", "zR", ":wrap<CR>"];
+    for step in 0..400 {
+        let old = a.prev_rows.clone();
+        let k = *rng.pick(&keys_pool);
+        if k == "<CR>" && !matches!(a.mode, Mode::Insert) {
+            continue; // evita abrir links reais
+        }
+        keys(&mut a, k);
+        if step % 50 == 0 {
+            a.cols = 80 + (rng.next() % 60) as i32;
+            a.clear_needed = true;
+        }
+        let out = draw(&mut a);
+        let new = a.prev_rows.clone();
+        let em: std::collections::HashSet<usize> = emitted_rows(&out).into_iter().collect();
+        if old.len() == new.len() {
+            for i in 0..new.len() {
+                if old[i] != new[i] {
+                    assert!(em.contains(&(i + 1)), "passo {step} ({k:?}): linha {} mudou e nao foi repintada", i + 1);
+                }
+            }
+            if em.len() < new.len() {
+                for &r in &em {
+                    assert!(old[r - 1] != new[r - 1], "passo {step}: linha {r} repintada sem mudar");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn incremental_render_sends_far_fewer_bytes_for_a_keystroke() {
+    let mut a = app_with(&[("Alfa", &big_body(500))]);
+    a.diff_render = true;
+    open(&mut a, "Alfa");
+    let full = draw(&mut a).len();
+    keys(&mut a, "i");
+    let _ = draw(&mut a);
+    a.on_key(Key::Char('x'));
+    let typed = draw(&mut a).len();
+    eprintln!("quadro completo: {full} bytes; uma tecla: {typed} bytes");
+    assert!(typed * 5 < full, "uma tecla deveria custar < 20% de um quadro completo ({typed} vs {full})");
+    // Sem nada novo, nem as linhas sao reenviadas (so o cursor).
+    let idle = draw(&mut a).len();
+    assert!(idle < 300, "quadro ocioso: {idle} bytes");
+}
+
+#[test]
+fn heartbeat_and_resize_force_a_full_repaint() {
+    let mut a = app_with(&[("Alfa", "x\n")]);
+    a.diff_render = true;
+    open(&mut a, "Alfa");
+    let _ = draw(&mut a);
+    a.force_full = true;
+    assert_eq!(emitted_rows(&draw(&mut a)).len() as i32, a.rows);
+    a.rows += 2;
+    a.clear_needed = true;
+    let out = draw(&mut a);
+    assert!(out.contains("\x1b[2J") && emitted_rows(&out).len() as i32 == a.rows);
+}
+
+#[test]
+fn saving_never_silently_overwrites_changes_made_elsewhere() {
+    let mut a = app_with(&[("Nota", "original\n")]);
+    open(&mut a, "Nota");
+    keys(&mut a, "A minha edicao<Esc>");
+    // Outra instancia (ou importacao) grava a mesma nota enquanto ela esta aberta.
+    let id = a.notes[0].key.db_id().unwrap();
+    assert!(a.db.update_content(id, "versao da outra instancia\n", crate::db::now_secs() + 10));
+
+    keys(&mut a, ":w<CR>");
+    assert!(a.tab().unwrap().modified, "nada foi gravado");
+    assert_eq!(a.db.get_content(id).unwrap(), "versao da outra instancia\n", "o trabalho alheio foi preservado");
+    assert!(a.status_text().unwrap().contains("alterada em outro lugar"), "{:?}", a.status_text());
+
+    // :q e fechar a aba tambem recusam, mantendo o aviso do motivo.
+    keys(&mut a, ":q<CR>");
+    assert!(!a.quit);
+    keys(&mut a, "c");
+    assert_eq!(a.tabs.len(), 1, "a aba nao fecha enquanto nao for salva");
+    assert!(a.status_text().unwrap().starts_with('⚠'));
+
+    // :w! sobrescreve de proposito.
+    keys(&mut a, ":w!<CR>");
+    assert!(!a.tab().unwrap().modified);
+    assert!(a.db.get_content(id).unwrap().contains("minha edicao"));
+    keys(&mut a, "ix<Esc>:w<CR>");
+    assert!(!a.tab().unwrap().modified, "depois de gravar, o proximo :w funciona normalmente");
+}
+
+#[test]
+fn reload_discards_edits_and_picks_up_the_other_version() {
+    let mut a = app_with(&[("Nota", "original\n")]);
+    open(&mut a, "Nota");
+    keys(&mut a, "Aruido<Esc>");
+    let id = a.notes[0].key.db_id().unwrap();
+    a.db.update_content(id, "nova versao\n", crate::db::now_secs() + 5);
+    keys(&mut a, ":e!<CR>");
+    assert_eq!(lines(&a), ["nova versao"]);
+    assert!(!a.tab().unwrap().modified);
+    keys(&mut a, "A!<Esc>:w<CR>");
+    assert!(db_text(&a, "Nota").starts_with("nova versao!"));
+}
+
+#[test]
+fn failed_autosave_backs_off_instead_of_retrying_every_tick() {
+    let mut a = app_with(&[("Nota", "x\n")]);
+    open(&mut a, "Nota");
+    keys(&mut a, "iabc<Esc>");
+    let id = a.notes[0].key.db_id().unwrap();
+    a.db.update_content(id, "outra\n", crate::db::now_secs() + 3);
+    a.tab_mut().unwrap().first_unsaved = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+    a.check_autosave();
+    assert!(a.tab().unwrap().modified, "conflito: nao grava");
+    let t = a.tab().unwrap().first_unsaved.unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "o relogio do autosave reinicia");
+    a.status = None;
+    a.check_autosave();
+    assert!(a.status_text().is_none(), "sem nova tentativa (nem nova mensagem) ate o proximo minuto");
+}
+
+#[test]
+fn link_button_command_and_key_copy_the_wikilink() {
+    let mut a = app_with(&[("Alfa", "# Alfa\n"), ("Beta Nota", "# Beta\n")]);
+    // Foco na lista: copia a nota SELECIONADA.
+    a.focus = Focus::Left;
+    a.selected = a.filtered.iter().position(|&i| a.notes[i].title == "Beta Nota").unwrap();
+    keys(&mut a, "y");
+    assert_eq!(a.yank, "[[Beta Nota]]");
+    assert!(a.status_text().unwrap().contains("[[Beta Nota]]"));
+    // Foco no editor: copia a nota da ABA ativa.
+    open(&mut a, "Alfa");
+    keys(&mut a, ":link<CR>");
+    assert_eq!(a.yank, "[[Alfa]]");
+    // O texto copiado funciona como link: o cursor sobre ele abre a nota.
+    open(&mut a, "Beta Nota");
+    keys(&mut a, "Go<Esc>");
+    a.paste_normal(); // cola o yank interno ([[Alfa]])
+    keys(&mut a, "0<CR>");
+    assert_eq!(a.tab().unwrap().title, "Alfa", "o link copiado abre a nota");
+
+    // Clique no botao [🔗 Link].
+    a.yank.clear();
+    draw(&mut a);
+    let (s, e) = a.hit.btn_link;
+    assert!(s > 0 && e > s, "botao desenhado");
+    let rows = a.rows;
+    a.last_theme_click = None;
+    click(&mut a, s + 2, rows - 1);
+    assert_eq!(a.yank, "[[Alfa]]");
+}
+
+#[test]
+fn link_for_standalone_file_uses_markdown_link_with_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("minha nota.md");
+    std::fs::write(&p, "oi\n").unwrap();
+    let mut a = new_app();
+    a.open_path_arg(p.clone());
+    keys(&mut a, ":copylink<CR>");
+    assert_eq!(a.yank, format!("[minha nota](<{}>)", p.display()));
+    let spans = crate::md::find_links(&a.yank);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].target, p.display().to_string(), "o alvo e o caminho completo");
+}
+
+#[test]
+fn link_without_any_note_is_harmless() {
+    let mut a = new_app();
+    keys(&mut a, ":link<CR>");
+    assert!(a.yank.is_empty());
+    assert!(a.status_text().unwrap().contains("Nenhuma nota"));
+}
+
+#[test]
+fn all_buttons_fit_the_window_when_possible() {
+    let mut a = app_with(&[("A", "x\n")]);
+    for cols in [70, 80, 100, 120, 160, 200] {
+        a.cols = cols;
+        a.rows = 24;
+        draw(&mut a);
+        let h = &a.hit;
+        let last = h.btn_export.1;
+        assert!(last <= cols + 1, "{cols} colunas: botao [Exportar] termina em {last}");
+        assert!(h.btn_link.0 >= 1);
+    }
+    a.cols = 200;
+    let v = visible(&draw(&mut a));
+    assert!(v.contains("[🔗 Link]") && v.contains("[⬆ Exportar]"), "rotulos completos em janela larga");
+}
+
+#[test]
+fn button_labels_adapt_in_three_levels() {
+    let mut a = app_with(&[("A", "x\n")]);
+    a.rows = 24;
+    a.cols = 200;
+    let wide = visible(&draw(&mut a));
+    assert!(wide.contains("[🔗 Link]") && wide.contains("[⬆ Exportar]") && wide.contains("Tokyo Night"));
+    a.cols = 120;
+    let mid = visible(&draw(&mut a));
+    assert!(mid.contains("[🔗 Link]") && mid.contains("[⬆ Exp.]") && !mid.contains("Exportar"), "{mid}");
+    a.cols = 80;
+    let small = visible(&draw(&mut a));
+    assert!(small.contains("[🔗]") && !small.contains("Link") && small.contains("[W:ON]"));
 }
 
 #[test]

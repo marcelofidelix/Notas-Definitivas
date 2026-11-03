@@ -176,6 +176,15 @@ impl Db {
             .is_ok()
     }
 
+    /// Data de modificacao gravada (usada para detectar alteracao por outra instancia).
+    pub fn get_mtime(&self, id: i64) -> Option<i64> {
+        self.conn
+            .prepare_cached("SELECT mtime FROM notes WHERE id=?1;")
+            .and_then(|mut st| st.query_row([id], |r| r.get(0)).optional())
+            .ok()
+            .flatten()
+    }
+
     pub fn get_name(&self, id: i64) -> Option<String> {
         self.conn
             .prepare_cached("SELECT name FROM notes WHERE id=?1;")

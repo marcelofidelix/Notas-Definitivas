@@ -50,6 +50,41 @@ Tudo o que está no [README principal](../README.md) existe aqui: edição modal
 - **Detalhes de edição:** `$` vai ao último caractere (como no Vim); `r`, `dd`, `gg`, `za`… são comandos de várias teclas não bloqueantes; busca lateral com edição completa (`←`, `→`, `Home`, `End`, `Ctrl+←/→`); `PageUp`/`PageDown`; tabelas sem limite de 128 linhas (continuam recusando > 32 colunas, sem perder dados); lista lateral e rolagem com a mesma altura.
 - **Falhas de gravação nunca perdem dados:** gravação atômica (`tmp` + `fsync` + `rename`), `COMMIT`/`ROLLBACK` verificados, fechar/sair salva tudo antes, e um pânico inesperado dispara salvamento de emergência.
 
+## 🔗 Copiar o link da nota
+
+O botão **`[🔗 Link]`** (barra de botões), o comando **`:link`** (`:copylink`, `:cl`) e a tecla **`y`** na lista lateral copiam o link da nota para a área de transferência — e também para o registrador interno, então `p`/`Ctrl+V` colam na hora:
+
+- nota do banco → `[[Título da Nota]]` (wikilink; `Enter` sobre ele abre a nota);
+- arquivo avulso (`notas arquivo.md`) → `[nome](<caminho completo>)`.
+
+Vale a nota **selecionada na lista** (se o foco está nela) ou a da **aba ativa**. A barra de botões escolhe sozinha entre rótulos completos, curtos e só ícones conforme a largura da janela (11 botões sempre visíveis).
+
+## ⚡ Revisão de desempenho e robustez
+
+A revisão começou **medindo** (nota de 20 mil linhas longas, cursor no meio; `cargo test --release bench_ -- --ignored --nocapture`):
+
+| Item | Antes | Depois |
+| :-- | --: | --: |
+| Quadro 120×30 | 234 ms | ~3 ms |
+| Tecla digitada + quadro | 188 ms | ~3 ms |
+| `Enter` (ponto de desfazer) | 4 ms | 0,5 ms |
+| Memória de 100 níveis de desfazer | 358 MB | 75 MB (teto de 2 mi de linhas) |
+| Bytes por tecla no terminal | 34 KB | ~1,3 KB |
+| Início com 2.000 notas de 10 KB | 349 ms | ~80–110 ms |
+
+O que foi feito:
+
+- **Posição do cursor sem refazer a quebra de todas as linhas** — o número de linhas visuais de cada linha é memorizado (validado por hash do conteúdo, correto para qualquer forma de edição). Era o gargalo dos 234 ms.
+- **Texto das linhas compartilhado (`Rc<str>`)** entre os snapshots de desfazer: copiar o documento custa um contador por linha, não o texto.
+- **Redesenho incremental:** só as linhas da tela que mudaram são enviadas (ótimo em SSH); o batimento de 30 s, o redimensionamento e a limpeza repintam tudo. Testado: nenhuma linha alterada é omitida, nenhuma igual é reenviada.
+- **Índice de busca:** normalização ASCII por bytes e sem cópia intermediária.
+- **Linhas gigantes** (> 20 mil bytes) são tratadas como texto simples (sem varrer links/estilos a cada quadro).
+- **Nunca sobrescrever trabalho alheio:** cada aba guarda o `mtime` que carregou; se outra instância (ou uma importação) alterou a nota, `:w`, o autosave e o fechamento **recusam** com aviso. `:w!` sobrescreve de propósito e `:e!` recarrega do banco.
+- **Autosave que falha não entra em laço** (antes repetiria a cada 100 ms): tenta de novo em 1 minuto.
+- **Fechar a janela do console (Windows)** salva as notas pendentes antes de sair (logoff/desligamento também).
+
+Oportunidades ainda abertas (não feitas, por serem maiores ou não testáveis aqui): indexar a busca em segundo plano para bancos com dezenas de milhares de notas; tratar `SIGTERM`/`SIGHUP` no Linux/macOS (o tratador de encerramento atual é só Windows); reduzir o tamanho de `Line`.
+
 ## Arquitetura (`src/`)
 
 | Módulo | Responsabilidade |
