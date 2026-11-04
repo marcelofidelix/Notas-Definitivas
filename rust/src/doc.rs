@@ -495,6 +495,31 @@ impl Buffer {
         self.update_folding();
     }
 
+    /// Cola um registro copiado por linha inteira: cada linha do texto entra como
+    /// linha completa, abaixo (`below`) ou acima da linha do cursor — como o `p` e
+    /// o `P` do Vim. Sem linha abaixo, a nova e criada no fim do texto. O cursor
+    /// fica no primeiro caractere da primeira linha colada. Devolve quantas
+    /// linhas entraram.
+    pub fn paste_lines(&mut self, text: &str, below: bool) -> usize {
+        self.clamp_cursor();
+        let mut segs = split_any_newline(text);
+        if segs.last().is_some_and(|s| s.is_empty()) {
+            // A quebra final apenas fecha a ultima linha; nao cria outra vazia.
+            segs.pop();
+        }
+        if segs.is_empty() {
+            segs.push("");
+        }
+        let at = if below { (self.cy + 1).min(self.lines.len()) } else { self.cy };
+        let count = segs.len();
+        self.lines.splice(at..at, segs.into_iter().map(Line::new));
+        self.cy = at;
+        let first = &self.lines[at].text;
+        self.cx = first.len() - first.trim_start_matches([' ', '\t']).len();
+        self.update_folding();
+        count
+    }
+
     /// Backspace no modo insercao.
     pub fn backspace(&mut self) {
         self.clamp_cursor();
@@ -825,6 +850,53 @@ mod tests {
         assert_eq!(b.undo_depth(), 2, "salto de posicao abre novo passo");
         b.save_undo_for_typing(1, 0, 1);
         assert_eq!(b.undo_depth(), 3, "troca de linha abre novo passo");
+    }
+
+    #[test]
+    fn paste_lines_goes_below_or_above_and_creates_the_last_line() {
+        // `p`: abaixo da linha do cursor.
+        let mut b = buf("a\nb\nc");
+        b.cy = 1;
+        assert_eq!(b.paste_lines("X\n", true), 1);
+        assert_eq!(texts(&b), ["a", "b", "X", "c"]);
+        assert_eq!((b.cy, b.cx), (2, 0), "cursor na linha colada");
+
+        // `P`: acima da linha do cursor.
+        let mut b = buf("a\nb\nc");
+        b.cy = 1;
+        assert_eq!(b.paste_lines("X\n", false), 1);
+        assert_eq!(texts(&b), ["a", "X", "b", "c"]);
+        assert_eq!((b.cy, b.cx), (1, 0));
+
+        // Varias linhas entram na ordem, como um bloco.
+        let mut b = buf("a\nb");
+        b.cy = 0;
+        assert_eq!(b.paste_lines("X\nY\n", true), 2);
+        assert_eq!(texts(&b), ["a", "X", "Y", "b"]);
+        assert_eq!((b.cy, b.cx), (1, 0));
+
+        // Sem linha abaixo, a linha nova e criada no fim.
+        let mut b = buf("a\nb");
+        b.cy = 1;
+        assert_eq!(b.paste_lines("X\n", true), 1);
+        assert_eq!(texts(&b), ["a", "b", "X"]);
+        assert_eq!(b.cy, 2);
+        let mut b = buf("unica");
+        assert_eq!(b.paste_lines("X\nY\n", true), 2);
+        assert_eq!(texts(&b), ["unica", "X", "Y"]);
+
+        // O cursor fica no primeiro caractere nao branco da linha colada.
+        let mut b = buf("a\nb");
+        b.cy = 0;
+        b.paste_lines("\t  - item\n", true);
+        assert_eq!(texts(&b), ["a", "\t  - item", "b"]);
+        assert_eq!(b.cx, 3);
+
+        // Registro com linha vazia continua sendo uma linha.
+        let mut b = buf("a\nb");
+        b.cy = 0;
+        assert_eq!(b.paste_lines("\n", true), 1);
+        assert_eq!(texts(&b), ["a", "", "b"]);
     }
 
     #[test]

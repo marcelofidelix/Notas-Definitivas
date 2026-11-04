@@ -1234,7 +1234,8 @@ impl App {
                 if has_sel {
                     self.paste_replace_selection();
                 } else {
-                    self.paste_normal_n(n);
+                    // Como no Vim: `p` desce a colagem de linha inteira, `P` sobe.
+                    self.paste_normal_n(n, matches!(key, Key::Char('p')));
                 }
             }
             Key::Char('u') => self.repeat_undo(n, false),

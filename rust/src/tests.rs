@@ -222,6 +222,51 @@ fn bracketed_paste_is_atomic_and_never_runs_as_commands() {
 }
 
 #[test]
+fn line_wise_paste_goes_below_the_current_line() {
+    let mut a = app_with(&[("D", "AAA\nBBB\nCCC")]);
+    open(&mut a, "D");
+    keys(&mut a, "y"); // copia "AAA" (linha inteira)
+    keys(&mut a, "j"); // cursor em "BBB"
+    keys(&mut a, "p");
+    assert_eq!(lines(&a), ["AAA", "BBB", "AAA", "CCC"], "p cola abaixo da atual");
+    assert_eq!(a.buf().unwrap().cy, 2, "cursor na linha colada");
+    assert!(a.status_text().unwrap_or("").contains("abaixo"), "{:?}", a.status_text());
+
+    keys(&mut a, "u");
+    assert_eq!(lines(&a), ["AAA", "BBB", "CCC"]);
+
+    // `P` continua colando acima.
+    keys(&mut a, "ggj");
+    keys(&mut a, "P");
+    assert_eq!(lines(&a), ["AAA", "AAA", "BBB", "CCC"], "P cola acima");
+    keys(&mut a, "u");
+
+    // Sem linha abaixo: a linha nova e criada no fim.
+    keys(&mut a, "G");
+    assert_eq!(a.buf().unwrap().cy, 2);
+    keys(&mut a, "y");
+    keys(&mut a, "p");
+    assert_eq!(lines(&a), ["AAA", "BBB", "CCC", "CCC"]);
+    assert_eq!(a.buf().unwrap().cy, 3, "a linha nova existe abaixo da ultima");
+    keys(&mut a, "u");
+
+    // Prefixo numerico: cada copia em sua propria linha.
+    keys(&mut a, "gg");
+    keys(&mut a, "y");
+    keys(&mut a, "2p");
+    assert_eq!(lines(&a), ["AAA", "AAA", "AAA", "BBB", "CCC"]);
+
+    // Selecao por caractere que atravessa linhas continua entrando no cursor.
+    let mut a = app_with(&[("D", "um\ndois\ntres")]);
+    open(&mut a, "D");
+    keys(&mut a, "vjy"); // "um\nd" (nao termina em quebra: nao e registro de linha)
+    assert!(!a.yank_linewise);
+    keys(&mut a, "G0");
+    keys(&mut a, "p");
+    assert_eq!(lines(&a), ["um", "dois", "um", "dtres"], "colagem por caractere e no cursor");
+}
+
+#[test]
 fn sidebar_search_filters_without_accents_and_cancels_cleanly() {
     let mut a = app_with(&[
         ("Alfa", "# Alfa\nconteudo\n"),
@@ -1084,7 +1129,7 @@ fn link_button_command_and_key_copy_the_wikilink() {
     // O texto copiado funciona como link: o cursor sobre ele abre a nota.
     open(&mut a, "Beta Nota");
     keys(&mut a, "Go<Esc>");
-    a.paste_normal_n(1); // cola o yank interno ([[Alfa]])
+    a.paste_normal_n(1, true); // cola o yank interno ([[Alfa]])
     keys(&mut a, "0<CR>");
     assert_eq!(a.tab().unwrap().title, "Alfa", "o link copiado abre a nota");
 

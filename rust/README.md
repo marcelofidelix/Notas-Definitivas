@@ -46,6 +46,7 @@ O editor Rust oferece: edição modal (Normal, Inserção, Visual caractere/linh
 - **Robustez comprovada por fuzz:** 10 milhões de teclas/cliques/redimensionamentos aleatórios sem pânico e sem violar invariantes (cursor em limite de caractere, índices válidos). O fuzz encontrou, ainda no desenvolvimento, três defeitos: fatiar string fora de um limite de caractere (nome terminando em ideograma), e cursor além do fim da linha após `:rename` e após `:tableall` (o código C também não reajusta o cursor nesses dois casos).
 - **Sem nenhuma nota aberta** (banco vazio ou todas as abas fechadas), teclas como `w`, `G`, `dd` são ignoradas com segurança (no C várias leem a linha atual sem checar se há nota aberta).
 - **Colagem sem perda:** colagem multilinha é uma operação única; texto colado nunca é executado como comando; limite de 64 MB.
+- **Linha inteira cola abaixo, como no Vim:** com registro de linha inteira (`y`, `dd`, Visual Linha), `p` insere as linhas **abaixo** da atual e `P` acima; se o cursor está na última linha, a linha nova é criada no fim. O cursor fica no primeiro caractere da primeira linha colada e o bloco inteiro é um só passo de desfazer. Seleção por caractere (mesmo atravessando linhas) continua sendo colada no cursor.
 - **Cache de busca correto após renomear** (no C o título antigo ficava no índice) e `Esc` na busca lateral **não** abre mais uma nota.
 - **Seleção sempre visível** (`v`/`V`/`Shift+Setas`): V-Line realça a linha inteira (inclusive vazias e blocos de código), `v` realça o trecho exato e a quebra de linha, e a barra de status mostra quantas linhas/caracteres serão copiados.
 - **Quebra de linha por largura real** (ideogramas/emoji = 2 colunas) e blocos de código sem duplicar linhas; recuo e TAB preservados.
@@ -101,7 +102,7 @@ No modo Normal (e no Visual), um número antes do comando o repete: `100l` anda 
 | `x` | recorta `N` caracteres (um só passo de desfazer) |
 | `dd`, `d3d`, `3d2d` | apaga `N` linhas; os dois números se multiplicam; um só passo de desfazer |
 | `y` | copia `N` linhas |
-| `p` | cola `N` cópias do registro (um só passo) |
+| `p` | cola `N` cópias do registro (um só passo); linha inteira desce abaixo da atual (`P` sobe) |
 | `u` / `Ctrl+R` | desfaz/refaz `N` passos |
 | `n` | `N`-ésima próxima ocorrência da busca |
 | `rx` | `3rx` troca `N` caracteres (se a linha não tiver `N`, nada acontece) |

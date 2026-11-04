@@ -206,16 +206,40 @@ impl App {
     }
 
     /// `p` / `P` sem selecao: cola o clipboard do sistema (ou o ultimo yank).
-    pub fn paste_normal_n(&mut self, n: usize) {
+    /// Registro copiado por linha inteira entra como linha completa — abaixo da
+    /// atual com `p` (`below`), acima com `P` —, como no Vim.
+    pub fn paste_normal_n(&mut self, n: usize, below: bool) {
         if let Some(t) = clip::paste() {
-            self.yank_linewise = t.contains('\n');
-            self.yank = t;
+            // Se o clipboard ainda tem o que nos mesmos copiamos, vale a marca
+            // exata do registro (`y`/`dd` e Visual Linha sao de linha inteira;
+            // uma selecao por caractere entre linhas nao e). So uma copia
+            // externa precisa ser classificada pelo conteudo.
+            if t != self.yank {
+                self.yank_linewise = t.contains('\n');
+                self.yank = t;
+            }
         }
         if self.yank.is_empty() {
             self.set_status("Área de transferência vazia.");
             return;
         }
         let t = self.repeated_register(n);
+        if self.yank_linewise {
+            if self.active.is_none() {
+                return;
+            }
+            if let Some(b) = self.buf_mut() {
+                b.save_undo();
+            }
+            let lines = self.edit(|b| b.paste_lines(&t, below)).unwrap_or(0);
+            self.clear_needed = true;
+            self.set_status(format!(
+                "{} linha(s) colada(s) {}",
+                lines,
+                if below { "abaixo" } else { "acima" }
+            ));
+            return;
+        }
         self.paste_text(&t);
         self.set_status("Colado da área de transferência");
     }
