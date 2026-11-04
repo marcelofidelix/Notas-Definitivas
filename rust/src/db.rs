@@ -17,6 +17,9 @@ pub struct NoteRow {
 
 pub struct Db {
     conn: Connection,
+    /// Avisos de degradacao (ex.: modo WAL indisponivel). O banco continua
+    /// utilizavel; a interface mostra o aviso no status inicial.
+    pub warnings: Vec<String>,
 }
 
 pub fn now_secs() -> i64 {
@@ -51,7 +54,10 @@ impl Db {
 
         // WAL: leitura/escrita concorrentes; se o sistema de arquivos nao
         // suportar, a SQLite mantem o journal padrao e seguimos funcionando.
-        let _ = conn.query_row("PRAGMA journal_mode=WAL;", [], |_| Ok(()));
+        let mut warnings = Vec::new();
+        if conn.query_row("PRAGMA journal_mode=WAL;", [], |_| Ok(())).is_err() {
+            warnings.push("WAL indisponivel neste sistema de arquivos".to_string());
+        }
         let _ = conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;");
 
         conn.execute_batch(
@@ -78,7 +84,7 @@ impl Db {
             conn.execute_batch("PRAGMA user_version=1;")
                 .map_err(|e| e.to_string())?;
         }
-        Ok(Db { conn })
+        Ok(Db { conn, warnings })
     }
 
     /// Banco em memoria (testes).
@@ -94,7 +100,7 @@ impl Db {
                  attention INTEGER NOT NULL DEFAULT 0);",
         )
         .unwrap();
-        Db { conn }
+        Db { conn, warnings: Vec::new() }
     }
 
     pub fn begin(&self) -> bool {

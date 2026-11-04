@@ -70,8 +70,60 @@ fn install_shutdown_handler() {
     }
 }
 
-#[cfg(not(windows))]
+/// `SIGTERM`, `SIGHUP` (queda de SSH) e `SIGQUIT` pedem encerramento: levanta a
+/// mesma flag do tratador do Windows e o laco salva as notas pendentes.
+#[cfg(unix)]
+extern "C" fn on_termination_signal(_sig: libc::c_int) {
+    // Seguro em contexto de sinal: apenas um store atomico.
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_shutdown_handler() {
+    // SAFETY: o tratador apenas escreve num AtomicBool (async-signal-safe). Se o
+    // registro falhar, o programa segue com o comportamento padrao do sistema.
+    unsafe {
+        let handler = on_termination_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
+        libc::signal(libc::SIGQUIT, handler);
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 fn install_shutdown_handler() {}
+
+/// Instala um hook de panico que registra o defeito em arquivo.
+///
+/// Sem ele a mensagem padrao do Rust e escrita com a tela alternativa ativa e
+/// desaparece quando o `TerminalGuard` restaura o terminal: o usuario ve apenas
+/// "erro interno" e nao tem o que relatar. O hook roda antes do hook padrao, que
+/// continua sendo chamado (assim `RUST_BACKTRACE` segue funcionando).
+fn install_panic_hook(log_dir: PathBuf) {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut msg = String::from("Notas Definitivas - relatorio de panico\n");
+        msg.push_str(&format!("quando   : epoch {}\n", db::now_secs()));
+        msg.push_str(&format!(
+            "local    : {}\n",
+            info.location().map_or("desconhecido".to_string(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        ));
+        let payload = info.payload();
+        let texto = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(sem mensagem)".to_string());
+        msg.push_str(&format!("mensagem : {}\n", texto));
+        msg.push_str("as notas pendentes foram salvas; rode com RUST_BACKTRACE=1 para a pilha\n---\n");
+        // Falhar aqui nao pode gerar outro panico (o processo abortaria).
+        let path = log_dir.join("notas-crash.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = std::io::Write::write_all(&mut f, msg.as_bytes());
+        }
+        default(info);
+    }));
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -202,6 +254,33 @@ fn should_draw(app: &mut App) -> bool {
     false
 }
 
+/// Espera ate o proximo prazo interno (letreiro, status, autosave, batimento e
+/// Game of Life ocioso) em vez de acordar a cada 100 ms para sempre. O teto de
+/// 500 ms mantem o tratador de encerramento do Windows responsivo: ele espera o
+/// laco salvar as notas antes de o processo ser encerrado.
+fn next_poll_timeout(app: &App) -> Duration {
+    let piso = Duration::from_millis(20);
+    let mut wait = Duration::from_millis(500);
+    if app.marquee_active {
+        wait = wait.min(Duration::from_millis(300));
+    }
+    if let Some((_, t)) = &app.status {
+        wait = wait.min(STATUS_TTL.saturating_sub(t.elapsed()).max(piso));
+    }
+    if let Some(restante) = app
+        .tabs
+        .iter()
+        .filter(|t| t.modified)
+        .filter_map(|t| t.first_unsaved)
+        .map(|t| app::AUTOSAVE_DELAY.saturating_sub(t.elapsed()))
+        .min()
+    {
+        wait = wait.min(restante.max(piso));
+    }
+    wait = wait.min(app::IDLE_HEARTBEAT.saturating_sub(app.last_draw.elapsed()).max(piso));
+    wait.min(app::IDLE_LIFE.saturating_sub(app.last_activity.elapsed()).max(piso))
+}
+
 fn run(app: &mut App) {
     while !app.quit {
         if let Ok((c, r)) = terminal::size() {
@@ -220,7 +299,7 @@ fn run(app: &mut App) {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        match event::poll(Duration::from_millis(100)) {
+        match event::poll(next_poll_timeout(app)) {
             Ok(true) => {
                 while let Ok(true) = event::poll(Duration::from_millis(0)) {
                     match event::read() {
@@ -271,7 +350,10 @@ fn main() {
     }
 
     // Como na versao em C, links relativos partem da pasta do executavel.
-    let _ = std::env::set_current_dir(exe_dir());
+    let mut warnings = Vec::new();
+    if std::env::set_current_dir(exe_dir()).is_err() {
+        warnings.push("pasta do executavel inacessivel; links relativos partem da pasta atual".to_string());
+    }
 
     let db = match db::Db::open(&db_path()) {
         Ok(d) => d,
@@ -280,8 +362,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    warnings.extend(db.warnings.iter().cloned());
 
     install_shutdown_handler();
+    install_panic_hook(db_path().parent().map(PathBuf::from).unwrap_or_else(exe_dir));
     let guard = match TerminalGuard::new() {
         Ok(g) => g,
         Err(e) => {
@@ -295,10 +379,16 @@ fn main() {
         app.open_path_arg(p);
     }
     let total = app.db.count_notes();
-    if total == 0 {
-        app.set_status("Banco SQLite vazio. Use [Nova] para criar uma nota ou [⬇] para importar seus .md");
+    let resumo = if total == 0 {
+        "Banco SQLite vazio. Use [Nova] para criar uma nota ou [⬇] para importar seus .md".to_string()
     } else {
-        app.set_status(format!("Notas Definitivas | SQLite: {} nota(s) | Pressione :q para sair", total));
+        format!("Notas Definitivas | SQLite: {} nota(s) | Pressione :q para sair", total)
+    };
+    if warnings.is_empty() {
+        app.set_status(resumo);
+    } else {
+        // Degradacao silenciosa e pior que um aviso: o usuario fica sabendo.
+        app.set_status(format!("{} | aviso: {}", resumo, warnings.join("; ")));
     }
 
     // Um panico nao pode custar o que ainda nao foi salvo.

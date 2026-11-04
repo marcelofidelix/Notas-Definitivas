@@ -1,10 +1,15 @@
 //! Area de transferencia do sistema: copia assincrona (sem travar a interface),
 //! colagem com tentativas e a sequencia OSC 52 para terminais remotos.
 
+use std::cell::RefCell;
 use std::io::Write;
 
 /// Teto para texto vindo do clipboard ou de colagem do terminal.
-pub const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
+///
+/// Era 64 MB: uma colagem desse tamanho virava `String` de entrada + uma `Rc<str>`
+/// por linha + o vetor de linhas, com pico de ~200 MB. 16 MB cobre qualquer
+/// colagem realista e evita um OOM em maquina pequena.
+pub const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
 /// Terminais costumam recusar OSC 52 maiores que isto.
 const MAX_OSC52_BYTES: usize = 75_000;
 
@@ -70,19 +75,40 @@ fn set_text(cb: &mut arboard::Clipboard, text: String) {
     let _ = cb.set_text(text);
 }
 
+thread_local! {
+    /// Handle reaproveitado para leitura: abrir um `arboard::Clipboard` por
+    /// colagem custava uma inicializacao de COM (Windows) ou de conexao X11
+    /// (Linux) a cada `p` / `Ctrl+V`. Descartado se uma leitura falhar.
+    static READER: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+}
+
 /// Le o texto do clipboard (vazio ou indisponivel => `None`).
+///
+/// A leitura e sincrona: até 3 tentativas de 5 ms (antes eram 10, ou seja, ate
+/// 50 ms de congelamento da interface com o clipboard disputado).
 pub fn paste() -> Option<String> {
     if cfg!(test) {
         return None;
     }
-    for _ in 0..10 {
-        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
-            Ok(t) if t.len() <= MAX_PASTE_BYTES => {
+    for _ in 0..3 {
+        let lido = READER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = arboard::Clipboard::new().ok();
+            }
+            slot.as_mut().map(|cb| cb.get_text())
+        });
+        match lido {
+            Some(Ok(t)) if t.len() <= MAX_PASTE_BYTES => {
                 return if t.is_empty() { None } else { Some(t) };
             }
-            Ok(_) => return None,
-            Err(arboard::Error::ContentNotAvailable) => return None,
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Some(Ok(_)) => return None,
+            Some(Err(arboard::Error::ContentNotAvailable)) => return None,
+            _ => {
+                // Handle quebrado ou clipboard ocupado: descarta e tenta de novo.
+                READER.with(|slot| *slot.borrow_mut() = None);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
     None

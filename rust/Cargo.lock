@@ -238,6 +238,7 @@ version = "7.0.0"
 dependencies = [
  "arboard",
  "crossterm",
+ "libc",
  "rusqlite",
  "tempfile",
  "windows-sys 0.59.0",
