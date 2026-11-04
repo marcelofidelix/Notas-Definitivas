@@ -1241,7 +1241,8 @@ impl App {
             Key::Char('u') => self.repeat_undo(n, false),
             Key::Ctrl('r') => self.repeat_undo(n, true),
             Key::Char('z') => self.pending = Pending::Z,
-            Key::Char('n') => self.repeat_search(n),
+            Key::Char('n') => self.repeat_search(n, true),
+            Key::Char('N') => self.repeat_search(n, false),
             Key::Enter => self.activate_link(),
             Key::Char(':') => {
                 self.cmd_buf.clear();

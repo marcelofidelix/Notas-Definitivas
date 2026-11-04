@@ -124,6 +124,11 @@ impl App {
                 let n = self.notes.len();
                 self.set_status(format!("Notas atualizadas ({} encontradas)", n));
             }
+            "noh" | "nohlsearch" | "semrealce" => {
+                // Desliga o realce mas mantem o padrao: `n`/`N` continuam valendo.
+                self.search_hl = false;
+                self.set_status("Realce da busca desligado (n/N continuam navegando)");
+            }
             "tabclose" | "tabc" => {
                 if let Some(i) = self.active {
                     self.tab_close(i);

@@ -122,6 +122,69 @@ pub fn hash_text(s: &str) -> u64 {
     h.finish()
 }
 
+/// Todas as ocorrencias de `needle` em `haystack`, ignorando a caixa, como
+/// intervalos de bytes `[inicio, fim)`.
+///
+/// Ocorrencias nao se sobrepoem (como no Vim): depois de um achado a busca segue
+/// no fim dele. Caminho ASCII sem alocacao; fora do ASCII, dobra para minusculas
+/// mantendo o mapa de volta para os bytes originais.
+pub fn find_all_caseless(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return Vec::new();
+    }
+    if needle.is_ascii() && haystack.is_ascii() {
+        let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + n.len() <= h.len() {
+            if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                out.push((i, i + n.len()));
+                i += n.len();
+            } else {
+                i += 1;
+            }
+        }
+        return out;
+    }
+    // Fora do ASCII: cada byte dobrado guarda o caractere original de origem.
+    let (low, mapa) = lowered_with_map(haystack);
+    let needle_low = needle.to_lowercase();
+    if needle_low.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    while from <= low.len() {
+        let Some(rel) = low[from..].find(&needle_low) else { break };
+        let a = from + rel;
+        let b = a + needle_low.len();
+        let (ini, _) = mapa[a];
+        let (_, fim) = mapa[b - 1];
+        out.push((ini, fim));
+        from = b;
+    }
+    out
+}
+
+/// Minusculas de `s` e, para cada byte produzido, o intervalo do caractere
+/// original que o gerou (alguns caracteres dobram para mais de um).
+fn lowered_with_map(s: &str) -> (String, Vec<(usize, usize)>) {
+    let mut out = String::with_capacity(s.len());
+    let mut mapa = Vec::with_capacity(s.len());
+    for (i, c) in s.char_indices() {
+        let fim = i + c.len_utf8();
+        let mut buf = [0u8; 4];
+        for lc in c.to_lowercase() {
+            let piece = lc.encode_utf8(&mut buf);
+            for _ in 0..piece.len() {
+                mapa.push((i, fim));
+            }
+            out.push_str(piece);
+        }
+    }
+    (out, mapa)
+}
+
 /// Byte onde a coluna visual `target_col` comeca (primeiro byte cuja coluna
 /// acumulada alcanca `target_col`).
 pub fn byte_offset_for_col(s: &str, target_col: usize) -> usize {
@@ -309,6 +372,22 @@ mod tests {
         assert_eq!(byte_offset_for_col("日本語", 2), 3);
         assert_eq!(byte_offset_for_col("abc", 10), 3);
         assert_eq!(byte_offset_for_col("abc", 0), 0);
+    }
+
+    #[test]
+    fn find_all_finds_every_occurrence_case_insensitively() {
+        // ASCII: todas as ocorrencias, sem sobrepor e sem alocar.
+        assert_eq!(find_all_caseless("alvo e ALVO e alvo", "alvo"), [(0, 4), (7, 11), (14, 18)]);
+        assert_eq!(find_all_caseless("aaaa", "aa"), [(0, 2), (2, 4)], "sem sobrepor");
+        assert_eq!(find_all_caseless("abc", "x"), []);
+        assert_eq!(find_all_caseless("abc", ""), []);
+        assert_eq!(find_all_caseless("", "a"), []);
+        assert_eq!(find_all_caseless("abc", "abcd"), []);
+        // Acentos e ideogramas: o intervalo volta para os bytes originais.
+        assert_eq!(find_all_caseless("Ação e ação", "ação"), [(0, 6), (9, 15)]);
+        assert_eq!(find_all_caseless("日本語です", "です"), [(9, 15)]);
+        assert_eq!(find_all_caseless("İİ", "i̇"), [(0, 2), (2, 4)], "caractere que dobra ao baixar");
+        assert_eq!(find_all_caseless("ÜBER ÜBER", "über"), [(0, 5), (6, 11)]);
     }
 
     #[test]

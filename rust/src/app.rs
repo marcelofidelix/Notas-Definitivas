@@ -167,6 +167,11 @@ pub struct App {
     pub cmd_cursor: usize,
     pub replace_find: String,
     pub last_search: String,
+    /// Onde comecou a ocorrencia atual da busca: o realce pinta essa diferente
+    /// das demais e o `n`/`N` partem dela.
+    pub search_at: Option<(usize, usize)>,
+    /// Realce das ocorrencias ligado (`:noh` desliga; uma nova busca religa).
+    pub search_hl: bool,
 
     pub yank: String,
     pub yank_linewise: bool,
@@ -235,6 +240,8 @@ impl App {
             cmd_cursor: 0,
             replace_find: String::new(),
             last_search: String::new(),
+            search_at: None,
+            search_hl: false,
             yank: String::new(),
             yank_linewise: false,
             history: Vec::new(),
@@ -316,6 +323,9 @@ impl App {
                 t.first_unsaved = Some(Instant::now());
             }
         }
+        // A ocorrencia atual da busca pode ter deixado de existir: a partir daqui
+        // `n`/`N` partem do cursor.
+        self.search_at = None;
     }
 
     /// Executa uma edicao no buffer ativo e marca a aba como modificada.
@@ -1212,19 +1222,6 @@ impl App {
         self.yank_linewise = linewise;
     }
 
-    /// Busca da proxima linha (caso indiferente) a partir de `from`, com volta.
-    pub fn find_line(&self, pat: &str, from: usize, wrap_to: usize) -> Option<(usize, bool)> {
-        let b = self.buf()?;
-        let n = b.lines.len();
-        (from..n)
-            .find(|&i| crate::notes::contains_caseless(&b.lines[i].text, pat))
-            .map(|i| (i, false))
-            .or_else(|| {
-                (0..wrap_to.min(n))
-                    .find(|&i| crate::notes::contains_caseless(&b.lines[i].text, pat))
-                    .map(|i| (i, true))
-            })
-    }
 }
 
 fn clamp_scroll(lines: &[Line], lay: Layout, scroll: usize, visible: usize) -> usize {

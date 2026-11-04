@@ -750,6 +750,115 @@ fn change_by_another_instance_in_the_same_second_is_detected() {
     assert!(outra.get_content(id).unwrap().contains("escrito daqui"));
 }
 
+/// Texto visivel imediatamente depois do primeiro `marcador` do quadro (serve para
+/// saber o que ficou com uma cor/realce).
+fn text_after(frame: &str, marker: &str) -> String {
+    match frame.find(marker) {
+        Some(i) => visible(&frame[i + marker.len()..]),
+        None => String::new(),
+    }
+}
+
+#[test]
+fn search_highlights_all_matches_and_n_navigate() {
+    let linha1 = "outra linha com alvo";
+    let mut a = app_with(&[("S", &format!("um alvo aqui\n{linha1}\nfim sem nada\n"))]);
+    open(&mut a, "S");
+    keys(&mut a, "/alvo<CR>");
+    assert_eq!(a.last_search, "alvo");
+    // `/` leva a primeira ocorrencia, com o cursor no inicio dela.
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), (0, 3));
+
+    let th = a.theme();
+    let frame = draw(&mut a);
+    assert!(frame.contains(th.bg_search), "as outras ocorrencias ficam realcadas");
+    assert!(frame.contains(th.bg_search_cur), "a ocorrencia atual tem cor propria");
+    assert!(text_after(&frame, th.bg_search_cur).starts_with("alvo"), "realce no texto certo");
+
+    // `n` desce de ocorrencia em ocorrencia e da a volta no fim.
+    keys(&mut a, "n");
+    let alvo1 = linha1.find("alvo").unwrap();
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), (1, alvo1));
+    keys(&mut a, "n");
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), (0, 3), "volta ao inicio");
+
+    // `N` desce ao contrario e da a volta no comeco.
+    keys(&mut a, "N");
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), (1, alvo1), "volta ao fim");
+    keys(&mut a, "N");
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), (0, 3));
+
+    // A ocorrencia atual muda de lugar depois do `n`.
+    let frame = draw(&mut a);
+    let resto = text_after(&frame, th.bg_search_cur);
+    assert!(resto.starts_with("alvo"));
+}
+
+#[test]
+fn search_marks_matches_inside_tables_code_and_ignores_case() {
+    let mut a = app_with(&[("T", "| col | ALVO |\n|---|---|\n| x | y |\n\n```\nalvo em codigo\n```\n")]);
+    open(&mut a, "T");
+    keys(&mut a, "/alvo<CR>");
+    let th = a.theme();
+    let frame = draw(&mut a);
+    assert!(
+        frame.contains(th.bg_search) || frame.contains(th.bg_search_cur),
+        "ocorrencia dentro da tabela desenhada fica realcada"
+    );
+    // A segunda ocorrencia esta num bloco de codigo.
+    keys(&mut a, "n");
+    assert_eq!(a.buf().unwrap().cy, 5, "linha do bloco de codigo");
+    let frame = draw(&mut a);
+    assert!(frame.contains(th.bg_search_cur), "realce dentro do bloco de codigo");
+}
+
+#[test]
+fn search_highlight_can_be_turned_off_and_keeps_navigating() {
+    let mut a = app_with(&[("S", "alvo um\nalvo dois\n")]);
+    open(&mut a, "S");
+    keys(&mut a, "/alvo<CR>");
+    assert!(draw(&mut a).contains(a.theme().bg_search_cur));
+    keys(&mut a, ":noh<CR>");
+    let frame = draw(&mut a);
+    assert!(!frame.contains(a.theme().bg_search_cur), "realce desligado");
+    assert!(!frame.contains(a.theme().bg_search));
+    // O padrao continua valendo para n/N.
+    keys(&mut a, "n");
+    assert_eq!(a.buf().unwrap().cy, 1);
+}
+
+#[test]
+fn search_reports_when_nothing_matches() {
+    let mut a = app_with(&[("S", "texto sem o padrao\n")]);
+    open(&mut a, "S");
+    keys(&mut a, "/inexistente<CR>");
+    assert!(a.status_text().unwrap_or("").contains("não encontrado"), "{:?}", a.status_text());
+    assert!(a.search_at.is_none());
+    // `n` sem busca avisa em vez de mexer no cursor.
+    let mut b = app_with(&[("S", "texto\n")]);
+    open(&mut b, "S");
+    keys(&mut b, "n");
+    assert!(b.status_text().unwrap_or("").contains("Nenhuma busca"), "{:?}", b.status_text());
+    assert_eq!(b.buf().unwrap().cx, 0);
+}
+
+#[test]
+fn search_opens_folds_and_follows_edits() {
+    let mut a = app_with(&[("S", "# Titulo\ncorpo\n## Secao\nsegredo aqui\n")]);
+    open(&mut a, "S");
+    keys(&mut a, "zM"); // recolhe os cabecalhos
+    assert!(a.buf().unwrap().lines[3].hidden, "a linha esta escondida");
+    keys(&mut a, "/segredo<CR>");
+    assert!(!a.buf().unwrap().lines[3].hidden, "a ocorrencia desdobra a secao");
+    assert_eq!(a.buf().unwrap().cy, 3);
+
+    // Depois de editar, a ocorrencia atual e esquecida e `n` parte do cursor.
+    keys(&mut a, "ggx");
+    assert!(a.search_at.is_none(), "edicao invalida a posicao da ocorrencia");
+    keys(&mut a, "n");
+    assert_eq!(a.buf().unwrap().cy, 3, "n continua encontrando a ocorrencia");
+}
+
 #[test]
 fn script_links_are_executed() {
     if !cfg!(windows) {

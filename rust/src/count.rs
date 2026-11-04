@@ -218,12 +218,10 @@ impl App {
         }
     }
 
-    /// `3n`: proxima ocorrencia da busca, `n` vezes.
-    pub fn repeat_search(&mut self, n: usize) {
+    /// `3n` / `3N`: anda `n` ocorrencias da busca (para frente ou para tras).
+    pub fn repeat_search(&mut self, n: usize, forward: bool) {
         for _ in 0..n {
-            let before = self.cursor_pos();
-            self.search_next();
-            if self.cursor_pos() == before {
+            if !self.search_occurrence(forward) {
                 break;
             }
         }

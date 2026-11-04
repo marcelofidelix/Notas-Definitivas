@@ -11,7 +11,8 @@ use crate::layout::{table_view, VRowIter, VisRow};
 use crate::tbl::{SubKind, TView, A_BOLD, A_ITALIC, A_LINK, A_WIKI};
 use crate::md::{bullet, find_links, find_styles, task_item, LinkSpan, StyleKind, StyleSpan};
 use crate::text::{
-    cp_width, format_rel_time, marquee_slice, sanitize_for_terminal, str_width, truncate_display, width_len,
+    cp_width, find_all_caseless, format_rel_time, marquee_slice, sanitize_for_terminal, str_width, truncate_display,
+    width_len,
 };
 use crate::theme::Theme;
 
@@ -182,6 +183,31 @@ pub fn draw(app: &mut App) -> String {
     app.needs_redraw = false;
     app.last_draw = std::time::Instant::now();
     out
+}
+
+/// Uma ocorrencia da busca dentro de uma linha, em bytes.
+#[derive(Clone, Copy)]
+struct Hit {
+    start: usize,
+    end: usize,
+}
+
+/// Ocorrencias do padrao da busca nesta linha e o inicio da ocorrencia atual
+/// (a que o `n`/`N` levou o cursor), quando o realce esta ligado.
+fn search_marks(app: &App, text: &str, line: usize, in_preview: bool) -> (Vec<Hit>, Option<usize>) {
+    if in_preview || !app.search_visible() {
+        return (Vec::new(), None);
+    }
+    let hits: Vec<Hit> = find_all_caseless(text, &app.last_search)
+        .into_iter()
+        .map(|(start, end)| Hit { start, end })
+        .collect();
+    let cur = app.search_at.filter(|&(l, _)| l == line).map(|(_, s)| s);
+    (hits, cur)
+}
+
+fn hit_at(hits: &[Hit], idx: usize) -> Option<Hit> {
+    hits.iter().find(|h| idx >= h.start && idx < h.end).copied()
 }
 
 struct Frame<'a> {
@@ -775,11 +801,19 @@ impl<'a> Frame<'a> {
             Some((a, b, linewise || y < ey))
         });
         let last_subrow = vr.seg.off + vr.seg.len >= l.text.len();
+        // Ocorrencias da busca nesta linha: as demais ficam com o fundo de busca e
+        // a atual (onde o cursor parou com n/N) com o fundo destacado.
+        let (hits, cur_hit) = search_marks(app, &l.text, vr.line, in_preview);
 
         // Cerca de codigo.
         if l.fence && line_sel.is_some() {
             // Linha selecionada: sem colorizacao de sintaxe, para o realce ser exato.
             self.selected_row(&l.text, ew, th.fg_h3, th.bg_cur_line, line_sel.unwrap_or((0, 0, false)), linewise, last_subrow);
+            return;
+        }
+        if l.fence && !hits.is_empty() {
+            // Com ocorrencia da busca, sem colorizacao de sintaxe para o realce bater.
+            self.search_row(&l.text, ew, th.fg_h3, th.bg_cur_line, &hits, cur_hit, last_subrow);
             return;
         }
         if l.fence {
@@ -816,6 +850,10 @@ impl<'a> Frame<'a> {
             self.selected_row(&l.text, ew, th.fg_main, th.bg_cur_line, line_sel.unwrap_or((0, 0, false)), linewise, last_subrow);
             return;
         }
+        if l.in_code && !hits.is_empty() {
+            self.search_row(&l.text, ew, th.fg_main, th.bg_cur_line, &hits, cur_hit, last_subrow);
+            return;
+        }
         if l.in_code {
             self.p(th.bg_cur_line);
             self.p(th.fg_main);
@@ -830,7 +868,7 @@ impl<'a> Frame<'a> {
 
         if let Some(tv) = &tv {
             let last = vr.sub + 1 >= tv.nsub();
-            self.table_sub(tv, vr.sub, cur_bg, line_bg, ew, line_sel, linewise, last);
+            self.table_sub(tv, vr.sub, cur_bg, line_bg, ew, line_sel, linewise, last, &hits, cur_hit);
             return;
         }
 
@@ -858,6 +896,7 @@ impl<'a> Frame<'a> {
         let end = vr.seg.off + vr.seg.len;
         let mut idx = vr.seg.off;
         let mut cols = 6;
+        let mut fundo_trocado = false;
         while idx < end && cols < ew - 1 {
             if let Some((pos, ch)) = bul {
                 if idx == pos {
@@ -871,10 +910,25 @@ impl<'a> Frame<'a> {
                     continue;
                 }
             }
-            if let Some((a, z, _)) = line_sel {
-                self.p(if idx >= a && idx < z { th.bg_select } else { line_bg });
+            // Fundo desta celula: realce da busca > selecao > fundo da linha. So
+            // emite escape quando o fundo muda (linha comum nao custa nada).
+            let hit = hit_at(&hits, idx);
+            let atual = hit.is_some_and(|h| Some(h.start) == cur_hit);
+            if hit.is_some() {
+                self.p(if atual { th.bg_search_cur } else { th.bg_search });
+                fundo_trocado = true;
+                if atual {
+                    // O trecho atual fica com texto escuro e negrito para saltar aos olhos.
+                    self.p(th.fg_dark);
+                    self.p(BOLD);
+                }
+            } else if line_sel.is_some_and(|(a, z, _)| idx >= a && idx < z) {
+                self.p(th.bg_select);
+                fundo_trocado = true;
+            } else if fundo_trocado {
+                self.p(line_bg);
+                fundo_trocado = false;
             }
-
             if let Some(t) = task.filter(|t| t.box_start == idx) {
                 if cols + 1 > ew - 1 {
                     break;
@@ -946,7 +1000,12 @@ impl<'a> Frame<'a> {
             if cols + cw > ew - 1 {
                 break;
             }
-            self.emit_styled_char(&text[idx..idx + clen], idx, st, hide.styles, line_fg, l.heading);
+            if atual {
+                // Sem estilo de Markdown: o realce exato vale mais aqui.
+                self.txt(&text[idx..idx + clen]);
+            } else {
+                self.emit_styled_char(&text[idx..idx + clen], idx, st, hide.styles, line_fg, l.heading);
+            }
             cols += cw;
             idx += clen;
         }
@@ -969,9 +1028,14 @@ impl<'a> Frame<'a> {
         line_sel: Option<(usize, usize, bool)>,
         linewise: bool,
         last_subrow: bool,
+        hits: &[Hit],
+        cur_hit: Option<usize>,
     ) {
         const K_SEL: u16 = 1 << 4;
         const K_BORDER: u16 = 1 << 5;
+        /// Ocorrencia da busca (e a atual) nesta celula.
+        const K_HIT: u16 = 1 << 6;
+        const K_HIT_CUR: u16 = 1 << 7;
         let th = self.th;
         let geo = tv.geo.clone();
         let kind = tv.sub_kind(sub);
@@ -1001,16 +1065,32 @@ impl<'a> Frame<'a> {
                     if g.vs16 {
                         s.push('\u{FE0F}');
                     }
-                    push(&mut pieces, u16::from(g.attr) | if sel { K_SEL } else { 0 }, &s);
+                    let mut key = u16::from(g.attr) | if sel { K_SEL } else { 0 };
+                    if let Some(h) = hit_at(hits, g.b as usize) {
+                        key |= if Some(h.start) == cur_hit { K_HIT_CUR } else { K_HIT };
+                    }
+                    push(&mut pieces, key, &s);
                 }
                 push(&mut pieces, pad_key, &" ".repeat(cl.pad_r + 1));
                 push(&mut pieces, K_BORDER, "│");
             }
             for (key, text) in &pieces {
                 self.p(RESET);
-                self.p(if key & K_SEL != 0 { th.bg_select } else { row_bg });
+                let atual = key & K_HIT_CUR != 0;
+                self.p(if atual {
+                    th.bg_search_cur
+                } else if key & K_HIT != 0 {
+                    th.bg_search
+                } else if key & K_SEL != 0 {
+                    th.bg_select
+                } else {
+                    row_bg
+                });
                 if key & K_BORDER != 0 {
                     self.p(th.fg_border);
+                } else if atual {
+                    self.p(th.fg_dark);
+                    self.p(BOLD);
                 } else {
                     let attr = (*key & 0x0F) as u8;
                     if attr & A_WIKI != 0 {
@@ -1084,6 +1164,56 @@ impl<'a> Frame<'a> {
                 self.pad(room);
             }
         }
+    }
+
+    /// Linha crua (codigo ou cerca) com o realce da busca e sem colorizacao de
+    /// sintaxe: com muitos trechos coloridos o realce sairia em pedacos.
+    #[allow(clippy::too_many_arguments)]
+    fn search_row(
+        &mut self,
+        text: &str,
+        ew: i32,
+        fg: &str,
+        base_bg: &str,
+        hits: &[Hit],
+        cur_hit: Option<usize>,
+        last_subrow: bool,
+    ) {
+        let th = self.th;
+        let mut cols = 6;
+        for (i, c) in text.char_indices() {
+            let (cw, piece): (i32, String) = if c == '\t' {
+                let w = 4.min((ew - 1 - cols).max(0));
+                (w, " ".repeat(w as usize))
+            } else {
+                (cp_width(c as u32) as i32, c.to_string())
+            };
+            if cols + cw > ew - 1 {
+                break;
+            }
+            let hit = hit_at(hits, i);
+            let atual = hit.is_some_and(|h| Some(h.start) == cur_hit);
+            self.p("\x1b[22m");
+            if hit.is_some() {
+                self.p(if atual { th.bg_search_cur } else { th.bg_search });
+                if atual {
+                    self.p(th.fg_dark);
+                    self.p(BOLD);
+                } else {
+                    self.p(fg);
+                }
+            } else {
+                self.p(base_bg);
+                self.p(fg);
+            }
+            self.txt(&piece);
+            cols += cw;
+        }
+        let _ = hits.len();
+        self.p(RESET);
+        self.fill_tail(cols, ew, base_bg, None, false, last_subrow);
+        self.p("\x1b[K");
+        self.p(RESET);
     }
 
     /// Linha de codigo/cerca com selecao: texto simples com realce exato.

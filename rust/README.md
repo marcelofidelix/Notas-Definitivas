@@ -104,12 +104,22 @@ No modo Normal (e no Visual), um número antes do comando o repete: `100l` anda 
 | `y` | copia `N` linhas |
 | `p` | cola `N` cópias do registro (um só passo); linha inteira desce abaixo da atual (`P` sobe) |
 | `u` / `Ctrl+R` | desfaz/refaz `N` passos |
-| `n` | `N`-ésima próxima ocorrência da busca |
+| `n` / `N` | `N`-ésima ocorrência da busca, para frente / para trás |
 | `rx` | `3rx` troca `N` caracteres (se a linha não tiver `N`, nada acontece) |
 | `i` `a` `I` `A` `o` `O` | `3ia<Esc>` repete o texto digitado `N` vezes ao sair da Inserção (`3ox<Esc>` cria 3 linhas); se você digitou mais de uma linha, não repete |
 | `gt` / `gT` | `2gt` vai para a aba 2; `3gT` volta 3 abas |
 
 Os demais comandos ignoram o prefixo. Números enormes são seguros (limite de 1.000.000; toda repetição para quando deixa de ter efeito, e `3p`/`5ix` produzem no máximo 16 MB). Na lista de notas os dígitos continuam sendo os filtros de urgência (`0`–`6`).
+
+## 🔎 Busca dentro da nota (`/`, `n`, `N`)
+
+`/texto` (ou o botão **[Localizar]**) procura no texto da nota **ignorando maiúsculas**: leva o cursor ao início da ocorrência e **realça todas as ocorrências da nota** de uma vez. A ocorrência onde o cursor parou tem cor própria (texto escuro em negrito sobre o fundo de destaque), então dá para ver onde você está e quantas faltam.
+
+- **`n`** vai para a próxima ocorrência; **`N`** volta para a anterior. As duas dão a volta no fim/início da nota e aceitam prefixo (`3n`, `2N`).
+- A barra de status mostra **`Ocorrência 3/17 na linha 42`** — posição e total.
+- O realce vale no texto, nas **tabelas desenhadas** (dentro das células) e nos **blocos de código**; em linhas de código o realce vem sem a colorização de sintaxe, para o destaque ficar exato.
+- **`:noh`** (`:nohlsearch`) desliga o realce e **mantém o padrão**: `n`/`N` continuam navegando. Uma busca nova religa o realce.
+- A ocorrência pode estar em qualquer coluna da linha (antes, `n` parava no início da linha). A comparação é por caixa, não por acentos: `/acao` não acha `ação` — para isso existe a busca lateral (`Ctrl+F`), que ignora acentos.
 ## 🔗 Copiar o link da nota
 
 O botão **`[🔗 Link]`** (barra de botões), o comando **`:link`** (`:copylink`, `:cl`) e a tecla **`y`** na lista lateral copiam o link da nota para a área de transferência — e também para o registrador interno, então `p`/`Ctrl+V` colam na hora:

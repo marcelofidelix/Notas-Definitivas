@@ -4,9 +4,9 @@
 use crate::app::{App, Focus, Mode, FIELD_MAX};
 use crate::doc::Buffer;
 use crate::md::{find_links, is_table_line};
-use crate::notes::{contains_caseless, NoteKey};
+use crate::notes::NoteKey;
 use crate::table;
-use crate::text::floor_boundary;
+use crate::text::{find_all_caseless, floor_boundary};
 use crate::{clip, links};
 
 /// Insere ate a primeira quebra de linha de `text` em `dst`, na posicao
@@ -279,65 +279,118 @@ impl App {
         }
     }
 
-    /// `:/padrao`: primeira linha do documento que contem o padrao.
-    pub fn search_from_top(&mut self, pat: &str) {
-        self.last_search = pat.chars().take(FIELD_MAX).collect();
-        let found = self
-            .buf()
-            .and_then(|b| b.lines.iter().position(|l| contains_caseless(&l.text, pat)));
-        match found {
-            Some(i) => {
-                if let Some(b) = self.buf_mut() {
-                    b.cy = i;
-                    b.cx = 0;
-                }
-                self.set_status(format!("Padrão encontrado na linha {}", i + 1));
+    /// Todas as ocorrencias do padrao atual, na ordem do documento:
+    /// `(linha, inicio, fim)` em bytes.
+    fn search_hits(&self) -> Vec<(usize, usize, usize)> {
+        if self.last_search.is_empty() {
+            return Vec::new();
+        }
+        let Some(b) = self.buf() else { return Vec::new() };
+        let mut out = Vec::new();
+        for (i, l) in b.lines.iter().enumerate() {
+            for (a, z) in find_all_caseless(&l.text, &self.last_search) {
+                out.push((i, a, z));
             }
-            None => self.set_status(format!("Padrão não encontrado: {}", pat)),
+        }
+        out
+    }
+
+    /// Abre as dobras que escondem `line`: uma ocorrencia dentro de uma secao
+    /// recolhida precisa aparecer quando o `n` para nela. Desdobra todos os
+    /// cabecalhos recolhidos acima (o de nivel 1 esconde os internos).
+    fn reveal_line(&mut self, line: usize) {
+        let Some(b) = self.buf_mut() else { return };
+        if b.lines.get(line).map_or(true, |l| !l.hidden) {
+            return;
+        }
+        let mut mudou = false;
+        for y in (0..line).rev() {
+            if b.lines[y].heading > 0 && b.lines[y].folded {
+                b.lines[y].folded = false;
+                mudou = true;
+            }
+        }
+        if mudou {
+            b.update_folding();
         }
     }
 
-    /// Prompt de localizar: do cursor para baixo e depois do topo.
-    pub fn search_from_cursor(&mut self, pat: &str) {
-        self.last_search = pat.chars().take(FIELD_MAX).collect();
-        let cy = self.buf().map_or(0, |b| b.cy);
-        match self.find_line(pat, cy, cy) {
-            Some((i, wrapped)) => {
-                if let Some(b) = self.buf_mut() {
-                    b.cy = i;
-                    b.cx = 0;
-                }
-                if wrapped {
-                    self.set_status(format!("Padrão encontrado na linha {} (reinício)", i + 1));
-                } else {
-                    self.set_status(format!("Padrão encontrado na linha {} (use n para próximo)", i + 1));
-                }
-            }
-            None => self.set_status(format!("Padrão não encontrado: {}", pat)),
+    /// Leva o cursor para a ocorrencia `idx` e devolve a mensagem de status.
+    fn goto_hit(&mut self, hits: &[(usize, usize, usize)], idx: usize) -> String {
+        let (line, start, _end) = hits[idx];
+        self.reveal_line(line);
+        if let Some(b) = self.buf_mut() {
+            b.cy = line;
+            b.cx = start;
         }
+        self.search_at = Some((line, start));
+        self.search_hl = true;
+        format!("Ocorrência {}/{} na linha {} (n: próxima, N: anterior)", idx + 1, hits.len(), line + 1)
     }
 
-    /// `n`: proxima ocorrencia do ultimo padrao.
-    pub fn search_next(&mut self) {
+    /// Nova busca: primeira ocorrencia a partir do topo (`:`) ou do cursor.
+    fn search_from(&mut self, pat: &str, from_top: bool) {
+        self.last_search = pat.chars().take(FIELD_MAX).collect();
+        self.search_hl = true;
+        self.search_at = None;
         if self.last_search.is_empty() {
             return;
         }
-        let pat = self.last_search.clone();
-        let cy = self.buf().map_or(0, |b| b.cy);
-        match self.find_line(&pat, cy + 1, cy + 1) {
-            Some((i, wrapped)) => {
-                if let Some(b) = self.buf_mut() {
-                    b.cy = i;
-                    b.cx = 0;
-                }
-                if wrapped {
-                    self.set_status(format!("Ocorrência na linha {} (reinício)", i + 1));
-                } else {
-                    self.set_status(format!("Ocorrência na linha {}", i + 1));
-                }
-            }
-            None => self.set_status(format!("Padrão não encontrado: {}", pat)),
+        let hits = self.search_hits();
+        if hits.is_empty() {
+            self.set_status(format!("Padrão não encontrado: {}", self.last_search));
+            return;
         }
+        let origin = if from_top {
+            (0, 0)
+        } else {
+            self.buf().map_or((0, 0), |b| (b.cy, b.cx))
+        };
+        // A ocorrencia sob o cursor conta (buscar de novo avanca para a proxima).
+        let idx = hits.iter().position(|&(l, a, _)| (l, a) >= origin).unwrap_or(0);
+        let msg = self.goto_hit(&hits, idx);
+        self.set_status(msg);
+    }
+
+    /// `:/padrao` e `:find`: primeira ocorrencia do documento.
+    pub fn search_from_top(&mut self, pat: &str) {
+        self.search_from(pat, true);
+    }
+
+    /// Prompt de localizar: do cursor para baixo, com volta ao topo.
+    pub fn search_from_cursor(&mut self, pat: &str) {
+        self.search_from(pat, false);
+    }
+
+    /// `n` (proxima) e `N` (anterior), com volta no fim/inicio da nota.
+    pub fn search_occurrence(&mut self, forward: bool) -> bool {
+        if self.last_search.is_empty() {
+            self.set_status("Nenhuma busca anterior (use /texto ou [Localizar])");
+            return false;
+        }
+        let hits = self.search_hits();
+        if hits.is_empty() {
+            self.search_at = None;
+            self.set_status(format!("Padrão não encontrado: {}", self.last_search));
+            return false;
+        }
+        let origin = match self.search_at {
+            Some(p) => p,
+            None => self.buf().map_or((0, 0), |b| (b.cy, b.cx)),
+        };
+        let idx = if forward {
+            hits.iter().position(|&(l, a, _)| (l, a) > origin).unwrap_or(0)
+        } else {
+            hits.iter().rposition(|&(l, a, _)| (l, a) < origin).unwrap_or(hits.len() - 1)
+        };
+        let msg = self.goto_hit(&hits, idx);
+        self.set_status(msg);
+        true
+    }
+
+    /// Realce das ocorrencias ligado (usado pelo desenho).
+    pub fn search_visible(&self) -> bool {
+        self.search_hl && !self.last_search.is_empty()
     }
 
     // ---- tabelas -----------------------------------------------------------
