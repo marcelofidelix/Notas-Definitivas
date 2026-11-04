@@ -100,32 +100,16 @@ fn plain_single(l: &Line, lay: &Layout) -> bool {
         || is_table_line(&l.text)
 }
 
-/// Hash rapido (nao criptografico) do conteudo, para validar a memoria de layout.
-fn fast_hash(b: &[u8]) -> u64 {
-    const K: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut h = K ^ b.len() as u64;
-    let mut chunks = b.chunks_exact(8);
-    for c in &mut chunks {
-        let mut w = [0u8; 8];
-        w.copy_from_slice(c);
-        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K).rotate_left(31);
-    }
-    let mut last = 0u64;
-    for (i, &x) in chunks.remainder().iter().enumerate() {
-        last |= u64::from(x) << (8 * i);
-    }
-    (h ^ last).wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (h >> 29)
-}
-
 fn layout_key(lay: &Layout) -> u32 {
     1 | ((lay.avail_w.min(1 << 20) as u32) << 4) | (u32::from(lay.hide.links) << 3) | (u32::from(lay.hide.styles) << 2)
         | (u32::from(lay.wrap) << 1)
 }
 
 /// Numero de linhas visuais de uma linha. Linhas longas (que precisam de quebra)
-/// guardam o resultado numa memoria validada pelo hash do conteudo: sem ela,
-/// calcular a posicao do cursor refazia a quebra de TODAS as linhas anteriores
-/// a cada quadro (centenas de ms em notas grandes).
+/// guardam o resultado numa memoria validada pela chave de layout; o texto e o
+/// bloco de tabela descartam essa memoria quando mudam (`Line::set_text`,
+/// `Line::edit` e `assign_table_blocks`). Sem ela, calcular a posicao do cursor
+/// refazia a quebra de TODAS as linhas anteriores a cada quadro.
 pub fn nsegs(l: &Line, lay: &Layout) -> usize {
     if let Some(tv) = table_view(l, lay) {
         return tv.nsub();
@@ -133,13 +117,13 @@ pub fn nsegs(l: &Line, lay: &Layout) -> usize {
     if plain_single(l, lay) {
         return 1;
     }
-    let (key, hash) = (layout_key(lay), fast_hash(l.text.as_bytes()));
+    let key = layout_key(lay);
     let m = l.memo.get();
-    if m.n > 0 && m.key == key && m.hash == hash {
+    if m.n > 0 && m.key == key {
         return m.n as usize;
     }
     let n = segments(l, lay).len();
-    l.memo.set(RowMemo { hash, key, n: n.min(u32::MAX as usize) as u32 });
+    l.memo.set(RowMemo { key, n: n.min(u32::MAX as usize) as u32 });
     n
 }
 
@@ -570,6 +554,41 @@ mod tests {
             wrap: true,
             avail_w: avail,
             hide: Hide { links: hide, styles: hide },
+        }
+    }
+
+    #[test]
+    fn memo_never_disagrees_with_a_fresh_layout() {
+        // A memoria de linhas visuais e invalidada por texto, layout e entrada ou
+        // saida de tabela; este teste compara com o calculo direto em cada passo.
+        let long = "palavra ".repeat(20);
+        let mut b = Buffer::from_content(&format!("{long}\n|x|\n{long}"));
+        let l = lay(20, true);
+        let check = |b: &Buffer, etapa: &str| {
+            for (i, line) in b.lines.iter().enumerate() {
+                assert_eq!(nsegs(line, &l), segments(line, &l).len(), "{etapa}: linha {i}");
+            }
+        };
+        check(&b, "inicial");
+
+        // A linha "|x|" sozinha nao e tabela; com uma vizinha, vira.
+        b.insert_line(1, "|y|");
+        b.update_folding();
+        check(&b, "virou tabela");
+        assert!(nsegs(&b.lines[1], &l) > 1, "linha de tabela ocupa mais de uma linha de tela");
+
+        // Desfazer a tabela (linha removida) tambem precisa esquecer a memoria.
+        b.delete_lines(2, 1);
+        b.update_folding();
+        check(&b, "deixou de ser tabela");
+
+        // Edicao de texto e mudanca de largura invalidam igualmente.
+        b.lines[0].set_text("curta".to_string());
+        check(&b, "texto trocado");
+        check(&b, "outra largura");
+        let estreito = lay(8, true);
+        for line in &b.lines {
+            assert_eq!(nsegs(line, &estreito), segments(line, &estreito).len());
         }
     }
 

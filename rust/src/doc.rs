@@ -14,11 +14,13 @@ pub const MAX_UNDO: usize = 100;
 /// Janela para agrupar digitacao continua em um unico passo de undo.
 pub const TYPING_UNDO_COALESCE: Duration = Duration::from_millis(800);
 
-/// Memoria do numero de linhas visuais de uma linha, valida enquanto o conteudo
-/// (hash) e a configuracao de layout (chave) forem os mesmos.
+/// Memoria do numero de linhas visuais de uma linha, valida enquanto a
+/// configuracao de layout (chave) for a mesma. E descartada sempre que o texto da
+/// linha ou o seu bloco de tabela mudam — ver `set_text`, `edit` e
+/// `assign_table_blocks`. Antes era validada por um hash do texto, recalculado a
+/// cada consulta (custo por quadro proporcional ao documento).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RowMemo {
-    pub hash: u64,
     pub key: u32,
     pub n: u32,
 }
@@ -56,6 +58,7 @@ impl Line {
         let mut s = String::from(&*self.text);
         let r = f(&mut s);
         self.text = Rc::from(s);
+        self.memo.set(RowMemo::default());
         self.detect_heading();
         r
     }
@@ -72,6 +75,7 @@ impl Line {
 
     pub fn set_text(&mut self, s: String) {
         self.text = Rc::from(s);
+        self.memo.set(RowMemo::default());
         self.detect_heading();
     }
 
@@ -134,6 +138,7 @@ fn assign_table_blocks(lines: &mut [Line]) {
         if !is_tbl(&lines[i]) {
             if lines[i].tb.is_some() {
                 lines[i].tb = None;
+                lines[i].memo.set(RowMemo::default());
             }
             i += 1;
             continue;
@@ -145,7 +150,10 @@ fn assign_table_blocks(lines: &mut [Line]) {
         let run = &mut lines[start..i];
         if run.len() < 2 || run.len() > usize::from(u16::MAX) {
             for l in run.iter_mut() {
-                l.tb = None;
+                if l.tb.is_some() {
+                    l.tb = None;
+                    l.memo.set(RowMemo::default());
+                }
             }
             continue;
         }
@@ -155,6 +163,9 @@ fn assign_table_blocks(lines: &mut [Line]) {
             l.trow = k as u16;
             if !l.tb.as_ref().is_some_and(|b| Rc::ptr_eq(b, &blk)) {
                 l.tb = Some(blk.clone());
+                // Entrar/sair de uma tabela muda as linhas de tela da linha sem
+                // tocar no texto: a memoria de layout precisa ser refeita.
+                l.memo.set(RowMemo::default());
             }
         }
     }
