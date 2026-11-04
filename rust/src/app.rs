@@ -5,12 +5,12 @@ use crate::db::{now_secs, Db};
 use crate::doc::{Buffer, Line};
 use crate::layout::{Hide, Layout, VRowIter};
 use crate::notes::{
-    build_search_norm, compare_notes, matches_filter, query_words, title_from_filename, NoteInfo, NoteKey,
+    build_content_norm, build_search_norm, compare_notes, matches_filter, query_words, search_norm,
+    title_from_filename, NoteInfo, NoteKey,
 };
 use crate::text::sanitize_note_name;
 use crate::theme::{NUM_THEMES, THEMES};
 use crate::{clip, fsio};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -190,6 +190,9 @@ pub struct App {
     pub last_theme_click: Option<Instant>,
     pub last_note_click: Option<(usize, Instant)>,
     pub last_editor_click: Option<crate::mouse::EditorClick>,
+    /// O indice de busca das notas ja foi carregado do banco (ver
+    /// `load_search_index`). Comeca falso e volta a falso a cada recatalogo.
+    pub norms_loaded: bool,
     pub start: Instant,
 }
 
@@ -248,6 +251,7 @@ impl App {
             last_theme_click: None,
             last_note_click: None,
             last_editor_click: None,
+            norms_loaded: false,
             start: now,
         };
         app.rescan_notes();
@@ -400,39 +404,62 @@ impl App {
 
     pub fn rescan_notes(&mut self) {
         let now = now_secs();
-        // Reaproveita o indice de busca das notas que nao mudaram.
-        let mut cache: HashMap<NoteKey, (i64, String, String)> = HashMap::new();
-        for n in self.notes.drain(..) {
-            cache.insert(n.key.clone(), (n.mtime, n.filename, n.search_norm));
-        }
-        let mut notes = Vec::new();
+        let mut notes = Vec::with_capacity(self.notes.len().max(8));
         for row in self.db.list_notes() {
-            let key = NoteKey::Db(row.id);
             let filename = format!("{}.md", row.name);
-            let mtime = if row.mtime > 0 { row.mtime } else { now };
-            let search_norm = match cache.remove(&key) {
-                Some((m, f, s)) if m == mtime && f == filename => s,
-                _ => {
-                    let content = self.db.get_content(row.id).unwrap_or_default();
-                    build_search_norm(&filename, &title_from_filename(&filename), &content)
-                }
-            };
             notes.push(NoteInfo {
                 title: title_from_filename(&filename),
                 filename,
-                key,
-                mtime,
+                key: NoteKey::Db(row.id),
+                mtime: if row.mtime > 0 { row.mtime } else { now },
                 attention: row.attention,
-                search_norm,
+                // Vazio de proposito: o indice sai do banco na primeira busca
+                // (`load_search_index`). Ler e normalizar o conteudo de todas as
+                // notas dominava o tempo de abertura.
+                search_norm: String::new(),
             });
         }
         notes.sort_by(compare_notes);
         self.notes = notes;
+        self.norms_loaded = false;
         self.apply_search();
+    }
+
+    /// Carrega (uma vez) o indice de busca de todas as notas, do banco.
+    ///
+    /// Notas gravadas por versoes anteriores (ou pela versao em C) nao tem o
+    /// indice: o conteudo delas e lido e indexado agora, uma unica vez.
+    fn load_search_index(&mut self) {
+        let rows = self.db.all_content_norms();
+        let mut por_id: std::collections::HashMap<i64, String> = std::collections::HashMap::with_capacity(rows.len());
+        for (id, norm) in rows {
+            let norm = match norm {
+                Some(n) => n,
+                None => {
+                    let content = self.db.get_content(id).unwrap_or_default();
+                    let n = build_content_norm(&content);
+                    self.db.set_content_norm(id, &n);
+                    n
+                }
+            };
+            por_id.insert(id, norm);
+        }
+        for n in &mut self.notes {
+            if let Some(id) = n.key.db_id() {
+                if let Some(norm) = por_id.get(&id) {
+                    let indice = search_norm(&n.filename, &n.title, norm);
+                    n.search_norm = indice;
+                }
+            }
+        }
+        self.norms_loaded = true;
     }
 
     pub fn apply_search(&mut self) {
         let words = query_words(&self.search_query);
+        if !words.is_empty() && !self.norms_loaded {
+            self.load_search_index();
+        }
         let urgency = self.filter_urgency;
         self.filtered = self
             .notes

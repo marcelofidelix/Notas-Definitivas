@@ -6,7 +6,8 @@ use std::path::Path;
 
 pub const DB_SCHEMA_VERSION: i32 = 1;
 
-/// Metadados de uma nota (sem o conteudo).
+/// Metadados de uma nota (sem o conteudo e sem o indice de busca, que e lido
+/// sob demanda por `all_content_norms`).
 #[derive(Clone, Debug)]
 pub struct NoteRow {
     pub id: i64,
@@ -66,10 +67,31 @@ impl Db {
                  name      TEXT    NOT NULL UNIQUE,
                  content   TEXT    NOT NULL DEFAULT '',
                  mtime     INTEGER NOT NULL DEFAULT 0,
-                 attention INTEGER NOT NULL DEFAULT 0);
+                 attention INTEGER NOT NULL DEFAULT 0,
+                 content_norm TEXT);
              CREATE INDEX IF NOT EXISTS idx_notes_mtime ON notes(mtime DESC);",
         )
         .map_err(|e| e.to_string())?;
+
+        // Coluna do indice de busca: presente em bancos novos, ausente nos antigos
+        // (inclusive os criados pela versao em C, que continua abrindo este banco
+        // porque a coluna e apenas adicional). Nao mexemos em `user_version` para
+        // preservar essa compatibilidade.
+        if !conn
+            .prepare("PRAGMA table_info(notes);")
+            .and_then(|mut st| {
+                let cols: Vec<String> = st
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .filter_map(|c| c.ok())
+                    .collect();
+                Ok(cols)
+            })
+            .map(|cols| cols.iter().any(|c| c == "content_norm"))
+            .unwrap_or(false)
+        {
+            conn.execute_batch("ALTER TABLE notes ADD COLUMN content_norm TEXT;")
+                .map_err(|e| e.to_string())?;
+        }
 
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
@@ -97,7 +119,8 @@ impl Db {
                  name      TEXT    NOT NULL UNIQUE,
                  content   TEXT    NOT NULL DEFAULT '',
                  mtime     INTEGER NOT NULL DEFAULT 0,
-                 attention INTEGER NOT NULL DEFAULT 0);",
+                 attention INTEGER NOT NULL DEFAULT 0,
+                 content_norm TEXT);",
         )
         .unwrap();
         Db { conn, warnings: Vec::new() }
@@ -130,9 +153,12 @@ impl Db {
             return None;
         }
         let mtime = if mtime > 0 { mtime } else { now_secs() };
+        let norm = crate::notes::build_content_norm(content);
         self.conn
-            .prepare_cached("INSERT INTO notes(name, content, mtime, attention) VALUES(?1,?2,?3,?4);")
-            .and_then(|mut st| st.execute(params![name, content, mtime, attention.min(6)]))
+            .prepare_cached(
+                "INSERT INTO notes(name, content, mtime, attention, content_norm) VALUES(?1,?2,?3,?4,?5);",
+            )
+            .and_then(|mut st| st.execute(params![name, content, mtime, attention.min(6), norm]))
             .ok()?;
         Some(self.conn.last_insert_rowid())
     }
@@ -142,11 +168,38 @@ impl Db {
             return false;
         }
         let mtime = if mtime > 0 { mtime } else { now_secs() };
+        // O indice de busca e gravado junto com o conteudo: assim ele nunca fica
+        // desatualizado por um caminho de gravacao que esqueca de atualiza-lo.
+        let norm = crate::notes::build_content_norm(content);
         self.conn
-            .prepare_cached("UPDATE notes SET content=?1, mtime=?2 WHERE id=?3;")
-            .and_then(|mut st| st.execute(params![content, mtime, id]))
+            .prepare_cached("UPDATE notes SET content=?1, mtime=?2, content_norm=?3 WHERE id=?4;")
+            .and_then(|mut st| st.execute(params![content, mtime, norm, id]))
             .map(|n| n > 0)
             .unwrap_or(false)
+    }
+
+    /// Indice de busca de todas as notas (`None` quando ainda nao foi gerado).
+    ///
+    /// Carregado sob demanda: abrir o programa nao precisa mover o conteudo
+    /// normalizado de todas as notas so para montar a lista lateral.
+    pub fn all_content_norms(&self) -> Vec<(i64, Option<String>)> {
+        let Ok(mut st) = self.conn.prepare_cached("SELECT id, content_norm FROM notes;") else {
+            return Vec::new();
+        };
+        let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Grava o indice de busca reconstruido de uma nota antiga (sem a coluna).
+    pub fn set_content_norm(&self, id: i64, norm: &str) -> bool {
+        id > 0
+            && self
+                .conn
+                .prepare_cached("UPDATE notes SET content_norm=?1 WHERE id=?2;")
+                .and_then(|mut st| st.execute(params![norm, id]))
+                .is_ok()
     }
 
     /// Falha (false) se ja existir outra nota com esse nome (UNIQUE).
@@ -252,6 +305,48 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_norm_follows_insert_and_update() {
+        let db = Db::open_memory();
+        let id = db.insert_note("Alfa", "# Título\nconteúdo inicial", 1, 0).unwrap();
+        let norm = |db: &Db| db.all_content_norms().into_iter().find(|r| r.0 == id).and_then(|r| r.1).unwrap_or_default();
+        assert!(norm(&db).contains("conteudo"), "{:?}", norm(&db));
+        assert!(norm(&db).contains("titulo"), "o acento e dobrado na normalizacao");
+        // Gravar conteudo novo atualiza o indice na mesma instrucao.
+        assert!(db.update_content(id, "outro texto sem acento", 2));
+        assert!(norm(&db).contains("outro"));
+        assert!(!norm(&db).contains("conteudo"));
+    }
+
+    #[test]
+    fn old_database_gains_the_search_index_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notas.db");
+        {
+            // Esquema anterior, como a versao em C deixava o banco.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     name TEXT NOT NULL UNIQUE,
+                     content TEXT NOT NULL DEFAULT '',
+                     mtime INTEGER NOT NULL DEFAULT 0,
+                     attention INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO notes(name, content, mtime, attention) VALUES('Antiga','texto','1',0);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let rows = db.list_notes();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            db.all_content_norms()[0].1.is_none(),
+            "nota antiga ainda nao tem indice"
+        );
+        assert!(db.set_content_norm(rows[0].id, "texto"));
+        assert_eq!(db.all_content_norms()[0].1.as_deref(), Some("texto"));
+    }
 
     #[test]
     fn crud_roundtrip() {

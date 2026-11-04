@@ -677,6 +677,47 @@ fn multi_click_from_insert_keeps_the_original_line_when_markdown_reflows() {
 }
 
 #[test]
+fn legacy_database_is_migrated_and_indexed_lazily() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notas.db");
+    {
+        // Banco no formato antigo (o mesmo que a versao em C gravava).
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL UNIQUE,
+                 content TEXT NOT NULL DEFAULT '',
+                 mtime INTEGER NOT NULL DEFAULT 0,
+                 attention INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO notes(name, content, mtime, attention)
+                VALUES('Reuniao', '# Pauta\nAção de Marketing do trimestre\n', 100, 0);",
+        )
+        .unwrap();
+    }
+    let mut a = App::new(Db::open(&path).unwrap());
+    a.cols = 120;
+    a.rows = 30;
+    assert_eq!(a.notes.len(), 1, "a coluna nova nao esconde notas antigas");
+    // O indice nao e lido na abertura: e carregado na primeira busca.
+    assert!(a.notes[0].search_norm.is_empty(), "abrir nao indexa nada");
+    // A busca funciona com o indice vindo do banco.
+    a.search_query = "ACAO pauta".into();
+    a.apply_search();
+    assert_eq!(a.filtered.len(), 1);
+    assert!(
+        a.notes[0].search_norm.contains("acao") && a.notes[0].search_norm.contains("marketing"),
+        "indice reconstruido a partir do conteudo: {:?}",
+        a.notes[0].search_norm
+    );
+    // Reconstruir uma vez basta: o indice ficou gravado junto da nota.
+    assert!(
+        a.db.all_content_norms()[0].1.as_deref().is_some_and(|n| n.contains("marketing")),
+        "o indice fica no banco para a proxima abertura"
+    );
+}
+
+#[test]
 fn script_links_are_executed() {
     if !cfg!(windows) {
         return;
@@ -761,8 +802,20 @@ fn bench_startup_with_many_notes() {
         db.insert_note(&format!("Nota {i}"), &body, 1_000 + i, 0).unwrap();
     }
     let t = std::time::Instant::now();
-    let a = App::new(db);
-    eprintln!("App::new com {} notas de {} KB: {} ms", a.notes.len(), body.len() / 1024, t.elapsed().as_millis());
+    let mut a = App::new(db);
+    let abertura = t.elapsed();
+    // A primeira busca carrega o indice do banco (as aberturas seguintes sao
+    // gratuitas porque nada e lido ate alguem procurar).
+    let t = std::time::Instant::now();
+    a.search_query = "exemplo".into();
+    a.apply_search();
+    eprintln!(
+        "App::new com {} notas de {} KB: {} ms; primeira busca (indice do banco): {} ms",
+        a.notes.len(),
+        body.len() / 1024,
+        abertura.as_millis(),
+        t.elapsed().as_millis()
+    );
 }
 
 #[test]

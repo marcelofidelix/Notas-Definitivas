@@ -55,32 +55,29 @@ pub fn title_from_filename(fname: &str) -> String {
     fname.to_string()
 }
 
-/// Texto do primeiro cabecalho `#` da nota (ate 250 bytes), se houver.
-pub fn first_heading(content: &str) -> &str {
-    let c = content.strip_prefix('\u{FEFF}').unwrap_or(content);
-    let line = c.lines().next().unwrap_or("");
-    let t = line.trim_start_matches([' ', '\t']);
-    if !t.starts_with('#') {
-        return "";
-    }
-    let t = t.trim_start_matches('#').trim_start_matches([' ', '\t']);
-    let mut end = t.len().min(250);
-    while !t.is_char_boundary(end) {
-        end -= 1;
-    }
-    &t[..end]
+/// Normaliza apenas o conteudo da nota. Fica gravado no banco (`content_norm`)
+/// para que abrir o programa nao precise reler e normalizar todas as notas.
+pub fn build_content_norm(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    crate::text::normalize_into(&mut out, content);
+    out
 }
 
-pub fn build_search_norm(filename: &str, title: &str, content: &str) -> String {
-    let header = first_heading(content);
-    let mut out = String::with_capacity(filename.len() + title.len() + header.len() + content.len() + 3);
-    for (i, part) in [filename, title, header, content].into_iter().enumerate() {
-        if i > 0 {
-            out.push(char::from(b' '));
-        }
-        crate::text::normalize_into(&mut out, part);
-    }
+/// Indice de busca da nota: nome, titulo e conteudo ja normalizado. Nome e titulo
+/// entram aqui porque mudam em `:rename` sem tocar no conteudo.
+pub fn search_norm(filename: &str, title: &str, content_norm: &str) -> String {
+    let mut out = String::with_capacity(filename.len() + title.len() + content_norm.len() + 2);
+    crate::text::normalize_into(&mut out, filename);
+    out.push(' ');
+    crate::text::normalize_into(&mut out, title);
+    out.push(' ');
+    out.push_str(content_norm);
     out
+}
+
+/// Indice de busca montado a partir do conteudo cru (testes e reconstrucao).
+pub fn build_search_norm(filename: &str, title: &str, content: &str) -> String {
+    search_norm(filename, title, &build_content_norm(content))
 }
 
 /// Ordem da lista: grupo de urgencia (1..6, depois sem marcacao), mais
@@ -111,8 +108,21 @@ pub fn matches_filter(n: &NoteInfo, words: &[String], urgency: u8) -> bool {
 }
 
 /// Comparacao de substring ignorando maiusculas/minusculas.
+///
+/// O caminho ASCII (praticamente todas as buscas) nao aloca: antes cada linha
+/// comparada virava dois `to_lowercase()`, e uma busca percorre todas as linhas.
 pub fn contains_caseless(haystack: &str, needle: &str) -> bool {
-    needle.is_empty() || haystack.to_lowercase().contains(&needle.to_lowercase())
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+        if n.len() > h.len() {
+            return false;
+        }
+        return h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
+    }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 #[cfg(test)]
@@ -163,13 +173,6 @@ mod tests {
         assert!(!matches_filter(&n, &query_words("acao vendas"), 0));
         assert!(matches_filter(&n, &[], 0));
         assert!(!matches_filter(&n, &[], 3), "filtro de urgencia");
-    }
-
-    #[test]
-    fn heading_extraction() {
-        assert_eq!(first_heading("# Titulo aqui\ncorpo"), "Titulo aqui");
-        assert_eq!(first_heading("sem titulo"), "");
-        assert_eq!(first_heading("\u{FEFF}## Dois"), "Dois");
     }
 
     #[test]
