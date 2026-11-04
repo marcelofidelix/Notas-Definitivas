@@ -26,7 +26,9 @@ case "${1:-build}" in
         cargo build --release
         cp target/release/notas ../notas_rs
         echo "    OK -> ../notas_rs"
-        [ "${1:-build}" = "run" ] && exec ../notas_rs
+        if [ "${1:-build}" = "run" ]; then
+            exec ../notas_rs
+        fi
         ;;
     *)
         echo "uso: $0 [build|run|test|clean]" >&2
