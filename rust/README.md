@@ -45,7 +45,7 @@ O editor Rust oferece: edição modal (Normal, Inserção, Visual caractere/linh
 - **Segurança do terminal:** todo texto de nota/nome/prompt passa por `sanitize_for_terminal` — um `.md` com `ESC`/OSC embutidos não consegue escrever no clipboard, mudar o título nem bagunçar a tela.
 - **Robustez comprovada por fuzz:** 10 milhões de teclas/cliques/redimensionamentos aleatórios sem pânico e sem violar invariantes (cursor em limite de caractere, índices válidos). O fuzz encontrou, ainda no desenvolvimento, três defeitos: fatiar string fora de um limite de caractere (nome terminando em ideograma), e cursor além do fim da linha após `:rename` e após `:tableall` (o código C também não reajusta o cursor nesses dois casos).
 - **Sem nenhuma nota aberta** (banco vazio ou todas as abas fechadas), teclas como `w`, `G`, `dd` são ignoradas com segurança (no C várias leem a linha atual sem checar se há nota aberta).
-- **Colagem sem perda:** colagem multilinha é uma operação única; texto colado nunca é executado como comando; limite de 64 MB.
+- **Colagem sem perda:** colagem multilinha é uma operação única; texto colado nunca é executado como comando; limite de 16 MB.
 - **Linha inteira cola abaixo, como no Vim:** com registro de linha inteira (`y`, `dd`, Visual Linha), `p` insere as linhas **abaixo** da atual e `P` acima; se o cursor está na última linha, a linha nova é criada no fim. O cursor fica no primeiro caractere da primeira linha colada e o bloco inteiro é um só passo de desfazer. Seleção por caractere (mesmo atravessando linhas) continua sendo colada no cursor.
 - **Cache de busca correto após renomear** (no C o título antigo ficava no índice) e `Esc` na busca lateral **não** abre mais uma nota.
 - **Seleção sempre visível** (`v`/`V`/`Shift+Setas`): V-Line realça a linha inteira (inclusive vazias e blocos de código), `v` realça o trecho exato e a quebra de linha, e a barra de status mostra quantas linhas/caracteres serão copiados.
@@ -121,30 +121,34 @@ Vale a nota **selecionada na lista** (se o foco está nela) ou a da **aba ativa*
 
 ## ⚡ Revisão de desempenho e robustez
 
-A revisão começou **medindo** (nota de 20 mil linhas longas, cursor no meio; `cargo test --release bench_ -- --ignored --nocapture`):
+A revisão começou **medindo** (nota de 20 mil linhas longas, cursor na linha 10.000; `cargo test --release bench_ -- --ignored --nocapture`). Números atuais, medidos no Windows/MSVC:
 
-| Item | Antes | Depois |
-| :-- | --: | --: |
-| Quadro 120×30 | 234 ms | ~3 ms |
-| Tecla digitada + quadro | 188 ms | ~3 ms |
-| `Enter` (ponto de desfazer) | 4 ms | 0,5 ms |
-| Memória de 100 níveis de desfazer | 358 MB | **~1 MB** (só o último estado fica completo) |
-| Bytes por tecla no terminal | 34 KB | ~1,3 KB |
-| Início com 2.000 notas de 10 KB | 349 ms | ~80–110 ms |
+| Item | Antes da 1ª revisão | Depois | Agora |
+| :-- | --: | --: | --: |
+| Quadro 120×30 | 234 ms | ~3 ms | **0,33 ms** |
+| Tecla digitada + quadro | 188 ms | ~3 ms | **0,35 ms** |
+| `Enter` (ponto de desfazer) | 4 ms | 0,5 ms | **0,30 ms** |
+| Memória de 100 níveis de desfazer | 358 MB | **~1 MB** | ~949 KB |
+| Bytes por tecla no terminal | 34 KB | ~1,3 KB | ~1,3 KB |
+| Início com 2.000 notas de 10 KB | 349 ms | ~80–110 ms | **3 ms** (+23 ms na primeira busca) |
 
 O que foi feito:
 
-- **Posição do cursor sem refazer a quebra de todas as linhas** — o número de linhas visuais de cada linha é memorizado (validado por hash do conteúdo, correto para qualquer forma de edição). Era o gargalo dos 234 ms.
+- **Posição do cursor sem refazer a quebra de todas as linhas** — o número de linhas visuais de cada linha é memorizado. Essa memória é descartada quando o texto ou o bloco de tabela da linha mudam, em vez de validada por um hash recalculado a cada consulta (era o custo dominante do quadro).
+- **Índice de busca no banco (`content_norm`)**: o texto normalizado de cada nota é gravado junto com o conteúdo e carregado **só na primeira busca**. Abrir o programa com 2.000 notas de 10 KB caiu de 63–95 ms para 3 ms; a primeira busca paga ~23 ms uma vez.
 - **Texto das linhas compartilhado (`Rc<str>`)** entre os estados de desfazer: copiar o documento custa um contador por linha, não o texto.
 - **Histórico de desfazer por diferenças (`history.rs`):** em cada pilha (desfazer e refazer) só o estado mais recente é completo; os anteriores guardam apenas o trecho que mudou (linhas iguais no início e no fim são reconhecidas por ponteiro, sem comparar texto) e são reconstruídos ao desfazer. Uma nota de 20 mil linhas com 150 passos passou de 91 MB para ~1 MB, e o ponto de desfazer ficou mais barato. Verificado contra um modelo de cópias completas em edições aleatórias.
 - **Redesenho incremental:** só as linhas da tela que mudaram são enviadas (ótimo em SSH); o batimento de 30 s, o redimensionamento e a limpeza repintam tudo. Testado: nenhuma linha alterada é omitida, nenhuma igual é reenviada.
-- **Índice de busca:** normalização ASCII por bytes e sem cópia intermediária.
 - **Linhas gigantes** (> 20 mil bytes) são tratadas como texto simples (sem varrer links/estilos a cada quadro).
-- **Nunca sobrescrever trabalho alheio:** cada aba guarda o `mtime` que carregou; se outra instância (ou uma importação) alterou a nota, `:w`, o autosave e o fechamento **recusam** com aviso. `:w!` sobrescreve de propósito e `:e!` recarrega do banco.
+- **Nunca sobrescrever trabalho alheio:** cada aba guarda o `mtime` **e o hash do texto** que carregou. O `mtime` tem resolução de segundos; o hash detecta até uma alteração feita por outra instância no mesmo segundo. `:w`, o autosave e o fechamento **recusam** com aviso; `:w!` sobrescreve de propósito e `:e!` recarrega do banco.
 - **Autosave que falha não entra em laço** (antes repetiria a cada 100 ms): tenta de novo em 1 minuto.
-- **Fechar a janela do console (Windows)** salva as notas pendentes antes de sair (logoff/desligamento também).
+- **Fechar a janela do console (Windows)** salva as notas pendentes antes de sair (logoff/desligamento também). No Linux/macOS, `SIGTERM`, `SIGHUP` (queda de SSH) e `SIGQUIT` levantam a mesma flag de encerramento.
+- **Pânico deixa rastro:** `notas-crash.log`, ao lado do banco, guarda data, local e mensagem antes de a tela ser restaurada (antes a mensagem do Rust era apagada junto com a tela alternativa).
+- **Degradação não é silenciosa:** WAL indisponível, pasta do executável inacessível e exportação parcial aparecem no status inicial.
+- **Exportação nunca perde nota:** nomes diferentes que higienizam para o mesmo arquivo (`a:b` e `a*b`) recebem sufixo em vez de se sobrescreverem.
+- **Menos desperdícios:** o laço de eventos espera até o próximo prazo interno (letreiro, status, autosave, batimento) em vez de acordar a cada 100 ms; o clipboard reaproveita o handle de leitura e tenta 3 vezes em vez de 10 (congelamento máximo de 50 ms para 15 ms); a colagem tem teto de 16 MB (era 64 MB, que podia custar ~200 MB de pico); busca de texto sem acento não aloca por linha.
 
-Oportunidades ainda abertas (não feitas, por serem maiores ou não testáveis aqui): indexar a busca em segundo plano para bancos com dezenas de milhares de notas; tratar `SIGTERM`/`SIGHUP` no Linux/macOS (o tratador de encerramento atual é só Windows).
+Oportunidades ainda abertas (maiores, não medidas como problema hoje): custo do quadro ainda cresce com o número de linhas até o cursor (duas varreduras por quadro — invisível até ~50 mil linhas, resolveria com índice de prefixo); indexar a busca em segundo plano para bancos com dezenas de milhares de notas; teste automatizado do terminal real (pty).
 
 ## Arquitetura (`src/`)
 
@@ -168,7 +172,7 @@ Oportunidades ainda abertas (não feitas, por serem maiores ou não testáveis a
 ## Testes
 
 ```bash
-cargo test                       # ~105 testes (unitarios + integracao, rapidos)
+cargo test                       # 171 testes (unitarios + integracao, rapidos)
 NOTAS_FUZZ_SEEDS=2000 NOTAS_FUZZ_STEPS=5000 cargo test --release fuzz   # campanha longa
 cargo test dump_frames -- --ignored    # NOTAS_DUMP_DIR=pasta: grava quadros de varios estados
 ```
