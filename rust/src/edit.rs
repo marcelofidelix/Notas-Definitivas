@@ -180,6 +180,7 @@ impl App {
     /// Insere texto colado onde estiver o foco: campo de busca/comando/prompt
     /// ou o cursor da nota ativa.
     pub fn paste_text(&mut self, text: &str) {
+        self.last_editor_click = None;
         if text.is_empty() {
             return;
         }

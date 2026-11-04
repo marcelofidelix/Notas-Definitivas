@@ -1,10 +1,10 @@
-//! Mouse: cliques nos botoes, abas, lista de notas, selecao por arrasto e
+//! Mouse: cliques nos botoes, abas, lista de notas, selecao por cliques/arrasto e
 //! rolagem. As coordenadas seguem a convencao do terminal (1-based).
 
 use crate::app::{App, Focus, Mode};
 use crate::layout::{click_offset, find_visual_row};
 use crate::render::prompt_label;
-use crate::text::{str_width, width_len};
+use crate::text::{prev_char_start, str_width, width_len};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,38 @@ pub struct Mouse {
     pub col: i32,
     pub row: i32,
     pub released: bool,
+}
+
+/// Sequencia de cliques no texto; conserva o ponto original mesmo se a selecao
+/// mudar a exibicao do Markdown ao sair do modo Insercao.
+pub struct EditorClick {
+    pub at: Instant,
+    col: i32,
+    row: i32,
+    cursor: (usize, usize),
+    count: u8,
+}
+
+/// Letras Unicode, numeros e sublinhados formam palavras. Espacos e sinais
+/// formam grupos separados, sem incluir a palavra vizinha na selecao.
+fn word_range(text: &str, at: usize) -> Option<(usize, usize)> {
+    let class = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let kind = class(text.get(at..)?.chars().next()?);
+    let start = text[..at].char_indices().rev()
+        .take_while(|&(_, c)| class(c) == kind)
+        .last().map_or(at, |(i, _)| i);
+    let end = text[at..].char_indices()
+        .take_while(|&(_, c)| class(c) == kind)
+        .last().map(|(i, c)| at + i + c.len_utf8())?;
+    Some((start, prev_char_start(text, end)))
 }
 
 pub fn map_mouse(ev: MouseEvent) -> Option<Mouse> {
@@ -55,9 +87,13 @@ impl App {
         self.last_activity = Instant::now();
         self.needs_redraw = true;
         let now = Instant::now();
+        if m.btn != Btn::Left {
+            self.last_editor_click = None;
+        }
 
         // 1. Prompts modais: so o clique na propria linha do prompt vale.
         if self.mode.is_prompt() {
+            self.last_editor_click = None;
             if m.btn == Btn::Left && !m.released && m.row == self.rows {
                 let label_w = prompt_label(self).map_or(0, |l| str_width(&l)) as i32;
                 let clicked = (m.col - label_w - 1).max(0) as usize;
@@ -81,6 +117,7 @@ impl App {
         if self.mode == Mode::Insert && m.btn == Btn::Left {
             if let Some(t) = self.last_typing {
                 if now.duration_since(t) < Duration::from_millis(150) {
+                    self.last_editor_click = None;
                     return;
                 }
             }
@@ -129,6 +166,8 @@ impl App {
     }
 
     fn on_left_click(&mut self, m: Mouse, now: Instant) {
+        // Qualquer clique fora do texto interrompe a sequencia do editor.
+        let previous = self.last_editor_click.take();
         // Confirmacao de exclusao: clique em "s" ou "n" no prompt.
         if self.mode == Mode::ConfirmDelete {
             if m.row == self.rows {
@@ -207,7 +246,7 @@ impl App {
         if m.col <= self.left_width {
             self.click_left_panel(m, now);
         } else {
-            self.click_editor(m);
+            self.click_editor(m, now, previous);
         }
     }
 
@@ -383,26 +422,44 @@ impl App {
     }
 
     /// Posiciona o cursor do texto na celula clicada.
-    fn place_cursor_at(&mut self, m: Mouse) {
+    fn place_cursor_at(&mut self, m: Mouse) -> bool {
         let lay = self.layout(false);
         let col = (m.col - (self.left_width + 1 + 6 + 1)).max(0) as usize;
         let screen_row = (m.row - 2).max(0) as usize;
-        let Some(b) = self.buf_mut() else { return };
+        let Some(b) = self.buf_mut() else { return false };
         let target = screen_row + b.scroll_y;
         if let Some(vr) = find_visual_row(&b.lines, lay, target) {
             b.cy = vr.line;
             b.cx = click_offset(&b.lines[vr.line], vr.sub, vr.seg, col, &lay).min(b.lines[vr.line].len());
             b.clamp_cursor();
+            return true;
         }
+        false
     }
 
-    fn click_editor(&mut self, m: Mouse) {
+    fn click_editor(&mut self, m: Mouse, now: Instant, previous: Option<EditorClick>) {
         self.promote_preview();
         self.focus = Focus::Right;
         if m.row > self.rows - 3 {
             return;
         }
-        self.place_cursor_at(m);
+        let previous = previous.filter(|p| {
+            p.col == m.col && p.row == m.row && p.count < 3
+                && now.duration_since(p.at) < Duration::from_millis(500)
+        });
+        let count = previous.as_ref().map_or(1, |p| p.count + 1);
+        if let Some(p) = previous {
+            if let Some(b) = self.buf_mut() {
+                (b.cy, b.cx) = p.cursor;
+                b.clamp_cursor();
+            }
+        } else if !self.place_cursor_at(m) {
+            return;
+        }
+        let Some(b) = self.buf() else { return };
+        self.last_editor_click = Some(EditorClick {
+            at: now, col: m.col, row: m.row, cursor: (b.cy, b.cx), count,
+        });
         if let Some(b) = self.buf_mut() {
             b.vis_y = b.cy;
             b.vis_x = b.cx;
@@ -411,6 +468,24 @@ impl App {
         if self.mode.is_visual() {
             self.mode = Mode::Normal;
             self.set_status("-- MODO NORMAL --");
+        }
+        if count == 2 {
+            let range = self.buf().and_then(|b| word_range(&b.cur().text, b.cx));
+            if let Some((start, end)) = range {
+                if let Some(b) = self.buf_mut() {
+                    b.vis_x = start;
+                    b.cx = end;
+                }
+                self.mode = Mode::VisualChar;
+                self.set_status("-- VISUAL (Palavra selecionada) --");
+            }
+        } else if count == 3 {
+            if let Some(b) = self.buf_mut() {
+                b.vis_x = 0;
+                b.cx = prev_char_start(&b.cur().text, b.cur().len());
+            }
+            self.mode = Mode::VisualLine;
+            self.set_status("-- VISUAL LINHA (Linha selecionada) --");
         }
     }
 

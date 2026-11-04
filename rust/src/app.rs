@@ -189,6 +189,7 @@ pub struct App {
     pub last_typing: Option<Instant>,
     pub last_theme_click: Option<Instant>,
     pub last_note_click: Option<(usize, Instant)>,
+    pub last_editor_click: Option<crate::mouse::EditorClick>,
     pub start: Instant,
 }
 
@@ -246,6 +247,7 @@ impl App {
             last_typing: None,
             last_theme_click: None,
             last_note_click: None,
+            last_editor_click: None,
             start: now,
         };
         app.rescan_notes();

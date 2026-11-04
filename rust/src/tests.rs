@@ -507,6 +507,131 @@ fn drag_selection_in_editor_enters_visual_mode() {
 }
 
 #[test]
+fn double_click_selects_words_without_splitting_utf8() {
+    for (text, offset, selected) in [
+        ("Olá ação_2, fim", 6, "ação_2"),
+        ("um café", 6, "café"),
+        ("a 世界 z", 3, "世界"),
+        ("x", 0, "x"),
+        ("um, dois", 2, ","),
+        ("um   dois", 3, "   "),
+        ("a 😀 z", 2, "😀"),
+    ] {
+        let mut a = app_with(&[("D", text)]);
+        open(&mut a, "D");
+        draw(&mut a);
+        let col = a.left_width + 8 + offset;
+        click(&mut a, col, 2);
+        assert_eq!(a.mode, Mode::Normal);
+        click(&mut a, col, 2);
+        assert_eq!(a.mode, Mode::VisualChar, "{text}");
+        let b = a.buf().unwrap();
+        assert_eq!(b.selection_text(false).as_deref(), Some(selected), "{text}");
+        assert!(b.cur().text.is_char_boundary(b.cx));
+        assert!(b.cur().text.is_char_boundary(b.vis_x));
+        keys(&mut a, "<C-c>");
+        assert_eq!(a.yank, selected);
+        assert_eq!(lines(&a), vec![text]);
+    }
+}
+
+#[test]
+fn triple_click_selects_the_entire_logical_line_and_can_cut_undo() {
+    let long = "palavra ".repeat(25);
+    let mut a = app_with(&[("D", &format!("{long}\nseguinte"))]);
+    open(&mut a, "D");
+    draw(&mut a);
+    let col = a.left_width + 10;
+    // Segunda linha da tela, ainda dentro da primeira linha do documento.
+    click(&mut a, col, 3);
+    click(&mut a, col, 3);
+    assert_eq!(a.mode, Mode::VisualChar);
+    click(&mut a, col, 3);
+    assert_eq!(a.mode, Mode::VisualLine);
+    let b = a.buf().unwrap();
+    assert_eq!((b.vis_y, b.cy), (0, 0));
+    assert_eq!(b.selection_text(true).unwrap(), format!("{long}\n"));
+    keys(&mut a, "x");
+    assert_eq!(a.yank, format!("{long}\n"));
+    assert_eq!(lines(&a), vec!["seguinte"]);
+    keys(&mut a, "u");
+    assert_eq!(lines(&a), vec![long, "seguinte".to_string()]);
+}
+
+#[test]
+fn repeated_clicks_handle_empty_lines_end_of_line_and_empty_database() {
+    for text in ["", "abc"] {
+        let mut a = app_with(&[("D", text)]);
+        open(&mut a, "D");
+        draw(&mut a);
+        let col = a.left_width + 8 + text.len() as i32;
+        click(&mut a, col, 2);
+        click(&mut a, col, 2);
+        assert_eq!(a.mode, Mode::Normal, "fim da linha nao seleciona a palavra anterior");
+        click(&mut a, col, 2);
+        assert_eq!(a.mode, Mode::VisualLine);
+        keys(&mut a, "y");
+        assert_eq!(a.yank, format!("{text}\n"));
+    }
+    let mut a = new_app();
+    let col = a.left_width + 8;
+    for _ in 0..3 { click(&mut a, col, 2); }
+    assert_eq!(a.mode, Mode::Normal);
+    assert!(a.last_editor_click.is_none());
+}
+
+#[test]
+fn editor_click_sequence_restarts_after_timeout_movement_or_other_input() {
+    for interruption in 0..7 {
+        let mut a = app_with(&[("D", "alpha beta")]);
+        open(&mut a, "D");
+        draw(&mut a);
+        let mut col = a.left_width + 9;
+        click(&mut a, col, 2);
+        match interruption {
+            0 => a.last_editor_click.as_mut().unwrap().at =
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            1 => col += 6,
+            2 => keys(&mut a, "l"),
+            3 => a.on_mouse(Mouse { btn: Btn::WheelDown, col, row: 2, released: false }),
+            4 => { let rows = a.rows; click(&mut a, col, rows); }
+            5 => a.on_mouse(Mouse { btn: Btn::Drag, col: col + 1, row: 2, released: false }),
+            _ => a.paste_text("z"),
+        }
+        click(&mut a, col, 2);
+        assert_eq!(a.mode, Mode::Normal, "interrupcao {interruption}");
+    }
+    let mut a = app_with(&[("D", "alpha beta")]);
+    open(&mut a, "D");
+    draw(&mut a);
+    let col = a.left_width + 9;
+    for _ in 0..3 { click(&mut a, col, 2); }
+    assert_eq!(a.mode, Mode::VisualLine);
+    click(&mut a, col, 2);
+    assert_eq!(a.mode, Mode::Normal, "quarto clique inicia nova sequencia");
+}
+
+#[test]
+fn multi_click_from_insert_keeps_the_original_line_when_markdown_reflows() {
+    let text = "[link](https://example.com/um/endereco/muito/longo/que/quebra) palavra\nsegunda";
+    let mut a = app_with(&[("D", text)]);
+    a.cols = 60;
+    a.left_width = crate::app::MIN_LEFT_WIDTH;
+    open(&mut a, "D");
+    keys(&mut a, "i");
+    let col = a.left_width + 9;
+    draw(&mut a);
+    click(&mut a, col, 3);
+    assert_eq!(a.buf().unwrap().cy, 0);
+    click(&mut a, col, 3);
+    assert_eq!(a.mode, Mode::VisualChar);
+    draw(&mut a); // o link agora ocupa menos espaco na tela
+    click(&mut a, col, 3);
+    assert_eq!(a.mode, Mode::VisualLine);
+    assert_eq!(a.buf().unwrap().selection_text(true).unwrap(), format!("{}\n", text.lines().next().unwrap()));
+}
+
+#[test]
 fn script_links_are_executed() {
     if !cfg!(windows) {
         return;
@@ -1203,6 +1328,12 @@ fn cursor_moves_through_table_cells_and_clicks_land_on_text() {
     click(&mut a, col as i32 + 1, row as i32 + 1);
     let b = a.buf().unwrap();
     assert_eq!((b.cy, &b.cur().text[b.cx..b.cx + 1]), (3, "B"));
+    click(&mut a, col as i32 + 1, row as i32 + 1);
+    assert_eq!(a.mode, Mode::VisualChar);
+    assert_eq!(a.buf().unwrap().selection_text(false).unwrap(), "Beto");
+    click(&mut a, col as i32 + 1, row as i32 + 1);
+    assert_eq!(a.mode, Mode::VisualLine);
+    assert_eq!(a.buf().unwrap().selection_text(true).unwrap(), "| Beto | b |\n");
 }
 
 #[test]

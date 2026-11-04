@@ -167,6 +167,7 @@ fn handle_event(app: &mut App, ev: Event) {
             }
         }
         Event::Resize(c, r) => {
+            app.last_editor_click = None;
             app.cols = i32::from(c);
             app.rows = i32::from(r);
             app.clear_needed = true;

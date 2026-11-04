@@ -161,6 +161,7 @@ impl App {
     /// Ponto de entrada: processa uma tecla. Ao sair de uma linha de tabela (ou do
     /// modo Insercao) com o cursor nela, a tabela e realinhada.
     pub fn on_key(&mut self, key: Key) {
+        self.last_editor_click = None;
         let in_table = self.mode == Mode::Insert
             && self.focus == Focus::Right
             && self.buf().is_some_and(|b| is_table_line(&b.cur().text));
