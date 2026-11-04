@@ -718,6 +718,39 @@ fn legacy_database_is_migrated_and_indexed_lazily() {
 }
 
 #[test]
+fn change_by_another_instance_in_the_same_second_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notas.db");
+    let db = Db::open(&path).unwrap();
+    let id = db.insert_note("Alfa", "# Alfa\noriginal\n", 1_000, 0).unwrap();
+    // Segunda "instancia" (outro handle no mesmo arquivo).
+    let outra = Db::open(&path).unwrap();
+
+    let mut a = App::new(Db::open(&path).unwrap());
+    a.cols = 120;
+    a.rows = 30;
+    let key = a.notes.iter().find(|n| n.title == "Alfa").unwrap().key.clone();
+    a.open_note(&key, true);
+    a.focus = Focus::Right;
+    a.mode = Mode::Normal;
+    keys(&mut a, "Goescrito daqui<Esc>");
+
+    // A outra instancia grava por cima mantendo o MESMO mtime (mesmo segundo).
+    let mtime = a.db.get_mtime(id).unwrap();
+    assert!(outra.update_content(id, "# Alfa\nalterado por fora\n", mtime));
+
+    assert!(!a.save_tab(0), "gravar por cima perderia a alteracao da outra instancia");
+    assert!(
+        a.status_text().unwrap_or("").contains("alterada em outro lugar"),
+        "{:?}",
+        a.status_text()
+    );
+    // `:w!` sobrescreve de proposito.
+    assert!(a.save_tab_ex(0, true));
+    assert!(outra.get_content(id).unwrap().contains("escrito daqui"));
+}
+
+#[test]
 fn script_links_are_executed() {
     if !cfg!(windows) {
         return;

@@ -98,6 +98,10 @@ pub struct Tab {
     /// `mtime` da nota no banco quando foi carregada/gravada por ultimo. Se o
     /// banco mudar (outra instancia, importacao), gravar por cima exige `:w!`.
     pub loaded_mtime: i64,
+    /// Hash do texto no formato do banco quando foi carregada/gravada. O `mtime`
+    /// tem resolucao de segundos: duas instancias que gravam no mesmo segundo
+    /// empatam, e so o conteudo mostra que houve alteracao.
+    pub loaded_hash: u64,
 }
 
 pub struct Preview {
@@ -617,6 +621,7 @@ impl App {
             modified: false,
             first_unsaved: None,
             loaded_mtime: key.db_id().and_then(|id| self.db.get_mtime(id)).unwrap_or(0),
+            loaded_hash: crate::text::hash_text(&content),
         });
         self.active = Some(self.tabs.len() - 1);
         if record_history {
@@ -646,6 +651,7 @@ impl App {
                 modified: false,
                 first_unsaved: None,
                 loaded_mtime: 0,
+                loaded_hash: crate::text::hash_text(""),
             });
             self.active = Some(self.tabs.len() - 1);
             self.push_history(&key);
@@ -755,6 +761,19 @@ impl App {
                 }
                 return false;
             }
+            // O mtime tem resolucao de segundos: duas instancias que gravam no
+            // mesmo segundo empatam e a comparacao acima nao veria nada. Nesse
+            // caso o conteudo gravado e a unica prova de alteracao.
+            if let Some(db_content) = self.db.get_content(*id) {
+                if crate::text::hash_text(&db_content) != t.loaded_hash {
+                    let name = t.filename.clone();
+                    self.set_status(format!(
+                        "⚠ \"{}\" foi alterada em outro lugar; :w! sobrescreve ou :e! recarrega",
+                        name
+                    ));
+                    return false;
+                }
+            }
         }
         if !self.write_note(&key, &content) {
             return false;
@@ -763,6 +782,7 @@ impl App {
             let m = self.db.get_mtime(*id).unwrap_or(0);
             self.tabs[idx].loaded_mtime = m;
         }
+        self.tabs[idx].loaded_hash = crate::text::hash_text(&content);
         let now = now_secs();
         if let Some(n) = self.notes.iter_mut().find(|n| n.key == key) {
             n.mtime = now;
@@ -818,6 +838,7 @@ impl App {
         t.modified = false;
         t.first_unsaved = None;
         t.loaded_mtime = mtime;
+        t.loaded_hash = crate::text::hash_text(&content);
         self.clear_needed = true;
         let name = self.tabs[idx].filename.clone();
         self.set_status(format!("\"{}\" recarregada do banco", name));
