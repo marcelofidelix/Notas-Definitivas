@@ -99,9 +99,30 @@ fn visible(frame: &str) -> String {
     out
 }
 
+/// (coluna, linha) 1-based do inicio de `needle` no texto visivel do quadro.
+fn screen_pos(frame: &str, needle: &str) -> (i32, i32) {
+    let v = visible(frame);
+    for (i, line) in v.lines().enumerate() {
+        if let Some(byte) = line.find(needle) {
+            return (crate::text::str_width(&line[..byte]) as i32 + 1, i as i32 + 1);
+        }
+    }
+    panic!("{needle:?} nao apareceu no quadro");
+}
+
 fn click(a: &mut App, col: i32, row: i32) {
     a.on_mouse(Mouse { btn: Btn::Left, col, row, released: false });
     a.on_mouse(Mouse { btn: Btn::Left, col, row, released: true });
+}
+
+/// Roda do mouse sobre a area do editor (a 120 colunas, o painel esquerdo tem 40).
+fn wheel_editor(a: &mut App, down: bool) {
+    a.on_mouse(Mouse {
+        btn: if down { Btn::WheelDown } else { Btn::WheelUp },
+        col: 70,
+        row: 6,
+        released: false,
+    });
 }
 
 #[test]
@@ -526,6 +547,90 @@ fn mouse_buttons_tabs_wheel_and_double_click() {
 }
 
 #[test]
+fn mouse_wheel_moves_cursor_through_a_long_note() {
+    let body: String = (0..100).map(|i| format!("linha {i}\n")).collect();
+    let mut a = app_with(&[("Roda", &body)]);
+    open(&mut a, "Roda");
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().scroll_y), (0, 0));
+
+    for i in 1..=10 {
+        wheel_editor(&mut a, true);
+        assert_eq!(a.buf().unwrap().cy, i);
+    }
+    for i in (0..10).rev() {
+        wheel_editor(&mut a, false);
+        assert_eq!(a.buf().unwrap().cy, i);
+    }
+    wheel_editor(&mut a, false);
+    assert_eq!(a.buf().unwrap().cy, 0, "no topo, a roda para cima nao sai da nota");
+
+    // A roda continua andando com o cursor; a tela acompanha para mante-lo visivel.
+    let rows = a.visible_rows();
+    for _ in 0..(rows + 5) {
+        wheel_editor(&mut a, true);
+    }
+    assert_eq!(a.buf().unwrap().cy, rows + 5);
+    assert!(a.buf().unwrap().scroll_y > 0, "a nota rola para manter o cursor visivel");
+    let frame = visible(&draw(&mut a));
+    assert!(frame.contains(&format!("linha {}", rows + 5)), "a linha do cursor aparece no quadro");
+
+    for _ in 0..200 {
+        wheel_editor(&mut a, true);
+    }
+    assert_eq!(a.buf().unwrap().cy, 99, "a roda para no fim da nota");
+    assert_eq!(a.buf().unwrap().scroll_y, 100 - rows, "a ultima linha fica no fim da tela");
+}
+
+#[test]
+fn mouse_wheel_moves_cursor_in_insert_mode_without_editing() {
+    let mut a = app_with(&[("Inserir", "um\ndois\ntres\n")]);
+    open(&mut a, "Inserir");
+    keys(&mut a, "i");
+    assert_eq!(a.mode, Mode::Insert);
+
+    wheel_editor(&mut a, true);
+    wheel_editor(&mut a, true);
+    assert_eq!(a.buf().unwrap().cy, 2);
+    assert_eq!(a.mode, Mode::Insert);
+    assert_eq!(lines(&a).join("|"), "um|dois|tres", "a roda nao altera o texto");
+    assert!(!a.tab().unwrap().modified, "a roda nao suja a nota");
+
+    wheel_editor(&mut a, false);
+    assert_eq!(a.buf().unwrap().cy, 1);
+}
+
+#[test]
+fn mouse_wheel_walks_visual_rows_in_a_wrapped_line() {
+    // 120 colunas - painel esquerdo (40) - margem do texto (7) = 72 colunas.
+    let long = "a".repeat(82);
+    let mut a = app_with(&[("Quebra", &format!("{long}\ncurta\n"))]);
+    open(&mut a, "Quebra");
+    assert_eq!(a.avail_text_w(false), 72);
+
+    wheel_editor(&mut a, true);
+    assert_eq!(a.buf().unwrap().cy, 0, "a primeira volta desce uma linha visual");
+    assert_eq!(a.buf().unwrap().cx, 72, "o cursor passa para a segunda linha visual");
+    wheel_editor(&mut a, true);
+    assert_eq!(a.buf().unwrap().cy, 1, "a volta seguinte passa para a proxima linha");
+}
+
+#[test]
+fn mouse_wheel_still_scrolls_preview_without_moving_the_cursor() {
+    let body: String = (0..100).map(|i| format!("linha {i}\n")).collect();
+    let mut a = app_with(&[("Previa", &body)]);
+    assert!(a.in_preview());
+
+    wheel_editor(&mut a, true);
+    assert_eq!(a.preview.as_ref().unwrap().scroll_y, 1, "na previa a roda rola o texto");
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().scroll_y), (0, 0), "sem mexer no cursor da nota");
+
+    let _ = draw(&mut a);
+    assert_eq!(a.preview.as_ref().unwrap().scroll_y, 1);
+    wheel_editor(&mut a, false);
+    assert_eq!(a.preview.as_ref().unwrap().scroll_y, 0);
+}
+
+#[test]
 fn prompt_click_moves_the_cursor_inside_the_field() {
     let mut a = new_app();
     keys(&mut a, ":import abcdef");
@@ -543,7 +648,7 @@ fn drag_selection_in_editor_enters_visual_mode() {
     let mut a = app_with(&[("D", "abcdefghij\n")]);
     open(&mut a, "D");
     draw(&mut a);
-    let col0 = a.left_width + 1 + 6 + 1;
+    let col0 = a.left_width + 1 + a.gutter_width(false) as i32 + 1;
     a.on_mouse(Mouse { btn: Btn::Left, col: col0 + 1, row: 2, released: false });
     a.on_mouse(Mouse { btn: Btn::Drag, col: col0 + 5, row: 2, released: false });
     assert_eq!(a.mode, Mode::VisualChar);
@@ -623,6 +728,17 @@ fn repeated_clicks_handle_empty_lines_end_of_line_and_empty_database() {
     for _ in 0..3 { click(&mut a, col, 2); }
     assert_eq!(a.mode, Mode::Normal);
     assert!(a.last_editor_click.is_none());
+}
+
+#[test]
+fn click_below_the_last_line_goes_to_its_last_character() {
+    let mut a = app_with(&[("D", "primeira\nabc\n")]);
+    open(&mut a, "D");
+    draw(&mut a);
+    let col = a.left_width + 1 + a.gutter_width(false) as i32 + 2;
+    click(&mut a, col, 15);
+    let b = a.buf().unwrap();
+    assert_eq!((b.cy, b.cx), (1, 2), "ultimo caractere da ultima linha");
 }
 
 #[test]
@@ -792,6 +908,26 @@ fn search_highlights_all_matches_and_n_navigate() {
     let frame = draw(&mut a);
     let resto = text_after(&frame, th.bg_search_cur);
     assert!(resto.starts_with("alvo"));
+}
+
+#[test]
+fn escape_deactivates_the_note_search() {
+    let mut a = app_with(&[("S", "um alvo aqui\noutro alvo\n")]);
+    open(&mut a, "S");
+    keys(&mut a, "/alvo<CR>");
+    assert!(a.search_visible() && !a.last_search.is_empty());
+    let before = (a.buf().unwrap().cy, a.buf().unwrap().cx);
+    let th = a.theme();
+    assert!(draw(&mut a).contains(th.bg_search), "antes de sair, a busca esta realcada");
+
+    keys(&mut a, "<Esc>");
+    assert!(a.last_search.is_empty() && a.search_at.is_none() && !a.search_visible());
+    assert!(a.status_text().unwrap_or("").contains("Busca desativada"));
+    assert!(!draw(&mut a).contains(th.bg_search), "o realce some ao desativar a busca");
+
+    keys(&mut a, "n");
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), before, "n nao navega mais");
+    assert!(a.status_text().unwrap_or("").contains("Nenhuma busca anterior"));
 }
 
 #[test]
@@ -1477,6 +1613,26 @@ fn cursor_at(frame: &str) -> (usize, usize) {
     (r.parse().unwrap(), c.parse().unwrap())
 }
 
+#[test]
+fn five_digit_line_numbers_keep_cursor_and_clicks_aligned() {
+    let body: String = (0..10_001).map(|i| format!("linha {i}\n")).collect();
+    let mut a = app_with(&[("G", &body)]);
+    open(&mut a, "G");
+    keys(&mut a, "G");
+    assert_eq!(a.buf().unwrap().cy, 10_000);
+    assert_eq!(a.gutter_width(false), 7, "a calha cresce para cinco digitos");
+
+    let frame = draw(&mut a);
+    let (row, col) = cursor_at(&frame);
+    let expected_col = (a.left_width + 1 + a.gutter_width(false) as i32 + 1) as usize;
+    assert_eq!(col, expected_col, "o cursor fica na mesma coluna do texto");
+    assert!(visible(&frame).contains("10001"), "numero da ultima linha aparece");
+
+    // O clique usa a mesma calha: primeiro caractere da linha, sem uma casa de erro.
+    click(&mut a, expected_col as i32, row as i32);
+    assert_eq!(a.buf().unwrap().cx, 0);
+}
+
 const TABLE_NOTE: &str = "# Tabelas\n\n|a|b|c|\n|1|2|3|\n\ndepois\n";
 
 #[test]
@@ -1574,6 +1730,54 @@ fn cursor_moves_through_table_cells_and_clicks_land_on_text() {
     click(&mut a, col as i32 + 1, row as i32 + 1);
     assert_eq!(a.mode, Mode::VisualLine);
     assert_eq!(a.buf().unwrap().selection_text(true).unwrap(), "| Beto | b |\n");
+}
+
+#[test]
+fn right_click_on_table_opens_sort_menu_and_sorts_column() {
+    let note = "| Nome | Idade |\n|---|---|\n| Ana | 30 |\n| Beto | 25 |\n";
+    let mut a = app_with(&[("T", note)]);
+    open(&mut a, "T");
+
+    // Botao direito na celula "30": menu da coluna 2.
+    let frame = draw(&mut a);
+    let (col, row) = screen_pos(&frame, "30");
+    a.on_mouse(Mouse { btn: Btn::Right, col, row, released: false });
+    assert_eq!(a.table_menu, Some(crate::app::TableMenu { line: 2, column: 1, selected: 0 }));
+
+    let frame = draw(&mut a);
+    let v = visible(&frame);
+    assert!(v.contains("Ordenar tabela") && v.contains("A→Z") && v.contains("Z→A"), "{v}");
+
+    // Primeira opcao (A→Z): "Beto" (25) passa para antes de "Ana" (30).
+    let (asc, _) = a.hit.menu_asc;
+    let rows = a.rows;
+    click(&mut a, asc + 1, rows);
+    assert!(a.table_menu.is_none());
+    let text = lines(&a).join("\n");
+    assert!(text.find("Beto").unwrap() < text.find("Ana").unwrap(), "coluna Idade em ordem:\n{text}");
+
+    // Um passo de desfazer devolve a ordem original.
+    keys(&mut a, "u");
+    let text = lines(&a).join("\n");
+    assert!(text.find("Ana").unwrap() < text.find("Beto").unwrap(), "u desfaz a ordenacao:\n{text}");
+
+    // Esc fecha o menu sem mexer na tabela.
+    let frame = draw(&mut a);
+    let (col, row) = screen_pos(&frame, "Ana");
+    a.on_mouse(Mouse { btn: Btn::Right, col, row, released: false });
+    assert!(a.table_menu.is_some());
+    keys(&mut a, "<Esc>");
+    assert!(a.table_menu.is_none());
+    assert!(a.status_text().unwrap_or("").contains("Ordenação cancelada"));
+
+    // Teclado: baixo alterna para Z→A e Enter aplica na coluna do clique (Nome).
+    let frame = draw(&mut a);
+    let (col, row) = screen_pos(&frame, "Ana");
+    a.on_mouse(Mouse { btn: Btn::Right, col, row, released: false });
+    keys(&mut a, "<Down><CR>");
+    assert!(a.table_menu.is_none());
+    let text = lines(&a).join("\n");
+    assert!(text.find("Beto").unwrap() < text.find("Ana").unwrap(), "Z→A com teclado:\n{text}");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Operacoes de edicao sobre a nota ativa: copiar/colar/recortar, substituir,
 //! tabelas, links e busca no texto.
 
-use crate::app::{App, Focus, Mode, FIELD_MAX};
+use crate::app::{App, Focus, Mode, TableMenu, FIELD_MAX};
 use crate::doc::Buffer;
 use crate::md::{find_links, is_table_line};
 use crate::notes::NoteKey;
@@ -393,6 +393,16 @@ impl App {
         self.search_hl && !self.last_search.is_empty()
     }
 
+    /// Encerra a busca da nota: apaga o padrao, o realce e a ocorrencia atual,
+    /// para que `n`/`N` nao continuem navegando. Devolve `true` se havia busca.
+    pub fn deactivate_search(&mut self) -> bool {
+        let was_active = !self.last_search.is_empty() || self.search_hl || self.search_at.is_some();
+        self.last_search.clear();
+        self.search_at = None;
+        self.search_hl = false;
+        was_active
+    }
+
     // ---- tabelas -----------------------------------------------------------
 
     pub fn table_align_at(&mut self, idx: usize) -> bool {
@@ -437,6 +447,65 @@ impl App {
         if end > start && align_range_keep_cursor(b, start, end) == Some(true) {
             self.mark_modified();
         }
+    }
+
+    /// Ordena a tabela que contem `line` pela coluna `column` (0-based).
+    /// `Some(false)` quando a ordem ja era essa; `None` se nao for possivel.
+    pub fn table_sort_at(&mut self, line: usize, column: usize, descending: bool) -> Option<bool> {
+        let b = self.buf_mut()?;
+        if line >= b.lines.len() {
+            return None;
+        }
+        let (start, end) = table_bounds(b, line);
+        let refs: Vec<&str> = b.lines[start..=end].iter().map(|l| &*l.text).collect();
+        let new = table::sort_table(&refs, column, descending)?;
+        if new.iter().zip(&refs).all(|(a, b)| a == b) {
+            return Some(false);
+        }
+        b.save_undo();
+        for (i, t) in new.into_iter().enumerate() {
+            b.lines[start + i].set_text(t);
+        }
+        b.update_folding();
+        b.clamp_cursor();
+        self.mark_modified();
+        Some(true)
+    }
+
+    /// Abre o menu de contexto para a tabela e a coluna indicadas.
+    pub fn open_table_menu(&mut self, line: usize, column: usize) {
+        self.table_menu = Some(TableMenu { line, column, selected: 0 });
+        self.needs_redraw = true;
+    }
+
+    pub fn cancel_table_menu(&mut self) {
+        if self.table_menu.take().is_some() {
+            self.set_status("Ordenação cancelada.");
+        }
+    }
+
+    /// Aplica a opcao escolhida no menu de contexto da tabela.
+    pub fn apply_table_menu(&mut self) {
+        let Some(menu) = self.table_menu.take() else { return };
+        let descending = menu.selected == 1;
+        match self.table_sort_at(menu.line, menu.column, descending) {
+            Some(true) => {
+                self.clear_needed = true;
+                self.set_status(format!(
+                    "Tabela ordenada pela coluna {} ({})",
+                    menu.column + 1,
+                    if descending { "Z→A" } else { "A→Z" }
+                ));
+            }
+            Some(false) => self.set_status("A tabela já está nessa ordem."),
+            None => self.set_status("Não foi possível ordenar esta tabela."),
+        }
+        self.mode = Mode::Normal;
+        if let Some(b) = self.buf_mut() {
+            b.has_selection = false;
+        }
+        self.editor_scroll();
+        self.needs_redraw = true;
     }
 
     pub fn table_align_all(&mut self) {

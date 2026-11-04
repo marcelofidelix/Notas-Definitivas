@@ -110,6 +110,17 @@ pub struct Preview {
     pub scroll_y: usize,
 }
 
+/// Menu de contexto aberto com o botao direito sobre uma tabela.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableMenu {
+    /// Linha do documento em que o clique caiu (dentro do bloco da tabela).
+    pub line: usize,
+    /// Coluna logica da tabela (0-based).
+    pub column: usize,
+    /// 0 = A→Z, 1 = Z→A.
+    pub selected: usize,
+}
+
 /// Geometria dos botoes (colunas 1-based, intervalo [inicio, fim)) gravada pelo
 /// desenho para o clique do mouse.
 #[derive(Default, Clone)]
@@ -130,6 +141,9 @@ pub struct HitMap {
     /// (indice da aba, inicio, fim, coluna do "x") de cada aba desenhada.
     pub tabs: Vec<(usize, i32, i32, i32)>,
     pub tab_new: (i32, i32),
+    /// Opcoes do menu de contexto de tabela na linha de comando.
+    pub menu_asc: (i32, i32),
+    pub menu_desc: (i32, i32),
 }
 
 pub struct App {
@@ -172,6 +186,8 @@ pub struct App {
     pub search_at: Option<(usize, usize)>,
     /// Realce das ocorrencias ligado (`:noh` desliga; uma nova busca religa).
     pub search_hl: bool,
+    /// Menu de contexto da tabela (botao direito): A→Z ou Z→A.
+    pub table_menu: Option<TableMenu>,
 
     pub yank: String,
     pub yank_linewise: bool,
@@ -242,6 +258,7 @@ impl App {
             last_search: String::new(),
             search_at: None,
             search_hl: false,
+            table_menu: None,
             yank: String::new(),
             yank_linewise: false,
             history: Vec::new(),
@@ -349,8 +366,34 @@ impl App {
         self.cols - self.left_width - 1
     }
 
-    pub fn avail_text_w(&self) -> usize {
-        let w = self.editor_width() - 7;
+    /// Quantas linhas o numero da linha precisa mostrar (minimo 4 digitos).
+    /// A calha cresce quando a nota passa de 9.999 linhas; sem isso o numero
+    /// ocupa uma coluna a mais e o texto (e o cursor) saem do lugar.
+    fn line_no_source_lines(&self, in_preview: bool) -> usize {
+        if in_preview {
+            self.preview.as_ref().map_or(1, |p| p.lines.len())
+        } else {
+            self.buf().map_or(1, |b| b.num_lines())
+        }
+    }
+
+    pub fn line_no_digits(&self, in_preview: bool) -> usize {
+        let mut n = self.line_no_source_lines(in_preview).max(1);
+        let mut digits = 1;
+        while n >= 10 {
+            n /= 10;
+            digits += 1;
+        }
+        digits.max(4)
+    }
+
+    /// Colunas da calha do numero de linha: digitos + espaco + indicador de dobra.
+    pub fn gutter_width(&self, in_preview: bool) -> usize {
+        self.line_no_digits(in_preview) + 2
+    }
+
+    pub fn avail_text_w(&self, in_preview: bool) -> usize {
+        let w = self.editor_width() - self.gutter_width(in_preview) as i32 - 1;
         if w <= 5 {
             5
         } else {
@@ -376,7 +419,7 @@ impl App {
     pub fn layout(&self, in_preview: bool) -> Layout {
         Layout {
             wrap: self.wrap,
-            avail_w: self.avail_text_w(),
+            avail_w: self.avail_text_w(in_preview),
             hide: self.hide(in_preview),
         }
     }

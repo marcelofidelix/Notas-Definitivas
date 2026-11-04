@@ -1,6 +1,7 @@
 //! Alinhamento automatico de tabelas Markdown (estilo Vimwiki).
 
-use crate::text::str_width;
+use crate::text::{normalize_text, str_width};
+use std::cmp::Ordering;
 
 pub const MAX_TABLE_COLS: usize = 32;
 
@@ -175,6 +176,63 @@ pub fn count_columns(text: &str) -> usize {
     t.matches('|').count() + 1
 }
 
+/// Ordena as linhas de dados pela coluna `column` (0-based), mantendo no lugar
+/// o cabecalho e as linhas delimitadoras, e realinha a tabela. `None` se a
+/// tabela nao puder ser ordenada sem perder conteudo (ex.: coluna inexistente
+/// ou mais de 32 colunas).
+///
+/// A comparacao e alfabetica sem diferenciar maiusculas nem acentos; celulas
+/// vazias ficam no fim nas duas direcoes e empates conservam a ordem original.
+pub fn sort_table(lines: &[&str], column: usize, descending: bool) -> Option<Vec<String>> {
+    if lines.len() < 2 {
+        return None;
+    }
+    let parsed: Vec<(usize, Row)> = lines.iter().map(|l| parse_row(l)).collect::<Option<_>>()?;
+    let max_cols = parsed.iter().map(|(_, r)| r.cells.len()).max().unwrap_or(0);
+    if column >= max_cols {
+        return None;
+    }
+    // Se existe linha delimitadora, tudo ate ela (o cabecalho) fica fixo.
+    // Delimitadoras em qualquer posicao nunca entram na ordenacao.
+    let first_delim = parsed.iter().position(|(_, r)| r.is_delim);
+    let movable: Vec<usize> = (0..lines.len())
+        .filter(|&i| first_delim.map_or(true, |d| i > d) && !parsed[i].1.is_delim)
+        .collect();
+    if movable.is_empty() {
+        return None;
+    }
+
+    let key = |i: usize| -> (bool, String) {
+        let cell = parsed[i].1.cells.get(column).map(String::as_str).unwrap_or("");
+        (cell.is_empty(), normalize_text(cell))
+    };
+    let mut ordered: Vec<(usize, bool, String)> = movable
+        .iter()
+        .map(|&i| {
+            let (empty, k) = key(i);
+            (i, empty, k)
+        })
+        .collect();
+    ordered.sort_by(|a, b| {
+        match (a.1, b.1) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => {
+                let ord = a.2.cmp(&b.2);
+                let ord = if descending { ord.reverse() } else { ord };
+                ord.then(a.0.cmp(&b.0))
+            }
+        }
+    });
+
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    for (slot, (src, _, _)) in movable.iter().zip(ordered) {
+        out[*slot] = lines[src].to_string();
+    }
+    let refs: Vec<&str> = out.iter().map(String::as_str).collect();
+    align_table(&refs)
+}
+
 /// Linha vazia de tabela com `cols` colunas.
 pub fn blank_row(cols: usize) -> Option<String> {
     let cols = if cols == 0 { 2 } else { cols };
@@ -232,5 +290,42 @@ mod tests {
         assert_eq!(count_columns(""), 2);
         assert_eq!(blank_row(2).unwrap(), "|   |   |");
         assert!(blank_row(33).is_none());
+    }
+
+    fn cell_values(lines: &[String], skip: usize) -> Vec<String> {
+        lines
+            .iter()
+            .skip(skip)
+            .map(|l| l.split('|').nth(1).unwrap_or("").trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn sorts_data_rows_and_keeps_header_and_delimiter() {
+        let table = ["| Nome | Idade |", "|:--|--:|", "| Beto | 25 |", "| ana | 30 |", "| Água | 5 |"];
+        let asc = sort_table(&table, 0, false).unwrap();
+        assert_eq!(cell_values(&asc, 2), ["Água", "ana", "Beto"]);
+        let desc = sort_table(&table, 0, true).unwrap();
+        assert_eq!(cell_values(&desc, 2), ["Beto", "ana", "Água"]);
+        assert!(asc[0].contains("Nome") && asc[1].contains("--"), "{asc:?}");
+    }
+
+    #[test]
+    fn sorts_by_any_column_and_puts_empty_cells_last() {
+        let table = ["| a | 10 |", "| b |  |", "| c | 1 |"];
+        let asc = sort_table(&table, 1, false).unwrap();
+        assert_eq!(cell_values(&asc, 0), ["c", "a", "b"]);
+        let desc = sort_table(&table, 1, true).unwrap();
+        assert_eq!(cell_values(&desc, 0), ["a", "c", "b"], "vazias ficam no fim tambem de tras para frente");
+        assert!(sort_table(&table, 2, false).is_none(), "coluna inexistente nao altera nada");
+        assert!(sort_table(&["| a |"], 0, false).is_none(), "uma linha nao e uma tabela");
+    }
+
+    #[test]
+    fn sorts_without_header_and_realligns() {
+        let table = ["| b |", "| a |"];
+        let out = sort_table(&table, 0, false).unwrap();
+        assert_eq!(cell_values(&out, 0), ["a", "b"]);
+        assert_eq!(out, ["| a   |", "| b   |"]);
     }
 }

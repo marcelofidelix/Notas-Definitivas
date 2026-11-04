@@ -2,8 +2,9 @@
 //! rolagem. As coordenadas seguem a convencao do terminal (1-based).
 
 use crate::app::{App, Focus, Mode};
-use crate::layout::{click_offset, find_visual_row};
+use crate::layout::{self, click_offset, find_visual_row, table_view};
 use crate::render::prompt_label;
+use crate::tbl::{self, SubKind};
 use crate::text::{prev_char_start, str_width, width_len};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 pub enum Btn {
     Left,
     Middle,
+    Right,
     Drag,
     WheelUp,
     WheelDown,
@@ -62,6 +64,7 @@ pub fn map_mouse(ev: MouseEvent) -> Option<Mouse> {
     let (btn, released) = match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => (Btn::Left, false),
         MouseEventKind::Up(MouseButton::Left) => (Btn::Left, true),
+        MouseEventKind::Down(MouseButton::Right) => (Btn::Right, false),
         MouseEventKind::Drag(MouseButton::Left) => (Btn::Drag, false),
         MouseEventKind::Down(MouseButton::Middle) => (Btn::Middle, false),
         MouseEventKind::ScrollUp => (Btn::WheelUp, false),
@@ -113,7 +116,37 @@ impl App {
             return;
         }
 
-        // 2. Rejeicao de toque acidental no touchpad durante a digitacao.
+        // 2. Menu de contexto da tabela: as opcoes ficam na linha de comando.
+        if self.table_menu.is_some() && !m.released {
+            match m.btn {
+                Btn::Left => {
+                    let asc = self.hit.menu_asc;
+                    let desc = self.hit.menu_desc;
+                    if m.row == self.rows && within(m.col, asc) {
+                        self.apply_table_menu();
+                        return;
+                    }
+                    if m.row == self.rows && within(m.col, desc) {
+                        if let Some(menu) = self.table_menu.as_mut() {
+                            menu.selected = 1;
+                        }
+                        self.apply_table_menu();
+                        return;
+                    }
+                    // Clique fora do menu: fecha e deixa o clique seguir seu curso.
+                    self.table_menu = None;
+                }
+                Btn::WheelUp | Btn::WheelDown => {
+                    self.table_menu = None;
+                }
+                Btn::Middle | Btn::Drag => {
+                    self.table_menu = None;
+                }
+                _ => {}
+            }
+        }
+
+        // 3. Rejeicao de toque acidental no touchpad durante a digitacao.
         if self.mode == Mode::Insert && m.btn == Btn::Left {
             if let Some(t) = self.last_typing {
                 if now.duration_since(t) < Duration::from_millis(150) {
@@ -125,6 +158,7 @@ impl App {
 
         match m.btn {
             Btn::WheelUp | Btn::WheelDown => self.on_wheel(m),
+            Btn::Right => self.on_right_click(m),
             Btn::Middle => {
                 if !m.released && m.row == 1 && m.col > self.left_width + 1 {
                     if let Some(&(i, ..)) = self.hit.tabs.iter().find(|t| m.col >= t.1 && m.col <= t.2) {
@@ -156,13 +190,74 @@ impl App {
                     p.scroll_y += 1;
                 }
             }
-        } else if let Some(b) = self.buf_mut() {
-            if up {
-                b.scroll_y = b.scroll_y.saturating_sub(1);
-            } else if b.scroll_y + 1 < b.lines.len() {
-                b.scroll_y += 1;
+        } else if self.focus == Focus::Right {
+            // A roda anda com o cursor, como `j`/`k`, em vez de rolar a tela
+            // apenas ate o cursor encostar no topo. Assim a nota inteira pode
+            // ser percorrida e a visualizacao acompanha o cursor.
+            let lay = self.layout(false);
+            self.with_buf(|b| {
+                if up {
+                    layout::move_up(b, &lay);
+                } else {
+                    layout::move_down(b, &lay);
+                }
+            });
+            self.editor_scroll();
+        }
+    }
+
+    /// Botao direito sobre uma celula de tabela: abre o menu A→Z / Z→A daquela
+    /// coluna. Fora de uma tabela, fecha o menu que estiver aberto.
+    fn on_right_click(&mut self, m: Mouse) {
+        match self.table_target_at(m) {
+            Some((line, column)) => self.open_table_menu(line, column),
+            None => {
+                if self.table_menu.take().is_some() {
+                    self.needs_redraw = true;
+                }
             }
         }
+    }
+
+    /// (linha do documento, coluna logica da tabela) sob o ponteiro, se o
+    /// clique caiu numa celula desenhada como grade.
+    fn table_target_at(&self, m: Mouse) -> Option<(usize, usize)> {
+        if self.focus != Focus::Right
+            || !matches!(self.mode, Mode::Normal | Mode::VisualChar | Mode::VisualLine)
+            || m.row < 2
+            || m.row > self.rows - 3
+        {
+            return None;
+        }
+        let content_start = self.left_width + 1 + self.gutter_width(false) as i32 + 1;
+        if m.col < content_start {
+            return None;
+        }
+        let lay = self.layout(false);
+        let b = self.buf()?;
+        let screen_row = (m.row - 2) as usize;
+        let target = screen_row + b.scroll_y;
+        let vr = find_visual_row(&b.lines, lay, target)?;
+        let line = &b.lines[vr.line];
+        let tv = table_view(line, &lay)?;
+        if !matches!(tv.sub_kind(vr.sub), SubKind::Content(_)) {
+            return None;
+        }
+        let col = (m.col - content_start) as usize;
+        if col >= tv.geo.total {
+            return None;
+        }
+        let byte = tbl::offset_at(&tv, vr.sub, col).min(line.len());
+        let row = &tv.parsed().rows[tv.row];
+        if row.delim || row.cells.is_empty() {
+            return None;
+        }
+        let column = row
+            .cells
+            .iter()
+            .position(|cell| byte <= cell.zone_end as usize)
+            .unwrap_or(row.cells.len() - 1);
+        Some((vr.line, column))
     }
 
     fn on_left_click(&mut self, m: Mouse, now: Instant) {
@@ -424,7 +519,7 @@ impl App {
     /// Posiciona o cursor do texto na celula clicada.
     fn place_cursor_at(&mut self, m: Mouse) -> bool {
         let lay = self.layout(false);
-        let col = (m.col - (self.left_width + 1 + 6 + 1)).max(0) as usize;
+        let col = (m.col - (self.left_width + 1 + self.gutter_width(false) as i32 + 1)).max(0) as usize;
         let screen_row = (m.row - 2).max(0) as usize;
         let Some(b) = self.buf_mut() else { return false };
         let target = screen_row + b.scroll_y;
@@ -434,7 +529,14 @@ impl App {
             b.clamp_cursor();
             return true;
         }
-        false
+        // Clique abaixo da ultima linha: vai para o ultimo caractere da ultima
+        // linha visivel, em vez de nao mover o cursor.
+        let last = b.lines.iter().rposition(|l| !l.hidden).unwrap_or(0);
+        b.cy = last;
+        let len = b.lines[last].len();
+        b.cx = if len == 0 { 0 } else { prev_char_start(&b.lines[last].text, len) };
+        b.clamp_cursor();
+        true
     }
 
     fn click_editor(&mut self, m: Mouse, now: Instant, previous: Option<EditorClick>) {

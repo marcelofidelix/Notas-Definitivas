@@ -142,6 +142,7 @@ pub fn draw(app: &mut App) -> String {
             hit: HitMap::default(),
             marquee: false,
             tick: 0,
+            gutter: 0,
         };
         f.run();
         (f.rows, f.cursor, f.hit, f.marquee, f.tick)
@@ -222,6 +223,8 @@ struct Frame<'a> {
     hit: HitMap,
     marquee: bool,
     tick: u128,
+    /// Calha do numero de linha (cresce em notas com mais de 9.999 linhas).
+    gutter: i32,
 }
 
 impl<'a> Frame<'a> {
@@ -249,6 +252,7 @@ impl<'a> Frame<'a> {
         let app = self.app;
         let editor_rows = (app.rows - 3).max(0);
         let in_preview = app.in_preview();
+        self.gutter = app.gutter_width(in_preview) as i32;
         let lay = app.layout(in_preview);
         let (lines, scroll): (&[Line], usize) = if let (true, Some(p)) = (in_preview, app.preview.as_ref()) {
             (&p.lines, p.scroll_y)
@@ -725,8 +729,10 @@ impl<'a> Frame<'a> {
             }
             _ => {
                 self.p(th.fg_muted);
-                self.p("~     ");
-                self.pad(ew - 1 - 6);
+                self.p("~");
+                let gutter = self.gutter;
+                self.pad(gutter - 1);
+                self.pad(ew - 1 - gutter);
             }
         }
         self.p("\x1b[K");
@@ -740,6 +746,7 @@ impl<'a> Frame<'a> {
         if ew <= 0 {
             return;
         }
+        let gutter = self.gutter;
         if !in_preview && app.tabs.is_empty() {
             self.empty_row(ew, screen_row);
             return;
@@ -747,8 +754,9 @@ impl<'a> Frame<'a> {
         self.p(th.bg_main);
         let Some(vr) = cur else {
             self.p(th.fg_muted);
-            self.p("~     ");
-            self.pad(ew - 1 - 6);
+            self.p("~");
+            self.pad(gutter - 1);
+            self.pad(ew - 1 - gutter);
             self.p("\x1b[K");
             self.p(RESET);
             return;
@@ -766,13 +774,14 @@ impl<'a> Frame<'a> {
         // Numero da linha e indicador de dobra.
         // Numero da linha no primeiro trecho de conteudo (numa tabela, depois da borda).
         let lnum = if vr.sub == tv.as_ref().map_or(0, |t| t.content_range().0) {
+            let digits = (gutter - 2) as usize;
             if l.heading > 0 {
-                format!("{:>4} {}", vr.line + 1, if l.folded { "▸" } else { "▾" })
+                format!("{:>width$} {}", vr.line + 1, if l.folded { "▸" } else { "▾" }, width = digits)
             } else {
-                format!("{:>4}  ", vr.line + 1)
+                format!("{:>width$}  ", vr.line + 1, width = digits)
             }
         } else {
-            "      ".to_string()
+            " ".repeat(gutter as usize)
         };
         if is_cur_line {
             self.p(th.fg_h1);
@@ -818,7 +827,7 @@ impl<'a> Frame<'a> {
         }
         if l.fence {
             self.p(th.bg_cur_line);
-            let mut printed = 6;
+            let mut printed = gutter;
             let indent: String = l.text.chars().take_while(|c| matches!(c, ' ' | '\t')).collect();
             self.p(&indent);
             printed += indent.len() as i32;
@@ -868,7 +877,7 @@ impl<'a> Frame<'a> {
 
         if let Some(tv) = &tv {
             let last = vr.sub + 1 >= tv.nsub();
-            self.table_sub(tv, vr.sub, cur_bg, line_bg, ew, line_sel, linewise, last, &hits, cur_hit);
+            self.table_sub(tv, vr.sub, cur_bg, line_bg, ew, gutter, line_sel, linewise, last, &hits, cur_hit);
             return;
         }
 
@@ -895,7 +904,7 @@ impl<'a> Frame<'a> {
         let text: &str = &l.text;
         let end = vr.seg.off + vr.seg.len;
         let mut idx = vr.seg.off;
-        let mut cols = 6;
+        let mut cols = gutter;
         let mut fundo_trocado = false;
         while idx < end && cols < ew - 1 {
             if let Some((pos, ch)) = bul {
@@ -1025,6 +1034,7 @@ impl<'a> Frame<'a> {
         cur_bg: bool,
         line_bg: &str,
         ew: i32,
+        gutter: i32,
         line_sel: Option<(usize, usize, bool)>,
         linewise: bool,
         last_subrow: bool,
@@ -1130,7 +1140,7 @@ impl<'a> Frame<'a> {
             self.p(&s);
         }
         self.p(RESET);
-        self.fill_tail(6 + geo.total as i32, ew, line_bg, line_sel, linewise, last_subrow);
+        self.fill_tail(gutter + geo.total as i32, ew, line_bg, line_sel, linewise, last_subrow);
         self.p("\x1b[K");
         self.p(RESET);
     }
@@ -1180,7 +1190,7 @@ impl<'a> Frame<'a> {
         last_subrow: bool,
     ) {
         let th = self.th;
-        let mut cols = 6;
+        let mut cols = self.gutter;
         for (i, c) in text.char_indices() {
             let (cw, piece): (i32, String) = if c == '\t' {
                 let w = 4.min((ew - 1 - cols).max(0));
@@ -1230,7 +1240,7 @@ impl<'a> Frame<'a> {
     ) {
         let th = self.th;
         let (a, z, _) = line_sel;
-        let mut cols = 6;
+        let mut cols = self.gutter;
         self.p(fg);
         for (i, c) in text.char_indices() {
             let (cw, piece): (i32, String) = if c == '\t' {
@@ -1360,7 +1370,7 @@ impl<'a> Frame<'a> {
     /// Colorizacao leve de blocos de codigo. Devolve as colunas usadas.
     fn code_line(&mut self, text: &str, max_w: i32) -> i32 {
         let th = self.th;
-        let mut cols = 6;
+        let mut cols = self.gutter;
         let t = text;
         let b = t.as_bytes();
         let mut i = 0;
@@ -1702,7 +1712,55 @@ impl<'a> Frame<'a> {
         let app = self.app;
         let cols = app.cols;
         self.p(th.bg_status);
-        if app.mode == Mode::Command {
+        if let Some(menu) = app.table_menu {
+            let compact = cols < 72;
+            let title = if compact {
+                format!(" Coluna {}: ", menu.column + 1)
+            } else {
+                format!(" Ordenar tabela — coluna {}: ", menu.column + 1)
+            };
+            let asc = if compact { " [1]A→Z " } else { " [1] A→Z " };
+            let desc = if compact { " [2]Z→A " } else { " [2] Z→A " };
+            let hint = if compact { " (Esc)" } else { "  (↑↓/Tab, Enter; Esc cancela)" };
+            self.p(th.fg_white);
+            self.p(BOLD);
+            self.txt(&title);
+            let mut col = 1 + str_width(&title) as i32;
+
+            let start = col;
+            if menu.selected == 0 {
+                self.p(th.bg_select);
+                self.p(th.fg_dark);
+                self.p(BOLD);
+            } else {
+                self.p(th.fg_white);
+            }
+            self.p(asc);
+            col += str_width(asc) as i32;
+            self.hit.menu_asc = (start, col);
+            self.p(RESET);
+            self.p(th.bg_status);
+
+            let start = col;
+            if menu.selected == 1 {
+                self.p(th.bg_select);
+                self.p(th.fg_dark);
+                self.p(BOLD);
+            } else {
+                self.p(th.fg_white);
+            }
+            self.p(desc);
+            col += str_width(desc) as i32;
+            self.hit.menu_desc = (start, col);
+            self.p(RESET);
+            self.p(th.bg_status);
+
+            let hint = truncate_display(hint, (cols - col).max(0) as usize);
+            self.p(th.fg_muted);
+            self.p(&hint);
+            col += str_width(&hint) as i32;
+            self.pad(cols - col);
+        } else if app.mode == Mode::Command {
             self.p(th.fg_h1);
             self.p(BOLD);
             self.p(":");
@@ -1749,6 +1807,11 @@ impl<'a> Frame<'a> {
     fn place_cursor(&mut self, editor_rows: i32) {
         let app = self.app;
         let rows = app.rows;
+        if app.table_menu.is_some() {
+            // O menu e navegado por realce proprio; o cursor do editor fica oculto.
+            self.p("\x1b[?25l");
+            return;
+        }
         match app.mode {
             Mode::Command => {
                 let col = 1 + width_len(&app.cmd_buf, app.cmd_cursor) as i32 + 1;
@@ -1780,7 +1843,8 @@ impl<'a> Frame<'a> {
                 let (vrow, vcol) = crate::layout::cursor_visual_pos(b, &lay);
                 let cy = (vrow as i32 - b.scroll_y as i32 + 2).clamp(2, editor_rows.max(2));
                 let lo = app.left_width + 2;
-                let cx = (app.left_width + 1 + 6 + vcol as i32 + 1).clamp(lo, app.cols.max(lo));
+                let gutter = app.gutter_width(false) as i32;
+                let cx = (app.left_width + 1 + gutter + vcol as i32 + 1).clamp(lo, app.cols.max(lo));
                 let shape = if app.mode == Mode::Insert { CURSOR_BAR } else { CURSOR_BLOCK };
                 self.p(&format!("\x1b[{};{}H{}\x1b[?25h", cy, cx, shape));
             }

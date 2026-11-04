@@ -162,6 +162,10 @@ impl App {
     /// modo Insercao) com o cursor nela, a tabela e realinhada.
     pub fn on_key(&mut self, key: Key) {
         self.last_editor_click = None;
+        if self.table_menu.is_some() {
+            self.handle_table_menu_key(key);
+            return;
+        }
         let in_table = self.mode == Mode::Insert
             && self.focus == Focus::Right
             && self.buf().is_some_and(|b| is_table_line(&b.cur().text));
@@ -172,6 +176,35 @@ impl App {
             if self.active == active && (self.mode != Mode::Insert || moved) {
                 self.table_autoalign(y);
             }
+        }
+    }
+
+    /// O menu de contexto da tabela e modal enquanto esta aberto: setas/Tab
+    /// alternam a opcao, Enter aplica, 1/2 aplicam direto e Esc cancela.
+    fn handle_table_menu_key(&mut self, key: Key) {
+        self.last_activity = Instant::now();
+        self.needs_redraw = true;
+        match key {
+            Key::Esc | Key::Ctrl('c') => self.cancel_table_menu(),
+            Key::Up | Key::Down | Key::Left | Key::Right | Key::Tab | Key::Char('j' | 'k') => {
+                if let Some(menu) = self.table_menu.as_mut() {
+                    menu.selected = 1 - menu.selected;
+                }
+            }
+            Key::Enter => self.apply_table_menu(),
+            Key::Char('1' | 'a' | 'A') => {
+                if let Some(menu) = self.table_menu.as_mut() {
+                    menu.selected = 0;
+                }
+                self.apply_table_menu();
+            }
+            Key::Char('2' | 'z' | 'Z') => {
+                if let Some(menu) = self.table_menu.as_mut() {
+                    menu.selected = 1;
+                }
+                self.apply_table_menu();
+            }
+            _ => {}
         }
     }
 
@@ -281,6 +314,9 @@ impl App {
 
     /// Esc: sempre volta ao modo Normal com o foco no editor.
     fn generic_escape(&mut self) {
+        // Esc no modo Normal encerra a busca da nota: some o realce e `n`/`N`
+        // deixam de navegar. Nos outros modos o Esc apenas sai do modo.
+        let search_was_active = self.mode == Mode::Normal && self.deactivate_search();
         match self.mode {
             Mode::SearchLeft => {
                 self.search_query.clear();
@@ -306,7 +342,7 @@ impl App {
         self.mode = Mode::Normal;
         self.focus = Focus::Right;
         self.pending = Pending::None;
-        self.set_status("-- MODO NORMAL --");
+        self.set_status(if search_was_active { "Busca desativada." } else { "-- MODO NORMAL --" });
     }
 
     fn start_sidebar_search(&mut self, msg: &str) {

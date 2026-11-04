@@ -51,7 +51,13 @@ O editor Rust oferece: edição modal (Normal, Inserção, Visual caractere/linh
 - **Seleção sempre visível** (`v`/`V`/`Shift+Setas`): V-Line realça a linha inteira (inclusive vazias e blocos de código), `v` realça o trecho exato e a quebra de linha, e a barra de status mostra quantas linhas/caracteres serão copiados.
 - **Quebra de linha por largura real** (ideogramas/emoji = 2 colunas) e blocos de código sem duplicar linhas; recuo e TAB preservados.
 - **Detalhes de edição:** `$` vai ao último caractere (como no Vim); `r`, `dd`, `gg`, `za`… são comandos de várias teclas não bloqueantes; busca lateral com edição completa (`←`, `→`, `Home`, `End`, `Ctrl+←/→`); `PageUp`/`PageDown`; tabelas sem limite de 128 linhas (continuam recusando > 32 colunas, sem perder dados); lista lateral e rolagem com a mesma altura.
+- **Notas com mais de 9.999 linhas:** a calha do número de linha ganha uma coluna quando o contador passa de quatro dígitos. Antes o número de cinco dígitos empurrava o texto e deixava o cursor (e o clique do mouse) uma casa fora de lugar.
+- **Clique abaixo da última linha:** em notas curtas, clicar no espaço vazio abaixo do texto leva o cursor ao **último caractere da última linha** (antes o clique era ignorado).
 - **Falhas de gravação nunca perdem dados:** gravação atômica (`tmp` + `fsync` + `rename`), `COMMIT`/`ROLLBACK` verificados, fechar/sair salva tudo antes, e um pânico inesperado dispara salvamento de emergência.
+
+## 🖱️ Roda do mouse
+
+No editor, girar a roda do mouse move o **cursor do texto** uma linha visual para baixo/cima, como `j`/`k` — inclusive dentro de linhas quebradas e de células de tabela. A visualização acompanha o cursor, então notas longas podem ser percorridas até o fim; antes a rolagem parava quando o cursor chegava ao topo da tela. Na lista lateral a roda continua rolando a lista e, na prévia de uma nota, rola o texto da prévia sem mexer no cursor da nota.
 
 ## ☑ Lista de tarefas
 
@@ -88,6 +94,7 @@ Duas linhas ou mais começando por `|` formam uma tabela (`|a|b|c|` na primeira 
 - **Alinhamento** pela linha delimitadora (`:--` esquerda, `:-:` centro, `--:` direita); colunas só de números ficam à direita sozinhas.
 - **Marcação dentro das células:** `**negrito**`, `*itálico*`, `[link](url)` e `[[wikilink]]` são exibidos como no resto da nota (sem os delimitadores).
 - **Cursor e mouse** seguem as células: `j`/`k` percorrem o texto quebrado da célula e depois passam para a linha seguinte/anterior mantendo a coluna; um clique cai no texto sob o ponteiro; seleção `v`/`V` realça normalmente.
+- **Ordenar coluna (botão direito):** clique com o botão direito sobre uma célula da tabela — ou selecione o texto de uma coluna e clique com o direito — para abrir o menu **`[1] A→Z`** / **`[2] Z→A`**. A ordenação usa a coluna clicada, mantém o cabeçalho e a linha delimitadora no lugar, ignora maiúsculas e acentos, põe células vazias no fim e é um único passo do `u`. No teclado: `↓`/`Tab` alterna a opção, `1`/`2` aplicam direto, `Enter` confirma e `Esc` cancela.
 - Linhas alternadas ganham um fundo suave; a linha do cursor é realçada.
 - Se a janela é tão estreita que nem a largura mínima de cada coluna cabe, ou com `:nowrap`, a tabela volta ao texto cru (cortado na borda) em vez de ficar ilegível. Tabelas com mais de 32 colunas também.
 ## 🔢 Prefixo numérico (como no Vim)
@@ -119,6 +126,7 @@ Os demais comandos ignoram o prefixo. Números enormes são seguros (limite de 1
 - A barra de status mostra **`Ocorrência 3/17 na linha 42`** — posição e total.
 - O realce vale no texto, nas **tabelas desenhadas** (dentro das células) e nos **blocos de código**; em linhas de código o realce vem sem a colorização de sintaxe, para o destaque ficar exato.
 - **`:noh`** (`:nohlsearch`) desliga o realce e **mantém o padrão**: `n`/`N` continuam navegando. Uma busca nova religa o realce.
+- **`Esc` encerra a busca da nota:** o realce some e `n`/`N` param de navegar (equivale a apagar o padrão). Para apenas esconder o realce mantendo `n`/`N`, use `:noh`.
 - A ocorrência pode estar em qualquer coluna da linha (antes, `n` parava no início da linha). A comparação é por caixa, não por acentos: `/acao` não acha `ação` — para isso existe a busca lateral (`Ctrl+F`), que ignora acentos.
 ## 🔗 Copiar o link da nota
 
@@ -182,7 +190,7 @@ Oportunidades ainda abertas (maiores, não medidas como problema hoje): custo do
 ## Testes
 
 ```bash
-cargo test                       # 171 testes (unitarios + integracao, rapidos)
+cargo test                       # 188 testes (unitarios + integracao, rapidos)
 NOTAS_FUZZ_SEEDS=2000 NOTAS_FUZZ_STEPS=5000 cargo test --release fuzz   # campanha longa
 cargo test dump_frames -- --ignored    # NOTAS_DUMP_DIR=pasta: grava quadros de varios estados
 ```
