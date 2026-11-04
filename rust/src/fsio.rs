@@ -135,6 +135,9 @@ pub fn import_notes_from_dir(db: &Db, dir: &str) -> Result<ImportReport, String>
 
 /// Exporta cada nota como `<nome>.md` (nome higienizado) com escrita atomica.
 /// Devolve quantas foram gravadas; erro se nada pode ser gravado.
+///
+/// Nomes diferentes podem higienizar para o mesmo arquivo (`a:b` e `a*b` viram
+/// `a_b`): o segundo recebe um sufixo, em vez de sobrescrever o primeiro.
 pub fn export_notes_to_dir(db: &Db, dir: &str) -> Result<usize, String> {
     if dir.is_empty() {
         return Err("nenhuma pasta informada".into());
@@ -144,11 +147,19 @@ pub fn export_notes_to_dir(db: &Db, dir: &str) -> Result<usize, String> {
         format!("nao foi possivel criar a pasta: {}", shown)
     })?;
     let (mut written, mut failed) = (0usize, 0usize);
+    let mut usados: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, content) in db.all_name_content() {
-        let safe = sanitize_note_name(&name);
-        if safe.is_empty() {
+        let base = sanitize_note_name(&name);
+        if base.is_empty() {
             failed += 1;
             continue;
+        }
+        // Windows e macOS nao diferenciam maiusculas no nome do arquivo.
+        let mut safe = base.clone();
+        let mut n = 2;
+        while !usados.insert(safe.to_lowercase()) {
+            safe = format!("{base} ({n})");
+            n += 1;
         }
         let path = Path::new(dir).join(format!("{}.md", safe));
         if write_file_atomic(&path, content.as_bytes()).is_ok() {
@@ -176,6 +187,37 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"dois");
         let n = fs::read_dir(d.path()).unwrap().count();
         assert_eq!(n, 1, "nenhum .tmp sobra");
+    }
+
+    #[test]
+    fn import_and_export_survive_awkward_names() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("entrada");
+        fs::create_dir(&src).unwrap();
+        for (f, body) in [
+            ("Ação, ñ e 日本語.md", "acentos e ideogramas"),
+            ("nota com espacos.markdown", "espacos"),
+            ("sem-extensao", "sem extensao"),
+            ("-traco no inicio.md", "traco"),
+            (".oculta.md", "nao deve entrar"),
+        ] {
+            fs::write(src.join(f), body).unwrap();
+        }
+        let db = Db::open_memory();
+        let r = import_notes_from_dir(&db, src.to_str().unwrap()).unwrap();
+        assert_eq!((r.added, r.updated), (4, 0), "arquivo oculto fica de fora");
+
+        // Nomes que so existem em banco (a versao em C ou um banco vindo do
+        // Linux podem te-los) higienizam para o mesmo arquivo.
+        db.insert_note("a:b", "dois pontos", 1, 0).unwrap();
+        db.insert_note("a*b", "asterisco", 2, 0).unwrap();
+
+        let out = d.path().join("saida");
+        let n = export_notes_to_dir(&db, out.to_str().unwrap()).unwrap();
+        let arquivos = fs::read_dir(&out).unwrap().count();
+        assert_eq!(n, 6);
+        assert_eq!(arquivos, 6, "nenhuma nota pode sobrescrever a outra");
+        assert_eq!(fs::read_to_string(out.join("Ação, ñ e 日本語.md")).unwrap(), "acentos e ideogramas");
     }
 
     #[test]
