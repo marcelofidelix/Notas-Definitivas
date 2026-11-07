@@ -17,6 +17,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 crossterm = { version = "0.28", features = ["bracketed-paste"] }
 # Area de transferencia do sistema (Win32 CF_UNICODETEXT, X11, Wayland).
 arboard = { version = "3", default-features = false }
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -30,9 +31,6 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(unix)'.dependencies]
 # Sinais de termino (SIGTERM/SIGHUP/SIGQUIT) para salvar antes de sair.
 libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 opt-level = 3

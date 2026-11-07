@@ -1,7 +1,8 @@
 //! Camada SQLite. Mesmo esquema e mesmas regras da versao em C: o `notas.db`
 //! e intercambiavel entre as duas versoes.
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
 pub const DB_SCHEMA_VERSION: i32 = 1;
@@ -28,6 +29,12 @@ pub fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn note_version(name: &str, mtime: i64, content: &str) -> u64 {
+    let mut hash = DefaultHasher::new();
+    (name, mtime, content).hash(&mut hash);
+    hash.finish()
 }
 
 fn clamp_attention(level: i64) -> u8 {
@@ -126,14 +133,47 @@ impl Db {
         Db { conn, warnings: Vec::new() }
     }
 
-    pub fn begin(&self) -> bool {
-        self.conn.execute_batch("BEGIN TRANSACTION;").is_ok()
+    pub fn transaction(&self, behavior: TransactionBehavior) -> rusqlite::Result<Transaction<'_>> {
+        Transaction::new_unchecked(&self.conn, behavior)
     }
-    pub fn commit(&self) -> bool {
-        self.conn.execute_batch("COMMIT;").is_ok()
+
+    /// Nome, conteúdo e versão pertencem à mesma leitura do SQLite.
+    pub fn snapshot(&self, id: i64) -> rusqlite::Result<(String, String, u64)> {
+        self.conn.prepare_cached("SELECT name, content, mtime FROM notes WHERE id=?1")?
+            .query_row([id], |row| {
+                let name: String = row.get(0)?;
+                let content: String = row.get(1)?;
+                let mtime: i64 = row.get(2)?;
+                let version = note_version(&name, mtime, &content);
+                Ok((name, content, version))
+            })
     }
-    pub fn rollback(&self) {
-        let _ = self.conn.execute_batch("ROLLBACK;");
+
+    /// Reserva o escritor antes de conferir a versão. O nome, o texto e o índice
+    /// de busca passam para a nova versão no mesmo commit.
+    pub fn save_note(
+        &self,
+        id: i64,
+        expected: Option<u64>,
+        rename: Option<&str>,
+        content: &str,
+    ) -> Result<u64, String> {
+        let tx = self.transaction(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let (name, _, current) = self.snapshot(id).map_err(|e| e.to_string())?;
+        if expected.is_some_and(|v| v != current) {
+            return Err("nota alterada em outro lugar; :e! recarrega ou :w! sobrescreve".into());
+        }
+        let name = rename.unwrap_or(&name);
+        let mtime = now_secs();
+        let rows = tx.execute(
+            "UPDATE notes SET name=?1, content=?2, mtime=?3, content_norm=?4 WHERE id=?5",
+            params![name, content, mtime, crate::notes::build_content_norm(content), id],
+        ).map_err(|e| e.to_string())?;
+        if rows != 1 {
+            return Err("nenhuma nota foi gravada".into());
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(note_version(name, mtime, content))
     }
 
     pub fn find_id_by_name(&self, name: &str) -> Option<i64> {
@@ -163,19 +203,21 @@ impl Db {
         Some(self.conn.last_insert_rowid())
     }
 
-    pub fn update_content(&self, id: i64, content: &str, mtime: i64) -> bool {
-        if id <= 0 {
-            return false;
-        }
-        let mtime = if mtime > 0 { mtime } else { now_secs() };
-        // O indice de busca e gravado junto com o conteudo: assim ele nunca fica
-        // desatualizado por um caminho de gravacao que esqueca de atualiza-lo.
+    pub fn import_note(&self, name: &str, content: &str, mtime: i64) -> rusqlite::Result<bool> {
         let norm = crate::notes::build_content_norm(content);
-        self.conn
-            .prepare_cached("UPDATE notes SET content=?1, mtime=?2, content_norm=?3 WHERE id=?4;")
-            .and_then(|mut st| st.execute(params![content, mtime, norm, id]))
-            .map(|n| n > 0)
-            .unwrap_or(false)
+        let updated = self.conn.prepare_cached(
+            "UPDATE notes SET content=?1, mtime=?2, content_norm=?3 WHERE name=?4",
+        )?.execute(params![content, mtime, norm, name])?;
+        if updated == 1 {
+            return Ok(false);
+        }
+        let inserted = self.conn.prepare_cached(
+            "INSERT INTO notes(name, content, mtime, content_norm, attention) VALUES(?1,?2,?3,?4,0)",
+        )?.execute(params![name, content, mtime, norm])?;
+        if inserted != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(true)
     }
 
     /// Indice de busca de todas as notas (`None` quando ainda nao foi gerado).
@@ -202,18 +244,6 @@ impl Db {
                 .is_ok()
     }
 
-    /// Falha (false) se ja existir outra nota com esse nome (UNIQUE).
-    pub fn update_name(&self, id: i64, new_name: &str) -> bool {
-        if id <= 0 || new_name.is_empty() {
-            return false;
-        }
-        self.conn
-            .prepare_cached("UPDATE notes SET name=?1 WHERE id=?2;")
-            .and_then(|mut st| st.execute(params![new_name, id]))
-            .map(|n| n > 0)
-            .unwrap_or(false)
-    }
-
     pub fn delete_note(&self, id: i64) -> bool {
         if id <= 0 {
             return false;
@@ -236,6 +266,7 @@ impl Db {
     }
 
     /// Data de modificacao gravada (usada para detectar alteracao por outra instancia).
+    #[cfg(test)]
     pub fn get_mtime(&self, id: i64) -> Option<i64> {
         self.conn
             .prepare_cached("SELECT mtime FROM notes WHERE id=?1;")
@@ -314,7 +345,7 @@ mod tests {
         assert!(norm(&db).contains("conteudo"), "{:?}", norm(&db));
         assert!(norm(&db).contains("titulo"), "o acento e dobrado na normalizacao");
         // Gravar conteudo novo atualiza o indice na mesma instrucao.
-        assert!(db.update_content(id, "outro texto sem acento", 2));
+        db.save_note(id, None, None, "outro texto sem acento").unwrap();
         assert!(norm(&db).contains("outro"));
         assert!(!norm(&db).contains("conteudo"));
     }
@@ -355,7 +386,7 @@ mod tests {
         assert_eq!(db.find_id_by_name("Alfa"), Some(id));
         assert_eq!(db.get_content(id).as_deref(), Some("# Alfa\n"));
         assert_eq!(db.get_name(id).as_deref(), Some("Alfa"));
-        assert!(db.update_content(id, "novo", 2000));
+        db.save_note(id, None, None, "novo").unwrap();
         assert_eq!(db.get_content(id).as_deref(), Some("novo"));
         assert!(db.set_attention(id, 9));
         assert_eq!(db.list_notes()[0].attention, 6, "nivel e limitado a 0..6");
@@ -371,8 +402,8 @@ mod tests {
         let a = db.insert_note("A", "", 1, 0).unwrap();
         let _b = db.insert_note("B", "", 1, 0).unwrap();
         assert!(db.insert_note("A", "", 1, 0).is_none());
-        assert!(!db.update_name(a, "B"), "UNIQUE impede o nome repetido");
-        assert!(db.update_name(a, "C"));
+        assert!(db.save_note(a, None, Some("B"), "").is_err());
+        assert!(db.save_note(a, None, Some("C"), "").is_ok());
         assert_eq!(db.find_id_by_name("C"), Some(a));
     }
 
@@ -389,9 +420,9 @@ mod tests {
     #[test]
     fn transaction_rollback_discards_inserts() {
         let db = Db::open_memory();
-        assert!(db.begin());
+        let tx = db.transaction(TransactionBehavior::Deferred).unwrap();
         db.insert_note("T", "", 1, 0).unwrap();
-        db.rollback();
+        tx.rollback().unwrap();
         assert_eq!(db.count_notes(), 0);
     }
 }

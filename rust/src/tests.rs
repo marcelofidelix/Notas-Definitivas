@@ -425,6 +425,171 @@ fn wiki_links_open_and_create_notes() {
 }
 
 #[test]
+fn forced_quit_discards_only_pending_changes_after_finalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notas.db");
+    let db = Db::open(&path).unwrap();
+    let id = db.insert_note("A", "original\n", 1, 0).unwrap();
+    let mut app = App::new(db);
+    open(&mut app, "A");
+    crate::run_session(&mut app, |a| {
+        keys(a, "A salva<Esc>:w<CR>A descartada<Esc>:q!<CR>");
+        assert!(a.quit);
+        crate::ExitReason::Quit
+    }).unwrap();
+    drop(app);
+    assert_eq!(Db::open(&path).unwrap().get_content(id).unwrap(), "original salva\n");
+}
+
+#[test]
+fn shutdown_and_panic_save_pending_tabs() {
+    for panic in [false, true] {
+        let mut app = app_with(&[("A", "original\n")]);
+        open(&mut app, "A");
+        let result = crate::run_session(&mut app, |a| {
+            keys(a, "A editada<Esc>");
+            if panic { panic!("falha simulada"); }
+            crate::ExitReason::Shutdown
+        });
+        assert_eq!(result.is_err(), panic);
+        assert_eq!(db_text(&app, "A"), "original editada\n");
+    }
+}
+
+#[test]
+fn only_one_concurrent_database_save_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notas.db");
+    let db = Db::open(&path).unwrap();
+    let id = db.insert_note("A", "original", 1, 0).unwrap();
+    let other = Db::open(&path).unwrap();
+    let first_version = db.snapshot(id).unwrap().2;
+    let second_version = other.snapshot(id).unwrap().2;
+    let start = std::sync::Barrier::new(2);
+    let gate = &start;
+    std::thread::scope(|scope| {
+        let a = scope.spawn(move || {
+            gate.wait();
+            other.save_note(id, Some(second_version), None, "primeira")
+        });
+        start.wait();
+        let b = db.save_note(id, Some(first_version), None, "segunda");
+        let a = a.join().unwrap();
+        let (winner, conflict) = match (a, b) {
+            (Ok(_), Err(e)) => ("primeira", e),
+            (Err(e), Ok(_)) => ("segunda", e),
+            results => panic!("resultado inesperado: {results:?}"),
+        };
+        assert!(conflict.contains("alterada em outro lugar"));
+        assert_eq!(db.get_content(id).as_deref(), Some(winner));
+    });
+}
+
+#[test]
+fn file_conflicts_protect_autosave_creation_reload_and_forced_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nova.md");
+    let mut a = new_app();
+    a.open_path_arg(path.clone());
+    keys(&mut a, "ilocal<Esc>");
+    std::fs::write(&path, "").unwrap();
+    keys(&mut a, ":w<CR>");
+    assert!(a.tab().unwrap().modified);
+    assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+    keys(&mut a, ":w!<CR>A pendente<Esc>");
+    assert_eq!(std::fs::read(&path).unwrap(), b"local\n");
+    std::fs::write(&path, "outro\n").unwrap(); // mesmo tamanho
+    a.tab_mut().unwrap().first_unsaved = Some(std::time::Instant::now() - crate::app::AUTOSAVE_DELAY);
+    a.check_autosave();
+    assert!(a.tab().unwrap().modified);
+    assert!(a.status_text().unwrap().contains("alterada em outro lugar"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "outro\n");
+    keys(&mut a, ":e!<CR>A aceita<Esc>:w<CR>");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "outro aceita\n");
+    assert!(!a.tab().unwrap().modified);
+
+    keys(&mut a, "Ax<Esc>");
+    std::fs::remove_file(&path).unwrap();
+    keys(&mut a, ":w<CR>");
+    assert!(a.tab().unwrap().modified);
+    assert!(!path.exists());
+}
+
+#[test]
+fn renaming_preserves_pending_edits_on_conflict() {
+    let mut a = app_with(&[("Antiga", "# Antiga\ntexto\n")]);
+    open(&mut a, "Antiga");
+    keys(&mut a, "GA local<Esc>");
+    let key = a.cur_key().unwrap().clone();
+    let id = key.db_id().unwrap();
+    a.db.save_note(id, None, None, "versão externa").unwrap();
+    assert!(!a.rename_note(&key, "Nova"));
+    assert!(a.status_text().unwrap().contains("alterada em outro lugar"));
+    assert_eq!(a.db.get_name(id).as_deref(), Some("Antiga"));
+    assert_eq!(a.db.get_content(id).as_deref(), Some("versão externa"));
+    assert_eq!(lines(&a), ["# Antiga", "texto local"]);
+    assert!(a.tab().unwrap().modified);
+
+    keys(&mut a, ":w!<CR>");
+    assert!(a.rename_note(&key, "Nova"));
+    assert_eq!(a.db.get_name(id).as_deref(), Some("Nova"));
+    assert_eq!(a.db.get_content(id).as_deref(), Some("# Nova\ntexto local\n"));
+    keys(&mut a, "A!<Esc>:w<CR>");
+    assert!(!a.tab().unwrap().modified);
+}
+
+#[test]
+fn standalone_rename_reports_failure_and_keeps_tab_editable() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("Antiga.md");
+    let dest = dir.path().join("Nova.md");
+    std::fs::write(&src, "# Antiga\n").unwrap();
+    std::fs::write(&dest, "ocupado").unwrap();
+    let mut a = new_app();
+    a.open_path_arg(src.clone());
+    keys(&mut a, "Golocal<Esc>");
+    let key = a.cur_key().unwrap().clone();
+    assert!(!a.rename_note(&key, "Nova"));
+    assert!(a.status_text().unwrap().contains("falha ao criar"));
+    assert!(a.tab().unwrap().modified);
+    assert_eq!(lines(&a), ["# Antiga", "local"]);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "ocupado");
+    assert_eq!(std::fs::read_to_string(&src).unwrap(), "# Antiga\n");
+    std::fs::remove_file(&dest).unwrap();
+    assert!(a.rename_note(&key, "Nova"));
+    assert!(!src.exists());
+    assert_eq!(a.cur_key(), Some(&NoteKey::File(dest.clone())));
+    keys(&mut a, "A!<Esc>:w<CR>");
+    assert_eq!(std::fs::read_to_string(dest).unwrap(), "# Nova\nlocal!\n");
+}
+
+#[test]
+fn large_search_prefix_wraps_in_both_directions() {
+    let mut a = app_with(&[("Busca", "á á á\n")]);
+    open(&mut a, "Busca");
+    keys(&mut a, "/á<CR>1000000n");
+    assert_eq!(a.search_at, Some((0, "á ".len())));
+    keys(&mut a, "1000000N");
+    assert_eq!(a.search_at, Some((0, 0)));
+    keys(&mut a, "3N");
+    assert_eq!(a.search_at, Some((0, 0)));
+}
+
+#[test]
+fn paste_over_unicode_selection_is_one_undo_step() {
+    let mut a = app_with(&[("P", "até\né fim\n")]);
+    open(&mut a, "P");
+    a.yank = "já\nfoi".into();
+    keys(&mut a, "llvj0p");
+    assert_eq!(lines(&a), ["atjá", "foi fim"]);
+    keys(&mut a, "u");
+    assert_eq!(lines(&a), ["até", "é fim"]);
+    keys(&mut a, "<C-r>");
+    assert_eq!(lines(&a), ["atjá", "foi fim"]);
+}
+
+#[test]
 fn quit_is_protected_and_wq_saves_everything() {
     let mut a = app_with(&[("A", "x\n"), ("B", "y\n")]);
     open(&mut a, "A");
@@ -878,7 +1043,7 @@ fn change_by_another_instance_in_the_same_second_is_detected() {
 
     // A outra instancia grava por cima mantendo o MESMO mtime (mesmo segundo).
     let mtime = a.db.get_mtime(id).unwrap();
-    assert!(outra.update_content(id, "# Alfa\nalterado por fora\n", mtime));
+    assert!(!outra.import_note("Alfa", "# Alfa\nalterado por fora\n", mtime).unwrap());
 
     assert!(!a.save_tab(0), "gravar por cima perderia a alteracao da outra instancia");
     assert!(
@@ -1416,7 +1581,7 @@ fn saving_never_silently_overwrites_changes_made_elsewhere() {
     keys(&mut a, "A minha edicao<Esc>");
     // Outra instancia (ou importacao) grava a mesma nota enquanto ela esta aberta.
     let id = a.notes[0].key.db_id().unwrap();
-    assert!(a.db.update_content(id, "versao da outra instancia\n", crate::db::now_secs() + 10));
+    a.db.save_note(id, None, None, "versao da outra instancia\n").unwrap();
 
     keys(&mut a, ":w<CR>");
     assert!(a.tab().unwrap().modified, "nada foi gravado");
@@ -1444,7 +1609,7 @@ fn reload_discards_edits_and_picks_up_the_other_version() {
     open(&mut a, "Nota");
     keys(&mut a, "Aruido<Esc>");
     let id = a.notes[0].key.db_id().unwrap();
-    a.db.update_content(id, "nova versao\n", crate::db::now_secs() + 5);
+    a.db.save_note(id, None, None, "nova versao\n").unwrap();
     keys(&mut a, ":e!<CR>");
     assert_eq!(lines(&a), ["nova versao"]);
     assert!(!a.tab().unwrap().modified);
@@ -1458,7 +1623,7 @@ fn failed_autosave_backs_off_instead_of_retrying_every_tick() {
     open(&mut a, "Nota");
     keys(&mut a, "iabc<Esc>");
     let id = a.notes[0].key.db_id().unwrap();
-    a.db.update_content(id, "outra\n", crate::db::now_secs() + 3);
+    a.db.save_note(id, None, None, "outra\n").unwrap();
     a.tab_mut().unwrap().first_unsaved = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
     a.check_autosave();
     assert!(a.tab().unwrap().modified, "conflito: nao grava");

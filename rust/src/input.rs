@@ -850,14 +850,13 @@ impl App {
                     self.set_status("Nenhum texto selecionado para copiar (use Shift+Setas ou Mouse)");
                 }
             }
+            Key::Ctrl('v') if self.buf().is_some_and(|b| b.has_selection) => {
+                self.paste_replace_selection();
+            }
             Key::Ctrl('v') => {
                 if let Some(t) = crate::clip::paste() {
                     self.yank_linewise = t.contains('\n');
                     self.yank = t;
-                }
-                if self.buf().is_some_and(|b| b.has_selection) {
-                    self.delete_visual_ex(false);
-                    self.with_buf(|b| b.has_selection = false);
                 }
                 if self.yank.is_empty() {
                     self.set_status("Área de transferência vazia.");

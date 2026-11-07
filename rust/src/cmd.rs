@@ -52,7 +52,7 @@ impl App {
             }
             "q" | "qa" => {
                 if self.any_tab_modified() {
-                    self.set_status("Modificações não salvas! Use :w para salvar ou :q! para forçar");
+                    self.set_status("Alterações pendentes. Use :wq para salvar todas ou :q! para descartá-las.");
                 } else {
                     self.quit = true;
                 }

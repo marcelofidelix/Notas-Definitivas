@@ -233,13 +233,6 @@ pub enum UndoResult {
 }
 
 impl Buffer {
-    pub fn new_empty() -> Buffer {
-        Buffer {
-            lines: vec![Line::new("")],
-            ..Default::default()
-        }
-    }
-
     /// Carrega texto: ignora BOM UTF-8, aceita CRLF e nao cria linha extra para
     /// o `\n` final. Nunca devolve um buffer sem linhas.
     pub fn from_content(content: &str) -> Buffer {

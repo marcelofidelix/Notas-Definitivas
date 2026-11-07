@@ -54,7 +54,7 @@ O editor Rust oferece: edição modal (Normal, Inserção, Visual caractere/linh
 - **Detalhes de edição:** `$` vai ao último caractere (como no Vim); `r`, `dd`, `gg`, `za`… são comandos de várias teclas não bloqueantes; busca lateral com edição completa (`←`, `→`, `Home`, `End`, `Ctrl+←/→`); `PageUp`/`PageDown`; tabelas sem limite de 128 linhas (continuam recusando > 32 colunas, sem perder dados); lista lateral e rolagem com a mesma altura.
 - **Notas com mais de 9.999 linhas:** a calha do número de linha ganha uma coluna quando o contador passa de quatro dígitos. Antes o número de cinco dígitos empurrava o texto e deixava o cursor (e o clique do mouse) uma casa fora de lugar.
 - **Clique abaixo da última linha:** em notas curtas, clicar no espaço vazio abaixo do texto leva o cursor ao **último caractere da última linha** (antes o clique era ignorado).
-- **Falhas de gravação nunca perdem dados:** gravação atômica (`tmp` + `fsync` + `rename`), `COMMIT`/`ROLLBACK` verificados, fechar/sair salva tudo antes, e um pânico inesperado dispara salvamento de emergência.
+- Ao fechar abas, o editor salva as alterações pendentes. `:wq` salva todas e sai. `:q!` e `:qa!` descartam o que ainda está pendente. Em caso de pânico ou encerramento pelo sistema, o editor tenta um salvamento de emergência.
 
 ## 🖱️ Roda do mouse
 
@@ -159,7 +159,8 @@ O que foi feito:
 - **Histórico de desfazer por diferenças (`history.rs`):** em cada pilha (desfazer e refazer) só o estado mais recente é completo; os anteriores guardam apenas o trecho que mudou (linhas iguais no início e no fim são reconhecidas por ponteiro, sem comparar texto) e são reconstruídos ao desfazer. Uma nota de 20 mil linhas com 150 passos passou de 91 MB para ~1 MB, e o ponto de desfazer ficou mais barato. Verificado contra um modelo de cópias completas em edições aleatórias.
 - **Redesenho incremental:** só as linhas da tela que mudaram são enviadas (ótimo em SSH); o batimento de 30 s, o redimensionamento e a limpeza repintam tudo. Testado: nenhuma linha alterada é omitida, nenhuma igual é reenviada.
 - **Linhas gigantes** (> 20 mil bytes) são tratadas como texto simples (sem varrer links/estilos a cada quadro).
-- **Nunca sobrescrever trabalho alheio:** cada aba guarda o `mtime` **e o hash do texto** que carregou. O `mtime` tem resolução de segundos; o hash detecta até uma alteração feita por outra instância no mesmo segundo. `:w`, o autosave e o fechamento **recusam** com aviso; `:w!` sobrescreve de propósito e `:e!` recarrega do banco.
+- No SQLite, salvar e renomear conferem a versão carregada e gravam na mesma transação. Um conflito mantém a edição na aba. Em arquivos avulsos, o editor compara o conteúdo no disco imediatamente antes da substituição. Se o arquivo estava por criar, a gravação exige que o destino continue livre. Use `:e!` para recarregar ou `:w!` para sobrescrever deliberadamente.
+- A importação de uma pasta é integral. Uma falha de leitura ou gravação em um arquivo elegível desfaz o lote e mostra o caminho e o motivo.
 - **Autosave que falha não entra em laço** (antes repetiria a cada 100 ms): tenta de novo em 1 minuto.
 - **Fechar a janela do console (Windows)** salva as notas pendentes antes de sair (logoff/desligamento também). No Linux/macOS, `SIGTERM`, `SIGHUP` (queda de SSH) e `SIGQUIT` levantam a mesma flag de encerramento.
 - **Pânico deixa rastro:** `notas-crash.log`, ao lado do banco, guarda data, local e mensagem antes de a tela ser restaurada (antes a mensagem do Rust era apagada junto com a tela alternativa).
@@ -191,7 +192,7 @@ Oportunidades ainda abertas (maiores, não medidas como problema hoje): custo do
 ## Testes
 
 ```bash
-cargo test                       # 188 testes (unitarios + integracao, rapidos)
+cargo test                       # suíte padrão (unitários, integração e fuzz)
 NOTAS_FUZZ_SEEDS=2000 NOTAS_FUZZ_STEPS=5000 cargo test --release fuzz   # campanha longa
 cargo test dump_frames -- --ignored    # NOTAS_DUMP_DIR=pasta: grava quadros de varios estados
 ```

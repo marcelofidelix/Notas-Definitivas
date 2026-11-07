@@ -113,15 +113,6 @@ pub fn next_char_end(s: &str, idx: usize) -> usize {
     }
 }
 
-/// Hash estavel do texto (uso interno: detectar alteracao feita por outra
-/// instancia quando o `mtime` empata). Nao e criptografico.
-pub fn hash_text(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
 /// Todas as ocorrencias de `needle` em `haystack`, ignorando a caixa, como
 /// intervalos de bytes `[inicio, fim)`.
 ///

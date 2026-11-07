@@ -218,15 +218,6 @@ impl App {
         }
     }
 
-    /// `3n` / `3N`: anda `n` ocorrencias da busca (para frente ou para tras).
-    pub fn repeat_search(&mut self, n: usize, forward: bool) {
-        for _ in 0..n {
-            if !self.search_occurrence(forward) {
-                break;
-            }
-        }
-    }
-
     /// Texto a colar com `3p`: `n` copias do registro (em linhas separadas se ele
     /// foi copiado por linha), limitado a um tamanho razoavel.
     pub fn repeated_register(&self, n: usize) -> String {

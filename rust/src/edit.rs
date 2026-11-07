@@ -167,14 +167,19 @@ impl App {
             self.yank_linewise = text.contains('\n');
             self.yank = text.clone();
         }
-        self.delete_visual_ex(false);
-        self.mode = Mode::Normal;
-        if let Some(b) = self.buf_mut() {
+        let linewise = self.mode == Mode::VisualLine;
+        self.edit(|b| {
+            b.save_undo();
+            b.delete_selection(linewise, true);
             b.has_selection = false;
+            b.paste(&text);
+        });
+        if self.mode != Mode::Insert {
+            self.mode = Mode::Normal;
         }
-        self.paste_text(&text);
+        self.clear_needed = true;
         self.editor_scroll();
-        self.set_status("Texto colado sobre a seleção com 'p'.");
+        self.set_status("Texto colado sobre a seleção.");
     }
 
     /// Insere texto colado onde estiver o foco: campo de busca/comando/prompt
@@ -362,30 +367,33 @@ impl App {
         self.search_from(pat, false);
     }
 
-    /// `n` (proxima) e `N` (anterior), com volta no fim/inicio da nota.
-    pub fn search_occurrence(&mut self, forward: bool) -> bool {
+    /// Calcula as ocorrências uma vez, inclusive para prefixos como `1000000n`.
+    pub fn repeat_search(&mut self, n: usize, forward: bool) {
         if self.last_search.is_empty() {
             self.set_status("Nenhuma busca anterior (use /texto ou [Localizar])");
-            return false;
+            return;
         }
         let hits = self.search_hits();
         if hits.is_empty() {
             self.search_at = None;
             self.set_status(format!("Padrão não encontrado: {}", self.last_search));
-            return false;
+            return;
         }
         let origin = match self.search_at {
             Some(p) => p,
             None => self.buf().map_or((0, 0), |b| (b.cy, b.cx)),
         };
+        let len = hits.len();
+        let extra = n.saturating_sub(1) % len;
         let idx = if forward {
-            hits.iter().position(|&(l, a, _)| (l, a) > origin).unwrap_or(0)
+            let next = hits.partition_point(|&(line, start, _)| (line, start) <= origin);
+            (next + extra) % len
         } else {
-            hits.iter().rposition(|&(l, a, _)| (l, a) < origin).unwrap_or(hits.len() - 1)
+            let before = hits.partition_point(|&(line, start, _)| (line, start) < origin);
+            (before + len - 1 - extra) % len
         };
         let msg = self.goto_hit(&hits, idx);
         self.set_status(msg);
-        true
     }
 
     /// Realce das ocorrencias ligado (usado pelo desenho).

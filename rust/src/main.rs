@@ -281,7 +281,12 @@ fn next_poll_timeout(app: &App) -> Duration {
     wait.min(app::IDLE_LIFE.saturating_sub(app.last_activity.elapsed()).max(piso))
 }
 
-fn run(app: &mut App) {
+enum ExitReason {
+    Quit,
+    Shutdown,
+}
+
+fn run(app: &mut App) -> ExitReason {
     while !app.quit {
         if let Ok((c, r)) = terminal::size() {
             if i32::from(c) != app.cols || i32::from(r) != app.rows {
@@ -307,7 +312,7 @@ fn run(app: &mut App) {
                         Err(_) => break,
                     }
                     if app.quit {
-                        return;
+                        return ExitReason::Quit;
                     }
                 }
             }
@@ -315,14 +320,29 @@ fn run(app: &mut App) {
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
         if SHUTDOWN.load(Ordering::SeqCst) {
-            app.emergency_save();
-            app.quit = true;
-            return;
+            return ExitReason::Shutdown;
         }
         app.check_autosave();
         if app.last_activity.elapsed() >= app::IDLE_LIFE {
             app.run_life();
         }
+    }
+    ExitReason::Quit
+}
+
+fn run_session(app: &mut App, events: impl FnOnce(&mut App) -> ExitReason) -> Result<(), &'static str> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let result = catch_unwind(AssertUnwindSafe(|| events(app)));
+    if matches!(result, Ok(ExitReason::Quit)) {
+        return Ok(());
+    }
+    let saved = catch_unwind(AssertUnwindSafe(|| app.emergency_save())).unwrap_or(false);
+    if !saved {
+        Err("Falha no salvamento de emergência. Há alterações pendentes.")
+    } else if result.is_err() {
+        Err("Erro interno inesperado. Salvamento de emergência concluído.")
+    } else {
+        Ok(())
     }
 }
 
@@ -391,13 +411,11 @@ fn main() {
         app.set_status(format!("{} | aviso: {}", resumo, warnings.join("; ")));
     }
 
-    // Um panico nao pode custar o que ainda nao foi salvo.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut app)));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.emergency_save()));
+    let result = run_session(&mut app, run);
     drop(guard);
     SHUTDOWN_DONE.store(true, Ordering::SeqCst);
-    if result.is_err() {
-        eprintln!("Erro interno inesperado; as alteracoes pendentes foram salvas.");
+    if let Err(message) = result {
+        eprintln!("{message}");
         std::process::exit(2);
     }
 }

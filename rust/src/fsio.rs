@@ -3,14 +3,14 @@
 use crate::db::{now_secs, Db};
 use crate::text::{is_markdown_ext, sanitize_note_name};
 use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::hash::{DefaultHasher, Hasher};
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 /// Teto para ler um arquivo inteiro (importacao e previa de arquivo avulso).
 pub const MAX_NOTE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Le um arquivo UTF-8 (bytes invalidos viram U+FFFD) respeitando o teto.
-pub fn read_text_file(path: &Path) -> std::io::Result<String> {
+fn read_note_bytes(path: &Path) -> io::Result<Vec<u8>> {
     let f = fs::File::open(path)?;
     let len = f.metadata()?.len();
     if len > MAX_NOTE_FILE_BYTES {
@@ -21,28 +21,101 @@ pub fn read_text_file(path: &Path) -> std::io::Result<String> {
     }
     let mut buf = Vec::with_capacity(len as usize);
     f.take(MAX_NOTE_FILE_BYTES + 1).read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    if buf.len() as u64 > MAX_NOTE_FILE_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "arquivo grande demais"));
+    }
+    Ok(buf)
 }
 
-/// Grava em `<arquivo>.tmp.<pid>`, confere cada etapa, faz `fsync` e so entao
-/// substitui o destino com `rename`: uma falha no meio nunca deixa o destino
-/// truncado.
-pub fn write_file_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".tmp.{}", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    let result = (|| {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.flush()?;
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+pub fn read_text_file(path: &Path) -> io::Result<String> {
+    Ok(String::from_utf8_lossy(&read_note_bytes(path)?).into_owned())
+}
+
+// Os blocos têm o mesmo tamanho ao calcular a versão em memória e no disco.
+const HASH_BLOCK: usize = 32 * 1024;
+
+pub fn file_version(data: &[u8]) -> u64 {
+    let mut hash = DefaultHasher::new();
+    for block in data.chunks(HASH_BLOCK) {
+        hash.write(block);
     }
-    result
+    hash.finish()
+}
+
+pub fn file_snapshot(path: &Path) -> io::Result<(String, u64)> {
+    let bytes = read_note_bytes(path)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), file_version(&bytes)))
+}
+
+pub enum FileWrite {
+    Overwrite,
+    Create,
+    IfUnchanged(u64),
+}
+
+fn check_file_version(path: &Path, expected: u64) -> io::Result<()> {
+    // O buffer pode ter crescido além do limite de importação desde a abertura.
+    // Compare em blocos para que os próximos salvamentos continuem possíveis.
+    let mut file = fs::File::open(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            io::Error::new(e.kind(), "arquivo removido; :w! permite recriá-lo")
+        } else {
+            e
+        }
+    })?;
+    let mut remaining = file.metadata()?.len();
+    let mut block = [0u8; HASH_BLOCK];
+    let mut hash = DefaultHasher::new();
+    while remaining != 0 {
+        let n = remaining.min(HASH_BLOCK as u64) as usize;
+        file.read_exact(&mut block[..n])?;
+        hash.write(&block[..n]);
+        remaining -= n as u64;
+    }
+    if file.read(&mut block[..1])? != 0 || hash.finish() != expected {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "nota alterada em outro lugar; :e! recarrega ou :w! sobrescreve"));
+    }
+    Ok(())
+}
+
+/// Publica um temporário completo no mesmo diretório. Ao criar uma nota nova,
+/// a própria publicação falha se o destino já existir.
+pub fn write_file(path: &Path, data: &[u8], mode: FileWrite) -> io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
+    match mode {
+        FileWrite::Create => tmp.persist_noclobber(path),
+        FileWrite::IfUnchanged(expected) => {
+            check_file_version(path, expected)?;
+            tmp.persist(path)
+        }
+        FileWrite::Overwrite => tmp.persist(path),
+    }
+    .map(|_| ())
+    .map_err(|e| match e.error.kind() {
+        io::ErrorKind::AlreadyExists => io::Error::new(e.error.kind(), "já existe um arquivo neste destino"),
+        _ => e.error,
+    })
+}
+
+/// Preserva a origem até publicar o conteúdo completo num destino exclusivo.
+pub fn rename_note_file(src: &Path, dest: &Path, version: Option<u64>, data: &[u8]) -> Result<u64, String> {
+    if let Some(expected) = version {
+        check_file_version(src, expected).map_err(|e| format!("{}: {e}", src.display()))?;
+    } else if src.try_exists().map_err(|e| e.to_string())? {
+        return Err(format!("{} foi criado em outro lugar", src.display()));
+    }
+    write_file(dest, data, FileWrite::Create)
+        .map_err(|e| format!("falha ao criar {}: {e}", dest.display()))?;
+    if let Some(expected) = version {
+        check_file_version(src, expected).and_then(|_| fs::remove_file(src)).map_err(|e|
+            format!("{} foi gravado; falha ao verificar ou remover {}: {e}", dest.display(), src.display())
+        )?;
+    }
+    Ok(file_version(data))
 }
 
 /// Expande `~` no inicio para a pasta pessoal.
@@ -72,6 +145,7 @@ pub fn clean_dir_input(raw: &str) -> String {
     s.to_string()
 }
 
+#[derive(Debug)]
 pub struct ImportReport {
     pub added: usize,
     pub updated: usize,
@@ -84,21 +158,17 @@ pub fn import_notes_from_dir(db: &Db, dir: &str) -> Result<ImportReport, String>
     if dir.is_empty() {
         return Err("nenhuma pasta informada".into());
     }
-    let entries = fs::read_dir(dir).map_err(|_| {
-        let shown: String = dir.chars().take(200).collect();
-        format!("pasta nao encontrada: {}", shown)
-    })?;
-    if !db.begin() {
-        return Err("nao foi possivel iniciar a transacao".into());
-    }
+    let entries = fs::read_dir(dir).map_err(|e| format!("{dir}: {e}"))?;
+    let tx = db.transaction(rusqlite::TransactionBehavior::Deferred).map_err(|e| e.to_string())?;
     let (mut added, mut updated) = (0, 0);
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{dir}: {e}"))?;
         let fname = entry.file_name().to_string_lossy().into_owned();
         if fname.starts_with('.') || !is_markdown_ext(&fname) {
             continue;
         }
         let path = entry.path();
-        let Ok(meta) = fs::metadata(&path) else { continue };
+        let meta = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if meta.is_dir() {
             continue;
         }
@@ -108,9 +178,9 @@ pub fn import_notes_from_dir(db: &Db, dir: &str) -> Result<ImportReport, String>
             None => &fname[..],
         };
         if name.is_empty() || name.len() >= 256 {
-            continue;
+            return Err(format!("{}: nome deve ter de 1 a 255 bytes", path.display()));
         }
-        let Ok(content) = read_text_file(&path) else { continue };
+        let content = read_text_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mtime = meta
             .modified()
             .ok()
@@ -118,18 +188,13 @@ pub fn import_notes_from_dir(db: &Db, dir: &str) -> Result<ImportReport, String>
             .map(|d| d.as_secs() as i64)
             .filter(|&t| t > 0)
             .unwrap_or_else(now_secs);
-        if let Some(id) = db.find_id_by_name(name) {
-            if db.update_content(id, &content, mtime) {
-                updated += 1;
-            }
-        } else if db.insert_note(name, &content, mtime, 0).is_some() {
+        if db.import_note(name, &content, mtime).map_err(|e| format!("{}: {e}", path.display()))? {
             added += 1;
+        } else {
+            updated += 1;
         }
     }
-    if !db.commit() {
-        db.rollback();
-        return Err("falha ao confirmar a importacao".into());
-    }
+    tx.commit().map_err(|e| format!("falha ao confirmar a importação de {dir}: {e}"))?;
     Ok(ImportReport { added, updated })
 }
 
@@ -162,7 +227,7 @@ pub fn export_notes_to_dir(db: &Db, dir: &str) -> Result<usize, String> {
             n += 1;
         }
         let path = Path::new(dir).join(format!("{}.md", safe));
-        if write_file_atomic(&path, content.as_bytes()).is_ok() {
+        if write_file(&path, content.as_bytes(), FileWrite::Overwrite).is_ok() {
             written += 1;
         } else {
             failed += 1;
@@ -182,11 +247,27 @@ mod tests {
     fn atomic_write_replaces_and_leaves_no_temp() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("a.md");
-        write_file_atomic(&p, b"um").unwrap();
-        write_file_atomic(&p, b"dois").unwrap();
+        write_file(&p, b"um", FileWrite::Create).unwrap();
+        write_file(&p, b"dois", FileWrite::Overwrite).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"dois");
         let n = fs::read_dir(d.path()).unwrap().count();
         assert_eq!(n, 1, "nenhum .tmp sobra");
+    }
+
+    #[test]
+    fn file_versions_compare_raw_bytes_across_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nota.md");
+        let mut bytes = vec![b'a'; HASH_BLOCK * 2 + 1];
+        bytes[HASH_BLOCK] = 0xff;
+        fs::write(&path, &bytes).unwrap();
+        let (text, version) = file_snapshot(&path).unwrap();
+        check_file_version(&path, version).unwrap();
+        bytes[HASH_BLOCK] = 0xfe;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(text, file_snapshot(&path).unwrap().0);
+        assert!(write_file(&path, b"novo", FileWrite::IfUnchanged(version)).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]
@@ -238,6 +319,37 @@ mod tests {
         let out = d.path().join("saida");
         assert_eq!(export_notes_to_dir(&db, out.to_str().unwrap()).unwrap(), 2);
         assert_eq!(fs::read_to_string(out.join("Beta.md")).unwrap(), "beta ção\n");
+    }
+
+    #[test]
+    fn oversized_eligible_file_aborts_import() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("válida.md"), "corpo").unwrap();
+        fs::File::create(dir.path().join("grande.md")).unwrap().set_len(MAX_NOTE_FILE_BYTES + 1).unwrap();
+        let db = Db::open_memory();
+        let err = import_notes_from_dir(&db, dir.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("grande.md") && err.contains("grande demais"), "{err}");
+        assert_eq!(db.count_notes(), 0);
+    }
+
+    #[test]
+    fn import_database_error_rolls_back_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("notas.db");
+        let db = Db::open(&db_path).unwrap();
+        let external = rusqlite::Connection::open(&db_path).unwrap();
+        external.execute_batch(
+            "CREATE TRIGGER fail_second BEFORE INSERT ON notes WHEN EXISTS (SELECT 1 FROM notes)
+             BEGIN SELECT RAISE(ABORT, 'falha simulada'); END;"
+        ).unwrap();
+        for filename in ["A.md", "B.md"] {
+            fs::write(dir.path().join(filename), filename).unwrap();
+        }
+        let err = import_notes_from_dir(&db, dir.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains(".md") && err.contains("falha simulada"), "{err}");
+        assert_eq!(db.count_notes(), 0);
+        external.execute_batch("DROP TRIGGER fail_second").unwrap();
+        assert_eq!(import_notes_from_dir(&db, dir.path().to_str().unwrap()).unwrap().added, 2);
     }
 
     #[test]

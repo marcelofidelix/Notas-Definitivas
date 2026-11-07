@@ -89,6 +89,12 @@ pub enum Pending {
     ReplaceChar,
 }
 
+struct NoteSnapshot {
+    filename: String,
+    content: String,
+    version: Option<u64>,
+}
+
 pub struct Tab {
     pub key: NoteKey,
     pub filename: String,
@@ -96,13 +102,8 @@ pub struct Tab {
     pub buf: Buffer,
     pub modified: bool,
     pub first_unsaved: Option<Instant>,
-    /// `mtime` da nota no banco quando foi carregada/gravada por ultimo. Se o
-    /// banco mudar (outra instancia, importacao), gravar por cima exige `:w!`.
-    pub loaded_mtime: i64,
-    /// Hash do texto no formato do banco quando foi carregada/gravada. O `mtime`
-    /// tem resolucao de segundos: duas instancias que gravam no mesmo segundo
-    /// empatam, e so o conteudo mostra que houve alteracao.
-    pub loaded_hash: u64,
+    /// Ausente apenas quando o arquivo ainda precisa ser criado.
+    loaded_version: Option<u64>,
 }
 
 pub struct Preview {
@@ -636,16 +637,31 @@ impl App {
         }
     }
 
-    fn write_note(&self, key: &NoteKey, content: &str) -> bool {
+    fn snapshot(&self, key: &NoteKey, allow_new: bool) -> Result<NoteSnapshot, String> {
         match key {
-            NoteKey::Db(id) => self.db.update_content(*id, content, now_secs()),
-            NoteKey::File(p) => fsio::write_file_atomic(p, content.as_bytes()).is_ok(),
+            NoteKey::Db(id) => {
+                let (name, content, version) = self.db.snapshot(*id).map_err(|e| e.to_string())?;
+                Ok(NoteSnapshot { filename: format!("{name}.md"), content, version: Some(version) })
+            }
+            NoteKey::File(path) => {
+                let (content, version) = match fsio::file_snapshot(path) {
+                    Ok((content, version)) => (content, Some(version)),
+                    Err(e) if allow_new && e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
+                    Err(e) => return Err(format!("{}: {e}", path.display())),
+                };
+                let filename = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
+                Ok(NoteSnapshot { filename, content, version })
+            }
         }
     }
 
     // ---- abas --------------------------------------------------------------
 
     pub fn open_note(&mut self, key: &NoteKey, record_history: bool) {
+        self.open_tab(key, record_history, false);
+    }
+
+    fn open_tab(&mut self, key: &NoteKey, record_history: bool, allow_new: bool) {
         if let Some(i) = self.tabs.iter().position(|t| &t.key == key) {
             self.tab_switch(i);
             if record_history {
@@ -653,20 +669,12 @@ impl App {
             }
             return;
         }
-        let Some(content) = self.read_note(key) else {
-            self.set_status("Nota não encontrada (foi excluída ou o arquivo sumiu).");
-            return;
-        };
-        let filename = match key {
-            NoteKey::Db(id) => self
-                .db
-                .get_name(*id)
-                .map(|n| format!("{}.md", n))
-                .unwrap_or_else(|| key.to_string()),
-            NoteKey::File(p) => p
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| key.to_string()),
+        let NoteSnapshot { filename, content, version } = match self.snapshot(key, allow_new) {
+            Ok(note) => note,
+            Err(e) => {
+                self.set_status(format!("Erro ao abrir nota: {e}"));
+                return;
+            }
         };
         let title = title_from_filename(&filename);
         self.tabs.push(Tab {
@@ -676,8 +684,7 @@ impl App {
             buf: Buffer::from_content(&content),
             modified: false,
             first_unsaved: None,
-            loaded_mtime: key.db_id().and_then(|id| self.db.get_mtime(id)).unwrap_or(0),
-            loaded_hash: crate::text::hash_text(&content),
+            loaded_version: version,
         });
         self.active = Some(self.tabs.len() - 1);
         if record_history {
@@ -690,29 +697,7 @@ impl App {
     /// Abre o arquivo passado na linha de comando. Se ainda nao existe, abre uma
     /// aba vazia que cria o arquivo ao salvar.
     pub fn open_path_arg(&mut self, path: PathBuf) {
-        let key = NoteKey::File(path.clone());
-        if path.exists() {
-            self.open_note(&key, true);
-        } else {
-            let filename = path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| key.to_string());
-            let title = title_from_filename(&filename);
-            self.tabs.push(Tab {
-                key: key.clone(),
-                filename,
-                title,
-                buf: Buffer::new_empty(),
-                modified: false,
-                first_unsaved: None,
-                loaded_mtime: 0,
-                loaded_hash: crate::text::hash_text(""),
-            });
-            self.active = Some(self.tabs.len() - 1);
-            self.push_history(&key);
-            self.clear_needed = true;
-        }
+        self.open_tab(&NoteKey::File(path), true, true);
         self.focus = Focus::Right;
     }
 
@@ -753,7 +738,6 @@ impl App {
             return;
         }
         if self.tabs[idx].modified && !self.save_tab(idx) {
-            self.save_failed_status("Aba nao fechada: falha ao salvar as alteracoes".to_string());
             return;
         }
         self.tabs.remove(idx);
@@ -778,8 +762,6 @@ impl App {
     pub fn close_all_tabs(&mut self) -> bool {
         for i in 0..self.tabs.len() {
             if self.tabs[i].modified && !self.save_tab(i) {
-                let name = self.tabs[i].filename.clone();
-                self.save_failed_status(format!("Nao foi possivel salvar '{}'; abas mantidas abertas", name));
                 return false;
             }
         }
@@ -803,42 +785,29 @@ impl App {
         let Some(t) = self.tabs.get(idx) else { return false };
         let content = t.buf.to_content();
         let key = t.key.clone();
-        if let (NoteKey::Db(id), false) = (&key, force) {
-            let current = self.db.get_mtime(*id);
-            if current != Some(t.loaded_mtime) {
-                let name = t.filename.clone();
-                if current.is_none() {
-                    self.set_status(format!("⚠ \"{}\" nao existe mais no banco; use :w! para recria-la", name));
+        let result = match &key {
+            NoteKey::Db(id) => {
+                let expected = if force { None } else { t.loaded_version };
+                self.db.save_note(*id, expected, None, &content)
+            }
+            NoteKey::File(path) => {
+                let mode = if force {
+                    fsio::FileWrite::Overwrite
                 } else {
-                    self.set_status(format!(
-                        "⚠ \"{}\" foi alterada em outro lugar; :w! sobrescreve ou :e! recarrega",
-                        name
-                    ));
-                }
+                    t.loaded_version.map_or(fsio::FileWrite::Create, fsio::FileWrite::IfUnchanged)
+                };
+                fsio::write_file(path, content.as_bytes(), mode)
+                    .map(|_| fsio::file_version(content.as_bytes()))
+                    .map_err(|e| e.to_string())
+            }
+        };
+        match result {
+            Ok(version) => self.tabs[idx].loaded_version = Some(version),
+            Err(e) => {
+                self.set_status(format!("⚠ Falha ao salvar {}: {e}", t.filename));
                 return false;
             }
-            // O mtime tem resolucao de segundos: duas instancias que gravam no
-            // mesmo segundo empatam e a comparacao acima nao veria nada. Nesse
-            // caso o conteudo gravado e a unica prova de alteracao.
-            if let Some(db_content) = self.db.get_content(*id) {
-                if crate::text::hash_text(&db_content) != t.loaded_hash {
-                    let name = t.filename.clone();
-                    self.set_status(format!(
-                        "⚠ \"{}\" foi alterada em outro lugar; :w! sobrescreve ou :e! recarrega",
-                        name
-                    ));
-                    return false;
-                }
-            }
         }
-        if !self.write_note(&key, &content) {
-            return false;
-        }
-        if let NoteKey::Db(id) = &key {
-            let m = self.db.get_mtime(*id).unwrap_or(0);
-            self.tabs[idx].loaded_mtime = m;
-        }
-        self.tabs[idx].loaded_hash = crate::text::hash_text(&content);
         let now = now_secs();
         if let Some(n) = self.notes.iter_mut().find(|n| n.key == key) {
             n.mtime = now;
@@ -861,8 +830,6 @@ impl App {
         };
         let name = self.tabs[idx].filename.clone();
         if !self.save_tab_ex(idx, force) {
-            // Conflito ja explicou o motivo no status; senao, erro generico.
-            self.save_failed_status(format!("Erro salvando nota: {}", name));
             return false;
         }
         let key = self.tabs[idx].key.clone();
@@ -880,12 +847,16 @@ impl App {
     pub fn reload_current(&mut self) {
         let Some(idx) = self.active else { return };
         let key = self.tabs[idx].key.clone();
-        let Some(content) = self.read_note(&key) else {
-            self.set_status("Nao foi possivel recarregar: a nota nao existe mais.");
-            return;
+        let NoteSnapshot { filename, content, version } = match self.snapshot(&key, false) {
+            Ok(note) => note,
+            Err(e) => {
+                self.set_status(format!("Falha ao recarregar a nota: {e}"));
+                return;
+            }
         };
-        let mtime = key.db_id().and_then(|id| self.db.get_mtime(id)).unwrap_or(0);
         let t = &mut self.tabs[idx];
+        t.title = title_from_filename(&filename);
+        t.filename = filename;
         let (cy, cx) = (t.buf.cy, t.buf.cx);
         t.buf = Buffer::from_content(&content);
         t.buf.cy = cy;
@@ -893,18 +864,10 @@ impl App {
         t.buf.clamp_cursor();
         t.modified = false;
         t.first_unsaved = None;
-        t.loaded_mtime = mtime;
-        t.loaded_hash = crate::text::hash_text(&content);
+        t.loaded_version = version;
         self.clear_needed = true;
         let name = self.tabs[idx].filename.clone();
-        self.set_status(format!("\"{}\" recarregada do banco", name));
-    }
-
-    /// Mensagem de falha ao salvar, sem esconder o motivo ("⚠ ...") ja informado.
-    fn save_failed_status(&mut self, generic: String) {
-        if !self.status_text().is_some_and(|s| s.starts_with('⚠')) {
-            self.set_status(generic);
-        }
+        self.set_status(format!("\"{}\" recarregada", name));
     }
 
     pub fn any_tab_modified(&self) -> bool {
@@ -914,8 +877,6 @@ impl App {
     pub fn save_all_modified(&mut self) -> bool {
         for i in 0..self.tabs.len() {
             if self.tabs[i].modified && !self.save_tab(i) {
-                let name = self.tabs[i].filename.clone();
-                self.save_failed_status(format!("Erro salvando nota: {}", name));
                 return false;
             }
         }
@@ -925,6 +886,7 @@ impl App {
     /// Salva em silencio as abas com alteracoes pendentes ha mais de 1 minuto.
     pub fn check_autosave(&mut self) {
         let mut saved = 0;
+        let mut failed = false;
         let mut last = String::new();
         for i in 0..self.tabs.len() {
             let due = self.tabs[i].modified
@@ -936,6 +898,7 @@ impl App {
                 } else {
                     // Falhou (conflito, disco...): tenta de novo so em 1 minuto, em vez
                     // de martelar o banco e a mensagem de status a cada 100 ms.
+                    failed = true;
                     self.tabs[i].first_unsaved = Some(Instant::now());
                 }
             }
@@ -947,6 +910,9 @@ impl App {
                 self.cur_key().cloned()
             };
             self.resort_keep(keep.as_ref());
+            if failed {
+                return;
+            }
             if saved == 1 {
                 self.set_status(format!("💾 Salvo automaticamente: {}", last));
             } else {
@@ -1049,71 +1015,70 @@ impl App {
             return false;
         }
 
-        let new_key = match old {
-            NoteKey::Db(id) => {
-                let current = self.notes.iter().find(|n| &n.key == old).map(|n| n.title.clone());
-                if current.as_deref() == Some(safe_new.as_str()) {
-                    self.set_status("O nome da nota permanece o mesmo.");
-                    return true;
-                }
-                if self.db.find_id_by_name(&safe_new).is_some_and(|other| other != *id) {
-                    self.set_status(format!("Já existe uma nota com o nome: {}", new_filename));
-                    return false;
-                }
-                if !self.db.update_name(*id, &safe_new) {
-                    self.set_status("Erro ao renomear a nota no banco.");
-                    return false;
-                }
-                old.clone()
+        let idx = self.tabs.iter().position(|t| &t.key == old);
+        let NoteSnapshot { filename, mut content, version } = match idx {
+            Some(i) => {
+                let t = &self.tabs[i];
+                NoteSnapshot { filename: t.filename.clone(), content: t.buf.to_content(), version: t.loaded_version }
             }
-            NoteKey::File(p) => {
-                let dir = p.parent().map(PathBuf::from).unwrap_or_default();
-                let np = dir.join(&new_filename);
-                if &np == p {
-                    self.set_status("O nome da nota permanece o mesmo.");
-                    return true;
-                }
-                if np.exists() {
-                    self.set_status(format!("Já existe uma nota com o nome: {}", new_filename));
+            None => match self.snapshot(old, false) {
+                Ok(note) => note,
+                Err(e) => {
+                    self.set_status(format!("Falha ao ler a nota para renomear: {e}"));
                     return false;
                 }
-                if std::fs::rename(p, &np).is_err() {
-                    self.set_status("Erro ao renomear arquivo no disco.");
-                    return false;
-                }
-                NoteKey::File(np)
+            },
+        };
+
+        let new_filename = match old {
+            NoteKey::Db(_) => format!("{safe_new}.md"),
+            NoteKey::File(_) => sanitize_note_name(&new_filename),
+        };
+        if filename == new_filename {
+            self.set_status("O nome da nota permanece o mesmo.");
+            return true;
+        }
+        let heading = format!("# {new_title}");
+        let body = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+        let update_heading = body.starts_with("# ");
+        if update_heading {
+            let end = content.find('\n').unwrap_or(content.len());
+            content.replace_range(..end, &heading);
+        }
+        let result = match old {
+            NoteKey::Db(id) => self.db.save_note(*id, version, Some(&safe_new), &content)
+                .map(|v| (old.clone(), v)),
+            NoteKey::File(path) => {
+                let dest = path.with_file_name(&new_filename);
+                fsio::rename_note_file(path, &dest, version, content.as_bytes())
+                    .map(|v| (NoteKey::File(dest), v))
+            }
+        };
+        let (new_key, version) = match result {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.set_status(format!("⚠ Falha ao renomear {filename}: {e}"));
+                return false;
             }
         };
 
-        // Atualiza as abas abertas e o titulo "# ..." da primeira linha.
-        let heading = format!("# {}", new_title);
-        let mut open_idx = Vec::new();
-        for (i, t) in self.tabs.iter_mut().enumerate() {
-            if &t.key == old {
-                t.key = new_key.clone();
-                t.filename = new_filename.clone();
-                t.title = new_title.clone();
-                if t.buf.lines.first().is_some_and(|l| l.text.starts_with("# ")) {
-                    t.buf.lines[0].set_text(heading.clone());
-                    t.buf.update_folding();
-                    t.buf.clamp_cursor(); // a linha pode ter encurtado sob o cursor
-                    t.modified = true;
-                }
-                open_idx.push(i);
+        if let Some(i) = idx {
+            let t = &mut self.tabs[i];
+            t.key = new_key.clone();
+            t.title = title_from_filename(&new_filename);
+            t.filename = new_filename.clone();
+            if update_heading {
+                t.buf.lines[0].set_text(heading);
+                t.buf.update_folding();
+                t.buf.clamp_cursor();
             }
+            t.loaded_version = Some(version);
+            t.modified = false;
+            t.first_unsaved = None;
         }
-        if open_idx.is_empty() {
-            // Nota fechada: ajusta o cabecalho direto no armazenamento.
-            if let Some(content) = self.read_note(&new_key) {
-                let body = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-                if body.starts_with("# ") {
-                    let rest = body.find('\n').map(|i| &body[i..]).unwrap_or("");
-                    let _ = self.write_note(&new_key, &format!("{}{}", heading, rest));
-                }
-            }
-        } else {
-            for i in open_idx {
-                self.save_tab(i);
+        for key in &mut self.history {
+            if key == old {
+                *key = new_key.clone();
             }
         }
         if self.preview.as_ref().is_some_and(|p| &p.key == old) {
@@ -1253,12 +1218,14 @@ impl App {
     }
 
     /// Salvamento de emergencia (encerramento ou falha inesperada).
-    pub fn emergency_save(&mut self) {
+    pub fn emergency_save(&mut self) -> bool {
+        let mut saved = true;
         for i in 0..self.tabs.len() {
-            if self.tabs[i].modified {
-                self.save_tab(i);
+            if self.tabs[i].modified && !self.save_tab(i) {
+                saved = false;
             }
         }
+        saved
     }
 
     /// Copia para o clipboard do sistema e guarda no buffer interno.
