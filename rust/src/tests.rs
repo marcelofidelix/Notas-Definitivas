@@ -218,11 +218,36 @@ fn visual_mode_yank_replace_and_paste_text() {
     keys(&mut a, "vlly");
     assert_eq!(a.yank, "abc");
     assert_eq!(a.mode, Mode::Normal);
-    keys(&mut a, "0vllrX");
-    assert_eq!(lines(&a)[0], "XXXdef");
+    keys(&mut a, "0vllrXYZ<CR>");
+    assert_eq!(lines(&a)[0], "XYZdef");
     keys(&mut a, "jVy");
     assert_eq!(a.yank, "segunda\n");
     assert!(a.yank_linewise);
+}
+
+#[test]
+fn replace_selection_accepts_text_cancels_and_undoes_as_one_edit() {
+    let mut a = app_with(&[("V", "aé😀z\nsegunda\nterceira")]);
+    open(&mut a, "V");
+    keys(&mut a, "lvlr");
+    assert_eq!(a.mode, Mode::PromptReplaceSelection);
+    keys(&mut a, "ignorado<Esc>");
+    assert_eq!(a.mode, Mode::VisualChar);
+    assert_eq!(lines(&a)[0], "aé😀z");
+    keys(&mut a, "rOlá<CR>");
+    assert_eq!(lines(&a)[0], "aOláz");
+    keys(&mut a, "u");
+    assert_eq!(lines(&a)[0], "aé😀z");
+    keys(&mut a, "<C-r>");
+    assert_eq!(lines(&a)[0], "aOláz");
+    keys(&mut a, "0vjlrX<CR>");
+    assert_eq!(lines(&a), vec!["Xgunda", "terceira"]);
+    keys(&mut a, "u");
+    assert_eq!(lines(&a), vec!["aOláz", "segunda", "terceira"]);
+    keys(&mut a, "ggVjrNova<CR>");
+    assert_eq!(lines(&a), vec!["Nova", "terceira"]);
+    keys(&mut a, "u");
+    assert_eq!(lines(&a), vec!["aOláz", "segunda", "terceira"]);
 }
 
 #[test]

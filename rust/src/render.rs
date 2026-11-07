@@ -52,6 +52,7 @@ pub fn prompt_label(app: &App) -> Option<String> {
         Mode::PromptRename => " ✏️  Renomear nota: ".to_string(),
         Mode::PromptFind => " 🔍 Localizar na nota: ".to_string(),
         Mode::PromptReplaceFind => " 🔄 Localizar para substituir: ".to_string(),
+        Mode::PromptReplaceSelection => " 🔄 Substituir seleção por: ".to_string(),
         Mode::PromptReplaceWith => format!(" 🔄 Substituir '{}' por: ", app.replace_find),
         Mode::PromptImport => PROMPT_IMPORT.to_string(),
         Mode::PromptExport => PROMPT_EXPORT.to_string(),
@@ -61,12 +62,12 @@ pub fn prompt_label(app: &App) -> Option<String> {
 
 /// " 2 linhas, 37 caracteres selecionados" enquanto ha selecao ativa.
 fn selection_summary(app: &App) -> String {
-    let active = app.mode.is_visual() || (app.mode == Mode::Insert && app.buf().is_some_and(|b| b.has_selection));
+    let active = app.mode.is_visual() || app.mode == Mode::PromptReplaceSelection || (app.mode == Mode::Insert && app.buf().is_some_and(|b| b.has_selection));
     if !active || app.in_preview() {
         return String::new();
     }
     let Some(b) = app.buf() else { return String::new() };
-    let linewise = app.mode == Mode::VisualLine;
+    let linewise = app.mode == Mode::VisualLine || (app.mode == Mode::PromptReplaceSelection && app.replace_selection_mode == Some(Mode::VisualLine));
     let Some((sy, _, ey, _)) = b.selection(linewise) else { return String::new() };
     let chars = b.selection_text(linewise).map_or(0, |t| t.chars().filter(|&c| c != '\n').count());
     let lines = ey - sy + 1;
@@ -793,12 +794,12 @@ impl<'a> Frame<'a> {
         self.p(RESET);
         self.p(line_bg);
 
-        let sel = if !in_preview && (app.mode.is_visual() || (app.mode == Mode::Insert && buf.is_some_and(|b| b.has_selection))) {
-            buf.and_then(|b| b.selection(app.mode == Mode::VisualLine))
+        let linewise = app.mode == Mode::VisualLine || (app.mode == Mode::PromptReplaceSelection && app.replace_selection_mode == Some(Mode::VisualLine));
+        let sel = if !in_preview && (app.mode.is_visual() || app.mode == Mode::PromptReplaceSelection || (app.mode == Mode::Insert && buf.is_some_and(|b| b.has_selection))) {
+            buf.and_then(|b| b.selection(linewise))
         } else {
             None
         };
-        let linewise = app.mode == Mode::VisualLine;
         // Trecho selecionado nesta linha: (inicio, fim, inclui a quebra de linha).
         let line_sel: Option<(usize, usize, bool)> = sel.and_then(|(sy, sx, ey, ex)| {
             let y = vr.line;

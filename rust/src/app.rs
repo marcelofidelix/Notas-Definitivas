@@ -38,6 +38,7 @@ pub enum Mode {
     PromptFind,
     PromptReplaceFind,
     PromptReplaceWith,
+    PromptReplaceSelection,
     PromptImport,
     PromptExport,
 }
@@ -51,6 +52,7 @@ impl Mode {
                 | Mode::PromptFind
                 | Mode::PromptReplaceFind
                 | Mode::PromptReplaceWith
+                | Mode::PromptReplaceSelection
                 | Mode::PromptImport
                 | Mode::PromptExport
         )
@@ -85,7 +87,6 @@ pub enum Pending {
     Z,
     D,
     ReplaceChar,
-    ReplaceVisual,
 }
 
 pub struct Tab {
@@ -176,6 +177,7 @@ pub struct App {
 
     pub prompt_buf: String,
     pub prompt_cursor: usize,
+    pub replace_selection_mode: Option<Mode>,
     pub rename_target: Option<NoteKey>,
     pub cmd_buf: String,
     pub cmd_cursor: usize,
@@ -251,6 +253,7 @@ impl App {
             cols: i32::from(cols),
             prompt_buf: String::new(),
             prompt_cursor: 0,
+            replace_selection_mode: None,
             rename_target: None,
             cmd_buf: String::new(),
             cmd_cursor: 0,

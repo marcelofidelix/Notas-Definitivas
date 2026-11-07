@@ -367,7 +367,7 @@ impl App {
         let pending = std::mem::replace(&mut self.pending, Pending::None);
         if key == Key::Esc {
             self.clear_count();
-            if matches!(pending, Pending::ReplaceChar | Pending::ReplaceVisual) {
+            if matches!(pending, Pending::ReplaceChar) {
                 self.set_status(if self.mode == Mode::VisualLine {
                     "-- VISUAL LINHA --"
                 } else if self.mode == Mode::VisualChar {
@@ -470,7 +470,6 @@ impl App {
                 }
             }
             Pending::ReplaceChar => self.replace_under_cursor(key, count.max(1)),
-            Pending::ReplaceVisual => self.replace_selection_chars(key),
             Pending::None => {}
         }
     }
@@ -517,43 +516,17 @@ impl App {
         }
     }
 
-    fn replace_selection_chars(&mut self, key: Key) {
-        let visual_msg = if self.mode == Mode::VisualLine { "-- VISUAL LINHA --" } else { "-- VISUAL --" };
-        let c = match key {
-            Key::Char(c) if !c.is_control() => c,
-            Key::Ctrl('c') => {
-                self.set_status(visual_msg);
-                return;
-            }
-            _ => return,
-        };
-        let linewise = self.mode == Mode::VisualLine;
-        self.with_buf(|b| b.save_undo());
-        self.edit(|b| {
-            let Some((sy, sx, ey, ex)) = b.selection(linewise) else { return };
-            for y in sy..=ey {
-                let t = &b.lines[y].text;
-                let a = if y == sy { sx } else { 0 };
-                let z = if y == ey { ex.min(t.len()) } else { t.len() };
-                let a = floor_boundary(t, a.min(z));
-                let n = t[a..z].chars().count();
-                let rep: String = std::iter::repeat(c).take(n).collect();
-                let mut new = String::with_capacity(t.len());
-                new.push_str(&t[..a]);
-                new.push_str(&rep);
-                new.push_str(&t[z..]);
-                b.lines[y].set_text(new);
-            }
-            b.clamp_cursor();
-        });
-        self.mode = Mode::Normal;
-        self.set_status("-- MODO NORMAL --");
-    }
-
     // ---- prompts -----------------------------------------------------------
 
     fn handle_prompt(&mut self, key: Key) {
         if matches!(key, Key::Esc | Key::Ctrl('c')) {
+            if self.mode == Mode::PromptReplaceSelection {
+                self.mode = self.replace_selection_mode.take().unwrap_or(Mode::Normal);
+                self.prompt_buf.clear();
+                self.prompt_cursor = 0;
+                self.set_status("Substituição cancelada.");
+                return;
+            }
             let msg = match self.mode {
                 Mode::PromptNew => "Criação de nota cancelada.",
                 Mode::PromptRename => "Renomeação cancelada.",
@@ -599,6 +572,25 @@ impl App {
                     if !text.is_empty() {
                         self.search_from_cursor(&text);
                     }
+                }
+                Mode::PromptReplaceSelection => {
+                    let linewise = self.replace_selection_mode.take() == Some(Mode::VisualLine);
+                    self.mode = Mode::Normal;
+                    self.with_buf(|b| b.save_undo());
+                    self.edit(|b| {
+                        if let Some((sy, sx, ey, ex)) = b.selection(linewise) {
+                            let replacement = format!("{}{}{}", &b.lines[sy].text[..sx], text, &b.lines[ey].text[ex..]);
+                            b.lines[sy].set_text(replacement);
+                            b.lines.drain(sy + 1..=ey);
+                            b.cy = sy;
+                            b.cx = sx;
+                            b.has_selection = false;
+                            b.update_folding();
+                            b.clamp_cursor();
+                        }
+                    });
+                    self.editor_scroll();
+                    self.set_status("Seleção substituída.");
                 }
                 Mode::PromptReplaceFind => {
                     if text.is_empty() {
@@ -1224,9 +1216,10 @@ impl App {
                 }
             },
             Key::Char('r') => {
-                if self.mode.is_visual() {
-                    self.pending = Pending::ReplaceVisual;
-                    self.set_status("-- REPLACE --");
+                if has_sel {
+                    self.replace_selection_mode = Some(self.mode);
+                    self.open_prompt(Mode::PromptReplaceSelection, "");
+                    self.set_status("Digite o texto substituto e pressione Enter; Esc cancela.");
                 } else if self.buf().is_some_and(|b| b.cx < b.cur().len()) {
                     self.pending = Pending::ReplaceChar;
                     self.set_status("-- REPLACE --");

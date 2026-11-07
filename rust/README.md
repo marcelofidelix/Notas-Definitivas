@@ -41,6 +41,7 @@ O editor Rust oferece: edição modal (Normal, Inserção, Visual caractere/linh
 ### Melhorias em relação à versão em C
 
 - **Seleção com mouse:** duplo clique no mesmo ponto do texto seleciona a palavra (letras Unicode, números e `_`); triplo clique seleciona a linha inteira do documento, mesmo com quebra visual. Os cliques devem ocorrer com menos de 500 ms entre eles. A seleção entra em Visual caractere/linha e funciona com `y`/`Ctrl+C`, `x`, `p` e `Esc`; espaços e pontuação são selecionados separadamente das palavras.
+- **Substituir seleção:** com texto selecionado, pressione `r`, digite o novo texto e confirme com `Enter`. `Esc` cancela mantendo a seleção; texto vazio remove o trecho. A substituição inteira é um passo de desfazer. Sem seleção, `r` continua substituindo um único caractere.
 
 - **Segurança do terminal:** todo texto de nota/nome/prompt passa por `sanitize_for_terminal` — um `.md` com `ESC`/OSC embutidos não consegue escrever no clipboard, mudar o título nem bagunçar a tela.
 - **Robustez comprovada por fuzz:** 10 milhões de teclas/cliques/redimensionamentos aleatórios sem pânico e sem violar invariantes (cursor em limite de caractere, índices válidos). O fuzz encontrou, ainda no desenvolvimento, três defeitos: fatiar string fora de um limite de caractere (nome terminando em ideograma), e cursor além do fim da linha após `:rename` e após `:tableall` (o código C também não reajusta o cursor nesses dois casos).
