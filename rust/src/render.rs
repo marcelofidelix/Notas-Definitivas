@@ -212,6 +212,33 @@ fn hit_at(hits: &[Hit], idx: usize) -> Option<Hit> {
     hits.iter().find(|h| idx >= h.start && idx < h.end).copied()
 }
 
+/// Estado do realce numa celula: 0 = fora de ocorrencia, 1 = ocorrencia,
+/// 2 = a ocorrencia atual (onde o `n`/`N` deixou o cursor).
+fn hit_state(hit: Option<Hit>, cur: Option<usize>) -> u8 {
+    match hit {
+        None => 0,
+        Some(h) if Some(h.start) == cur => 2,
+        Some(_) => 1,
+    }
+}
+
+/// Ocorrencias que caem dentro do titulo visivel de um link, com os deslocamentos
+/// relativos ao titulo (`[titulo](url)` ou `[[titulo]]`), e o inicio da atual.
+fn link_marks(hits: &[Hit], cur: Option<usize>, sp: &LinkSpan) -> (Vec<Hit>, Option<usize>) {
+    if hits.is_empty() {
+        return (Vec::new(), None);
+    }
+    let off = sp.start + if sp.wiki { 2 } else { 1 };
+    let fim = off + sp.text.len();
+    let dentro: Vec<Hit> = hits
+        .iter()
+        .filter(|h| h.start >= off && h.end <= fim)
+        .map(|h| Hit { start: h.start - off, end: h.end - off })
+        .collect();
+    let cur = cur.filter(|&c| c >= off && c < fim).map(|c| c - off);
+    (dentro, cur)
+}
+
 struct Frame<'a> {
     app: &'a App,
     th: &'static Theme,
@@ -907,6 +934,8 @@ impl<'a> Frame<'a> {
         let mut idx = vr.seg.off;
         let mut cols = gutter;
         let mut fundo_trocado = false;
+        // Realce da busca em curso: 0 = nenhum, 1 = ocorrencia, 2 = a atual.
+        let mut inv = 0u8;
         while idx < end && cols < ew - 1 {
             if let Some((pos, ch)) = bul {
                 if idx == pos {
@@ -920,24 +949,19 @@ impl<'a> Frame<'a> {
                     continue;
                 }
             }
-            // Fundo desta celula: realce da busca > selecao > fundo da linha. So
-            // emite escape quando o fundo muda (linha comum nao custa nada).
+            // Fundo desta celula (selecao ou fundo da linha) e realce da busca, que e
+            // o negativo das cores do trecho. So emite escape quando algo muda (linha
+            // comum nao custa nada). Onde ha ocorrencia, ela vale mais que a selecao.
             let hit = hit_at(&hits, idx);
-            let atual = hit.is_some_and(|h| Some(h.start) == cur_hit);
-            if hit.is_some() {
-                self.p(if atual { th.bg_search_cur } else { th.bg_search });
-                fundo_trocado = true;
-                if atual {
-                    // O trecho atual fica com texto escuro e negrito para saltar aos olhos.
-                    self.p(th.fg_dark);
-                    self.p(BOLD);
-                }
-            } else if line_sel.is_some_and(|(a, z, _)| idx >= a && idx < z) {
-                self.p(th.bg_select);
-                fundo_trocado = true;
-            } else if fundo_trocado {
-                self.p(line_bg);
-                fundo_trocado = false;
+            let want_inv = hit_state(hit, cur_hit);
+            let want_sel = hit.is_none() && line_sel.is_some_and(|(a, z, _)| idx >= a && idx < z);
+            if want_sel != fundo_trocado {
+                self.p(if want_sel { th.bg_select } else { line_bg });
+                fundo_trocado = want_sel;
+            }
+            if want_inv != inv {
+                self.inv_transition(inv, want_inv, false);
+                inv = want_inv;
             }
             if let Some(t) = task.filter(|t| t.box_start == idx) {
                 if cols + 1 > ew - 1 {
@@ -957,7 +981,14 @@ impl<'a> Frame<'a> {
             // Links ocultos: so o titulo, sublinhado.
             if let Some(sp) = links.iter().find(|s| idx >= s.start && idx < s.end) {
                 if idx == sp.start {
-                    cols = self.render_link(sp, cols, ew);
+                    if inv != 0 {
+                        self.inv_transition(inv, 0, false);
+                        inv = 0;
+                    }
+                    // Ocorrencias da busca dentro do titulo (a parte visivel do link).
+                    let (lh, lcur) = link_marks(&hits, cur_hit, sp);
+                    cols = self.render_link(sp, cols, ew, &lh, lcur);
+                    fundo_trocado = false;
                     self.p(line_bg);
                     self.p(line_fg);
                     if l.heading >= 1 {
@@ -1010,12 +1041,7 @@ impl<'a> Frame<'a> {
             if cols + cw > ew - 1 {
                 break;
             }
-            if atual {
-                // Sem estilo de Markdown: o realce exato vale mais aqui.
-                self.txt(&text[idx..idx + clen]);
-            } else {
-                self.emit_styled_char(&text[idx..idx + clen], idx, st, hide.styles, line_fg, l.heading);
-            }
+            self.emit_styled_char(&text[idx..idx + clen], idx, st, hide.styles, line_fg, l.heading);
             cols += cw;
             idx += clen;
         }
@@ -1088,20 +1114,10 @@ impl<'a> Frame<'a> {
             for (key, text) in &pieces {
                 self.p(RESET);
                 let atual = key & K_HIT_CUR != 0;
-                self.p(if atual {
-                    th.bg_search_cur
-                } else if key & K_HIT != 0 {
-                    th.bg_search
-                } else if key & K_SEL != 0 {
-                    th.bg_select
-                } else {
-                    row_bg
-                });
+                let marcado = atual || key & K_HIT != 0;
+                self.p(if key & K_SEL != 0 && !marcado { th.bg_select } else { row_bg });
                 if key & K_BORDER != 0 {
                     self.p(th.fg_border);
-                } else if atual {
-                    self.p(th.fg_dark);
-                    self.p(BOLD);
                 } else {
                     let attr = (*key & 0x0F) as u8;
                     if attr & A_WIKI != 0 {
@@ -1118,6 +1134,12 @@ impl<'a> Frame<'a> {
                     }
                     if attr & A_ITALIC != 0 {
                         self.p(ITALIC);
+                    }
+                    // Realce da busca: negativo das cores da celula (a ocorrencia atual
+                    // ganha sublinhado; em link, que ja e sublinhado, italico).
+                    if marcado {
+                        let link = attr & (A_LINK | A_WIKI) != 0;
+                        self.inv_transition(0, if atual { 2 } else { 1 }, link);
                     }
                 }
                 self.txt(text);
@@ -1190,7 +1212,6 @@ impl<'a> Frame<'a> {
         cur_hit: Option<usize>,
         last_subrow: bool,
     ) {
-        let th = self.th;
         let mut cols = self.gutter;
         for (i, c) in text.char_indices() {
             let (cw, piece): (i32, String) = if c == '\t' {
@@ -1202,20 +1223,13 @@ impl<'a> Frame<'a> {
             if cols + cw > ew - 1 {
                 break;
             }
-            let hit = hit_at(hits, i);
-            let atual = hit.is_some_and(|h| Some(h.start) == cur_hit);
-            self.p("\x1b[22m");
-            if hit.is_some() {
-                self.p(if atual { th.bg_search_cur } else { th.bg_search });
-                if atual {
-                    self.p(th.fg_dark);
-                    self.p(BOLD);
-                } else {
-                    self.p(fg);
-                }
-            } else {
-                self.p(base_bg);
-                self.p(fg);
+            let st = hit_state(hit_at(hits, i), cur_hit);
+            // Desliga negrito, reverso e sublinhado do caractere anterior.
+            self.p("\x1b[22;24;27m");
+            self.p(base_bg);
+            self.p(fg);
+            if st != 0 {
+                self.inv_transition(0, st, false);
             }
             self.txt(&piece);
             cols += cw;
@@ -1333,7 +1347,53 @@ impl<'a> Frame<'a> {
         }
     }
 
-    fn render_link(&mut self, sp: &LinkSpan, cols: i32, ew: i32) -> i32 {
+    /// Muda o realce da busca de `from` para `to` (0 nenhum, 1 ocorrencia, 2 a
+    /// atual). O realce e o NEGATIVO das cores vigentes (video reverso): o fundo
+    /// vira a cor da letra e a letra vira a cor do fundo, seja qual for o contexto
+    /// (texto, titulo, link, tabela). A atual ganha sublinhado (`italico`: em
+    /// italico, para os trechos que ja sao sublinhados, como os links).
+    fn inv_transition(&mut self, from: u8, to: u8, italico: bool) {
+        if from == to {
+            return;
+        }
+        if from != 0 {
+            self.p(match (from, italico) {
+                (2, false) => "\x1b[27;24m",
+                (2, true) => "\x1b[27;23m",
+                _ => "\x1b[27m",
+            });
+        }
+        if to != 0 {
+            self.p(match (to, italico) {
+                (2, false) => "\x1b[7;4m",
+                (2, true) => "\x1b[7;3m",
+                _ => "\x1b[7m",
+            });
+        }
+    }
+
+    /// Texto de um link com o realce da busca (`hits` relativos ao texto).
+    fn link_text(&mut self, text: &str, hits: &[Hit], cur: Option<usize>) {
+        if hits.is_empty() {
+            self.txt(text);
+            return;
+        }
+        let mut st = 0u8;
+        let mut ini = 0;
+        for (i, _) in text.char_indices() {
+            let novo = hit_state(hit_at(hits, i), cur);
+            if novo != st {
+                self.txt(&text[ini..i]);
+                ini = i;
+                self.inv_transition(st, novo, true);
+                st = novo;
+            }
+        }
+        self.txt(&text[ini..]);
+        self.inv_transition(st, 0, true);
+    }
+
+    fn render_link(&mut self, sp: &LinkSpan, cols: i32, ew: i32, hits: &[Hit], cur: Option<usize>) -> i32 {
         let th = self.th;
         let wiki = i32::from(sp.wiki) * 2;
         let full_w = str_width(&sp.text) as i32 + wiki;
@@ -1352,13 +1412,13 @@ impl<'a> Frame<'a> {
             self.p(th.fg_wiki);
             self.p(BOLD);
             self.p("[");
-            self.txt(&text);
+            self.link_text(&text, hits, cur);
             self.p("]");
             self.p("\x1b[22m");
         } else {
             self.p(th.fg_link);
             self.p(UNDERLINE);
-            self.txt(&text);
+            self.link_text(&text, hits, cur);
             self.p(RESET);
         }
         if cols + full_w > ew - 1 {

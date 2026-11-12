@@ -113,11 +113,11 @@ Os demais comandos ignoram o prefixo. Números enormes são seguros (limite de 1
 
 ## 🔎 Busca dentro da nota (`/`, `n`, `N`)
 
-`/texto` (ou o botão **[Localizar]**) procura no texto da nota **ignorando maiúsculas**: leva o cursor ao início da ocorrência e **realça todas as ocorrências da nota** de uma vez. A ocorrência onde o cursor parou tem cor própria (texto escuro em negrito sobre o fundo de destaque), então dá para ver onde você está e quantas faltam.
+`/texto` (ou o botão **[Localizar]**) procura no texto da nota **ignorando maiúsculas**: leva o cursor ao início da ocorrência e **realça todas as ocorrências da nota** de uma vez. O realce é o **negativo** (cores inversas) do trecho: a cor da letra vira o fundo e a cor do fundo vira a letra, seja em texto comum, título, link ou tabela, o que o torna fácil de achar em qualquer tema. A ocorrência onde o cursor parou aparece também **sublinhada** (em itálico dentro de links, que já são sublinhados), então dá para ver onde você está e quantas faltam.
 
 - **`n`** vai para a próxima ocorrência; **`N`** volta para a anterior. As duas dão a volta no fim/início da nota e aceitam prefixo (`3n`, `2N`).
 - A barra de status mostra **`Ocorrência 3/17 na linha 42`** — posição e total.
-- O realce vale no texto, nas **tabelas desenhadas** (dentro das células) e nos **blocos de código**; em linhas de código o realce vem sem a colorização de sintaxe, para o destaque ficar exato.
+- O realce vale no texto, nas **descrições dos links** (`[descrição](url)` e `[[Nota]]`; o endereço oculto não é pesquisado na tela), nas **tabelas desenhadas** (dentro das células) e nos **blocos de código**; em linhas de código o realce vem sem a colorização de sintaxe, para o destaque ficar exato.
 - **`:noh`** (`:nohlsearch`) desliga o realce e **mantém o padrão**: `n`/`N` continuam navegando. Uma busca nova religa o realce.
 - **`Esc` encerra a busca da nota:** o realce some e `n`/`N` param de navegar (equivale a apagar o padrão). Para apenas esconder o realce mantendo `n`/`N`, use `:noh`.
 - A ocorrência pode estar em qualquer coluna da linha (antes, `n` parava no início da linha). A comparação é por caixa, não por acentos: `/acao` não acha `ação` — para isso existe a busca lateral (`Ctrl+F`), que ignora acentos.

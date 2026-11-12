@@ -1056,6 +1056,11 @@ fn change_by_another_instance_in_the_same_second_is_detected() {
     assert!(outra.get_content(id).unwrap().contains("escrito daqui"));
 }
 
+/// Realce da busca: negativo (video reverso) das cores do trecho; a ocorrencia
+/// atual (onde o `n`/`N` deixou o cursor) vem tambem sublinhada.
+const HIT: &str = "\x1b[7m";
+const HIT_CUR: &str = "\x1b[7;4m";
+
 /// Texto visivel imediatamente depois do primeiro `marcador` do quadro (serve para
 /// saber o que ficou com uma cor/realce).
 fn text_after(frame: &str, marker: &str) -> String {
@@ -1075,11 +1080,10 @@ fn search_highlights_all_matches_and_n_navigate() {
     // `/` leva a primeira ocorrencia, com o cursor no inicio dela.
     assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), (0, 3));
 
-    let th = a.theme();
     let frame = draw(&mut a);
-    assert!(frame.contains(th.bg_search), "as outras ocorrencias ficam realcadas");
-    assert!(frame.contains(th.bg_search_cur), "a ocorrencia atual tem cor propria");
-    assert!(text_after(&frame, th.bg_search_cur).starts_with("alvo"), "realce no texto certo");
+    assert!(frame.contains(HIT), "as outras ocorrencias ficam realcadas (negativo das cores)");
+    assert!(frame.contains(HIT_CUR), "a ocorrencia atual tem marca propria");
+    assert!(text_after(&frame, HIT_CUR).starts_with("alvo"), "realce no texto certo");
 
     // `n` desce de ocorrencia em ocorrencia e da a volta no fim.
     keys(&mut a, "n");
@@ -1096,7 +1100,7 @@ fn search_highlights_all_matches_and_n_navigate() {
 
     // A ocorrencia atual muda de lugar depois do `n`.
     let frame = draw(&mut a);
-    let resto = text_after(&frame, th.bg_search_cur);
+    let resto = text_after(&frame, HIT_CUR);
     assert!(resto.starts_with("alvo"));
 }
 
@@ -1107,13 +1111,13 @@ fn escape_deactivates_the_note_search() {
     keys(&mut a, "/alvo<CR>");
     assert!(a.search_visible() && !a.last_search.is_empty());
     let before = (a.buf().unwrap().cy, a.buf().unwrap().cx);
-    let th = a.theme();
-    assert!(draw(&mut a).contains(th.bg_search), "antes de sair, a busca esta realcada");
+    assert!(draw(&mut a).contains(HIT_CUR), "antes de sair, a busca esta realcada");
 
     keys(&mut a, "<Esc>");
     assert!(a.last_search.is_empty() && a.search_at.is_none() && !a.search_visible());
     assert!(a.status_text().unwrap_or("").contains("Busca desativada"));
-    assert!(!draw(&mut a).contains(th.bg_search), "o realce some ao desativar a busca");
+    let depois = draw(&mut a);
+    assert!(!depois.contains(HIT_CUR) && !depois.contains(HIT), "o realce some ao desativar a busca");
 
     keys(&mut a, "n");
     assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), before, "n nao navega mais");
@@ -1125,17 +1129,69 @@ fn search_marks_matches_inside_tables_code_and_ignores_case() {
     let mut a = app_with(&[("T", "| col | ALVO |\n|---|---|\n| x | y |\n\n```\nalvo em codigo\n```\n")]);
     open(&mut a, "T");
     keys(&mut a, "/alvo<CR>");
-    let th = a.theme();
     let frame = draw(&mut a);
     assert!(
-        frame.contains(th.bg_search) || frame.contains(th.bg_search_cur),
+        frame.contains(HIT) || frame.contains(HIT_CUR),
         "ocorrencia dentro da tabela desenhada fica realcada"
     );
     // A segunda ocorrencia esta num bloco de codigo.
     keys(&mut a, "n");
     assert_eq!(a.buf().unwrap().cy, 5, "linha do bloco de codigo");
     let frame = draw(&mut a);
-    assert!(frame.contains(th.bg_search_cur), "realce dentro do bloco de codigo");
+    assert!(frame.contains(HIT_CUR), "realce dentro do bloco de codigo");
+}
+
+#[test]
+fn search_highlights_inside_link_descriptions() {
+    let mut a = app_with(&[(
+        "L",
+        "alvo solto\n[Documento ALVO](http://alvo.example/alvo) e mais\n[[Nota Alvo]] fim\nsem nada\n",
+    )]);
+    open(&mut a, "L");
+    keys(&mut a, "/alvo<CR>");
+    assert_eq!((a.buf().unwrap().cy, a.buf().unwrap().cx), (0, 0), "a atual esta na 1a linha");
+
+    // Fora da linha do cursor: o titulo do link e o do wikilink ficam em negativo.
+    let frame = draw(&mut a);
+    let marcados: Vec<String> = frame.split(HIT).skip(1).map(visible).collect();
+    assert!(
+        marcados.iter().any(|m| m.starts_with("ALVO")),
+        "descricao do link markdown realcada: {marcados:?}"
+    );
+    assert!(
+        marcados.iter().any(|m| m.starts_with("Alvo")),
+        "descricao do wikilink realcada: {marcados:?}"
+    );
+    // O endereco do link nao aparece na tela, entao nao ha realce nele.
+    assert!(!visible(&frame).contains("alvo.example"), "URL continua oculta");
+    assert!(visible(&frame).contains("Documento ALVO e mais"));
+
+    // `n` leva o cursor ao titulo do link (a atual, marcada tambem em italico).
+    keys(&mut a, "n");
+    assert_eq!(a.buf().unwrap().cy, 1);
+    let frame = draw(&mut a);
+    assert!(frame.contains("\x1b[7;3m"), "ocorrencia atual dentro do link tem marca propria");
+    assert!(text_after(&frame, "\x1b[7;3m").starts_with("ALVO"));
+
+    // Sem busca, nada de negativo nos links.
+    keys(&mut a, ":noh<CR>");
+    let frame = draw(&mut a);
+    assert!(!frame.contains(HIT) && !frame.contains("\x1b[7;3m"));
+}
+
+#[test]
+fn search_highlight_is_the_negative_of_the_text_colors() {
+    let mut a = app_with(&[("N", "# Titulo alvo aqui\numa linha alvo no meio\n")]);
+    open(&mut a, "N");
+    keys(&mut a, "/alvo<CR>");
+    let frame = draw(&mut a);
+    // Nenhuma cor propria de busca: so video reverso sobre as cores vigentes, de
+    // modo que cada trecho vira o negativo do que era (titulo e texto comum).
+    assert!(frame.contains(HIT) || frame.contains(HIT_CUR));
+    assert!(!frame.contains("\x1b[48;2;61;89;161m"), "sem o antigo fundo fixo de busca");
+    // O negativo e desligado ao fim da ocorrencia: o resto volta ao normal.
+    let fora: Vec<String> = frame.split("\x1b[27m").skip(1).map(visible).collect();
+    assert!(fora.iter().any(|p| p.starts_with(" no meio")), "{fora:?}");
 }
 
 #[test]
@@ -1143,11 +1199,11 @@ fn search_highlight_can_be_turned_off_and_keeps_navigating() {
     let mut a = app_with(&[("S", "alvo um\nalvo dois\n")]);
     open(&mut a, "S");
     keys(&mut a, "/alvo<CR>");
-    assert!(draw(&mut a).contains(a.theme().bg_search_cur));
+    assert!(draw(&mut a).contains(HIT_CUR));
     keys(&mut a, ":noh<CR>");
     let frame = draw(&mut a);
-    assert!(!frame.contains(a.theme().bg_search_cur), "realce desligado");
-    assert!(!frame.contains(a.theme().bg_search));
+    assert!(!frame.contains(HIT_CUR), "realce desligado");
+    assert!(!frame.contains(HIT));
     // O padrao continua valendo para n/N.
     keys(&mut a, "n");
     assert_eq!(a.buf().unwrap().cy, 1);
