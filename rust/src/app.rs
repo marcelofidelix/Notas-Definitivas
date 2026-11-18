@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_LEFT_WIDTH: i32 = 40;
 pub const MIN_LEFT_WIDTH: i32 = 18;
 pub const MAX_HISTORY: usize = 64;
-pub const AUTOSAVE_DELAY: Duration = Duration::from_secs(60);
+/// Teto: uma alteracao nao gravada nunca espera mais que isto (mesmo digitando).
+pub const AUTOSAVE_DELAY: Duration = Duration::from_secs(20);
+/// Pausa na edicao que dispara a gravacao automatica (o SQLite em WAL aguenta).
+pub const AUTOSAVE_IDLE: Duration = Duration::from_secs(3);
 pub const IDLE_LIFE: Duration = Duration::from_secs(600);
 pub const IDLE_HEARTBEAT: Duration = Duration::from_secs(30);
 pub const STATUS_TTL: Duration = Duration::from_secs(5);
@@ -102,6 +105,8 @@ pub struct Tab {
     pub buf: Buffer,
     pub modified: bool,
     pub first_unsaved: Option<Instant>,
+    /// Ultima edicao ainda nao gravada (a pausa na digitacao dispara o autosave).
+    pub last_edit: Option<Instant>,
     /// Ausente apenas quando o arquivo ainda precisa ser criado.
     loaded_version: Option<u64>,
 }
@@ -221,6 +226,11 @@ pub struct App {
     /// O indice de busca das notas ja foi carregado do banco (ver
     /// `load_search_index`). Comeca falso e volta a falso a cada recatalogo.
     pub norms_loaded: bool,
+    /// Durante um lote de eventos do laco principal, trocar a selecao da lista
+    /// apenas marca a previa como pendente; ela e carregada uma vez, no fim do
+    /// lote (segurar `j` numa lista de notas grandes nao le uma nota por tecla).
+    pub defer_preview: bool,
+    pub preview_pending: bool,
     pub start: Instant,
 }
 
@@ -284,15 +294,17 @@ impl App {
             last_note_click: None,
             last_editor_click: None,
             norms_loaded: false,
+            defer_preview: false,
+            preview_pending: false,
             start: now,
         };
-        app.rescan_notes();
+        let catalog_ok = app.rescan_notes();
         if let Some(first) = app.notes.first().map(|n| n.key.clone()) {
             app.open_note(&first, false);
             app.selected = 0;
             app.focus = Focus::Left;
             app.load_preview(&first);
-        } else {
+        } else if catalog_ok {
             app.set_status("Banco de dados vazio. Use [Nova] para criar ou [Importar] para trazer seus .md.");
         }
         app
@@ -340,8 +352,10 @@ impl App {
             // Toda edicao termina aqui: garante cursor valido mesmo se a linha encurtou.
             t.buf.clamp_cursor();
             t.modified = true;
+            let now = Instant::now();
+            t.last_edit = Some(now);
             if t.first_unsaved.is_none() {
-                t.first_unsaved = Some(Instant::now());
+                t.first_unsaved = Some(now);
             }
         }
         // A ocorrencia atual da busca pode ter deixado de existir: a partir daqui
@@ -435,7 +449,8 @@ impl App {
         if let Some(i) = self.active {
             let b = &mut self.tabs[i].buf;
             b.clamp_cursor();
-            let (cur_vrow, _) = crate::layout::cursor_visual_pos(b, &lay);
+            let (cur_vrow, cur_vcol) = crate::layout::cursor_visual_pos(b, &lay);
+            b.vpos = (cur_vrow, cur_vcol);
             b.scroll_y = clamp_scroll(&b.lines, lay, b.scroll_y, visible);
             if cur_vrow < b.scroll_y {
                 b.scroll_y = cur_vrow;
@@ -463,57 +478,134 @@ impl App {
 
     // ---- catalogo ----------------------------------------------------------
 
-    pub fn rescan_notes(&mut self) {
+    /// Relê a lista de notas do banco. Em caso de falha mantem a lista atual,
+    /// avisa e devolve `false` (nunca finge que o banco esta vazio).
+    ///
+    /// Se o indice de busca ja estava carregado, ele e reaproveitado: so as notas
+    /// novas ou alteradas (nome/data diferentes) sao reindexadas, e so quando sao
+    /// poucas; num lote grande (importacao) o indice volta a ser carregado sob
+    /// demanda, de uma vez.
+    pub fn rescan_notes(&mut self) -> bool {
+        const MAX_INCREMENTAL_REINDEX: usize = 32;
+        let (rows, unreadable) = match self.db.list_notes() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_status(format!("⚠ Falha ao ler a lista de notas: {e}"));
+                return false;
+            }
+        };
         let now = now_secs();
-        let mut notes = Vec::with_capacity(self.notes.len().max(8));
-        for row in self.db.list_notes() {
+        let was_loaded = self.norms_loaded;
+        let mut old: std::collections::HashMap<i64, (String, i64, String)> = std::collections::HashMap::new();
+        if was_loaded {
+            for n in std::mem::take(&mut self.notes) {
+                if let NoteKey::Db(id) = n.key {
+                    old.insert(id, (n.filename, n.mtime, n.search_norm));
+                }
+            }
+        }
+        let mut complete = was_loaded;
+        let mut reindexed = 0usize;
+        let mut notes = Vec::with_capacity(rows.len());
+        for row in rows {
             let filename = format!("{}.md", row.name);
+            let title = title_from_filename(&filename);
+            let mtime = if row.mtime > 0 { row.mtime } else { now };
+            let mut norm = String::new();
+            if complete {
+                match old.remove(&row.id) {
+                    Some((f, m, s)) if f == filename && m == mtime => norm = s,
+                    _ => {
+                        reindexed += 1;
+                        if reindexed > MAX_INCREMENTAL_REINDEX {
+                            complete = false;
+                        } else {
+                            match self.db.try_get_content(row.id) {
+                                Ok(Some(c)) => norm = build_search_norm(&filename, &title, &c),
+                                _ => complete = false,
+                            }
+                        }
+                    }
+                }
+            }
             notes.push(NoteInfo {
-                title: title_from_filename(&filename),
+                title,
                 filename,
                 key: NoteKey::Db(row.id),
-                mtime: if row.mtime > 0 { row.mtime } else { now },
+                mtime,
                 attention: row.attention,
-                // Vazio de proposito: o indice sai do banco na primeira busca
-                // (`load_search_index`). Ler e normalizar o conteudo de todas as
-                // notas dominava o tempo de abertura.
-                search_norm: String::new(),
+                // Vazio de proposito quando o indice nao esta carregado: ele sai do
+                // banco na primeira busca (`load_search_index`). Ler e normalizar o
+                // conteudo de todas as notas dominava o tempo de abertura.
+                search_norm: norm,
             });
         }
         notes.sort_by(compare_notes);
         self.notes = notes;
-        self.norms_loaded = false;
+        self.norms_loaded = complete;
+        if unreadable > 0 {
+            self.set_status(format!("⚠ {unreadable} nota(s) ilegível(is) no banco não aparecem na lista."));
+        }
         self.apply_search();
+        true
     }
 
     /// Carrega (uma vez) o indice de busca de todas as notas, do banco.
     ///
     /// Notas gravadas por versoes anteriores (ou pela versao em C) nao tem o
-    /// indice: o conteudo delas e lido e indexado agora, uma unica vez.
+    /// indice: o conteudo delas e lido e indexado agora, uma unica vez, numa so
+    /// transacao. Uma nota que nao pode ser lida fica sem indice (nunca recebe um
+    /// indice vazio gravado) e e reindexada na proxima gravacao ou abertura.
     fn load_search_index(&mut self) {
-        let rows = self.db.all_content_norms();
-        let mut por_id: std::collections::HashMap<i64, String> = std::collections::HashMap::with_capacity(rows.len());
-        for (id, norm) in rows {
-            let norm = match norm {
-                Some(n) => n,
-                None => {
-                    let content = self.db.get_content(id).unwrap_or_default();
-                    let n = build_content_norm(&content);
-                    self.db.set_content_norm(id, &n);
-                    n
-                }
+        let rows = match self.db.all_content_norms() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_status(format!("⚠ Índice de busca indisponível: {e}"));
+                return;
+            }
+        };
+        let por_id = {
+            // Reconstrucoes em lote: uma transacao, nao um commit por nota.
+            let batch = if rows.iter().any(|(_, norm)| norm.is_none()) {
+                self.db.transaction(rusqlite::TransactionBehavior::Immediate).ok()
+            } else {
+                None
             };
-            por_id.insert(id, norm);
-        }
+            let mut por_id: std::collections::HashMap<i64, String> =
+                std::collections::HashMap::with_capacity(rows.len());
+            for (id, norm) in rows {
+                let norm = match norm {
+                    Some(n) => n,
+                    None => match self.db.try_get_content(id) {
+                        Ok(Some(content)) => {
+                            let n = build_content_norm(&content);
+                            self.db.set_content_norm(id, &n);
+                            n
+                        }
+                        _ => continue,
+                    },
+                };
+                por_id.insert(id, norm);
+            }
+            if let Some(tx) = batch {
+                let _ = tx.commit();
+            }
+            por_id
+        };
+        let mut gaps = 0usize;
         for n in &mut self.notes {
             if let Some(id) = n.key.db_id() {
-                if let Some(norm) = por_id.get(&id) {
-                    let indice = search_norm(&n.filename, &n.title, norm);
-                    n.search_norm = indice;
-                }
+                let norm = por_id.get(&id).map(String::as_str).unwrap_or_else(|| {
+                    gaps += 1;
+                    ""
+                });
+                n.search_norm = search_norm(&n.filename, &n.title, norm);
             }
         }
         self.norms_loaded = true;
+        if gaps > 0 {
+            self.set_status(format!("⚠ {gaps} nota(s) sem índice de busca por conteúdo (só o nome é pesquisável)."));
+        }
     }
 
     pub fn apply_search(&mut self) {
@@ -547,18 +639,44 @@ impl App {
     }
 
     /// Mostra a previa da nota selecionada (ou limpa se a lista esta vazia).
+    /// Dentro de um lote de eventos (`defer_preview`) apenas marca a previa como
+    /// pendente: `flush_preview` a carrega uma vez no fim do lote.
     pub fn sync_preview_to_selection(&mut self) {
+        if self.defer_preview {
+            self.preview_pending = true;
+            // A rolagem da previa antiga nao vale para a proxima nota.
+            if self.selected_key().as_ref() != self.preview.as_ref().map(|p| &p.key) {
+                if let Some(p) = &mut self.preview {
+                    p.scroll_y = 0;
+                }
+            }
+            return;
+        }
+        self.preview_pending = false;
         match self.selected_key() {
             Some(k) => self.load_preview(&k),
             None => self.free_preview(),
         }
     }
 
+    /// Resolve a previa pendente (ver `defer_preview`). Seguro chamar sempre.
+    pub fn flush_preview(&mut self) {
+        if self.preview_pending {
+            self.preview_pending = false;
+            match self.selected_key() {
+                Some(k) => self.load_preview(&k),
+                None => self.free_preview(),
+            }
+        }
+    }
+
     pub fn free_preview(&mut self) {
         self.preview = None;
+        self.preview_pending = false;
     }
 
     pub fn load_preview(&mut self, key: &NoteKey) {
+        self.preview_pending = false;
         // Uma nota aberta pode ter edicoes ainda nao gravadas. A previa deve
         // mostrar a aba, e ser reconstruida mesmo se a chave nao mudou.
         let mut lines = if let Some(tab) = self.tabs.iter().find(|t| &t.key == key) {
@@ -568,7 +686,13 @@ impl App {
                 return;
             }
             self.preview = None;
-            let Some(content) = self.read_note(key) else { return };
+            let content = match self.read_note(key) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.set_status(format!("⚠ Falha ao ler a prévia: {e}"));
+                    return;
+                }
+            };
             Buffer::from_content(&content).lines
         };
         crate::doc::update_lines_syntax(&mut lines);
@@ -636,10 +760,13 @@ impl App {
 
     // ---- leitura/escrita de notas -----------------------------------------
 
-    pub fn read_note(&self, key: &NoteKey) -> Option<String> {
+    pub fn read_note(&self, key: &NoteKey) -> Result<String, String> {
         match key {
-            NoteKey::Db(id) => self.db.get_content(*id),
-            NoteKey::File(p) => fsio::read_text_file(p).ok(),
+            NoteKey::Db(id) => self
+                .db
+                .try_get_content(*id)?
+                .ok_or_else(|| "a nota não existe mais no banco".to_string()),
+            NoteKey::File(p) => fsio::read_text_file(p).map_err(|e| format!("{}: {e}", p.display())),
         }
     }
 
@@ -690,6 +817,7 @@ impl App {
             buf: Buffer::from_content(&content),
             modified: false,
             first_unsaved: None,
+            last_edit: None,
             loaded_version: version,
         });
         self.active = Some(self.tabs.len() - 1);
@@ -791,10 +919,14 @@ impl App {
         let Some(t) = self.tabs.get(idx) else { return false };
         let content = t.buf.to_content();
         let key = t.key.clone();
+        // O indice de busca e calculado uma unica vez: vai para o banco e, se a
+        // lista ja o carregou, tambem para a nota no catalogo.
+        let mut norm = String::new();
         let result = match &key {
             NoteKey::Db(id) => {
                 let expected = if force { None } else { t.loaded_version };
-                self.db.save_note(*id, expected, None, &content)
+                norm = build_content_norm(&content);
+                self.db.save_note_with_norm(*id, expected, None, &content, &norm)
             }
             NoteKey::File(path) => {
                 let mode = if force {
@@ -815,13 +947,17 @@ impl App {
             }
         }
         let now = now_secs();
+        let index_loaded = self.norms_loaded;
         if let Some(n) = self.notes.iter_mut().find(|n| n.key == key) {
             n.mtime = now;
-            n.search_norm = build_search_norm(&n.filename, &n.title, &content);
+            // Sem o indice carregado `search_norm` fica vazio (o carregamento o
+            // preenche de uma vez); montar so o desta nota seria trabalho perdido.
+            n.search_norm = if index_loaded { search_norm(&n.filename, &n.title, &norm) } else { String::new() };
         }
         let t = &mut self.tabs[idx];
         t.modified = false;
         t.first_unsaved = None;
+        t.last_edit = None;
         true
     }
 
@@ -870,6 +1006,7 @@ impl App {
         t.buf.clamp_cursor();
         t.modified = false;
         t.first_unsaved = None;
+        t.last_edit = None;
         t.loaded_version = version;
         self.clear_needed = true;
         let name = self.tabs[idx].filename.clone();
@@ -889,23 +1026,28 @@ impl App {
         true
     }
 
-    /// Salva em silencio as abas com alteracoes pendentes ha mais de 1 minuto.
+    /// Salva em silencio as abas com alteracoes pendentes: apos uma pausa na
+    /// edicao (`AUTOSAVE_IDLE`) ou, digitando sem parar, no maximo `AUTOSAVE_DELAY`
+    /// depois da primeira alteracao nao gravada.
     pub fn check_autosave(&mut self) {
         let mut saved = 0;
         let mut failed = false;
         let mut last = String::new();
         for i in 0..self.tabs.len() {
-            let due = self.tabs[i].modified
-                && self.tabs[i].first_unsaved.is_some_and(|t| t.elapsed() >= AUTOSAVE_DELAY);
+            let t = &self.tabs[i];
+            let due = t.modified
+                && (t.first_unsaved.is_some_and(|f| f.elapsed() >= AUTOSAVE_DELAY)
+                    || t.last_edit.is_some_and(|e| e.elapsed() >= AUTOSAVE_IDLE));
             if due {
                 if self.save_tab(i) {
                     saved += 1;
                     last = self.tabs[i].filename.clone();
                 } else {
-                    // Falhou (conflito, disco...): tenta de novo so em 1 minuto, em vez
-                    // de martelar o banco e a mensagem de status a cada 100 ms.
+                    // Falhou (conflito, disco...): tenta de novo so no proximo teto,
+                    // em vez de martelar o banco e a mensagem de status.
                     failed = true;
                     self.tabs[i].first_unsaved = Some(Instant::now());
+                    self.tabs[i].last_edit = None;
                 }
             }
         }
@@ -1052,7 +1194,9 @@ impl App {
             content.replace_range(..end, &heading);
         }
         let result = match old {
-            NoteKey::Db(id) => self.db.save_note(*id, version, Some(&safe_new), &content)
+            NoteKey::Db(id) => self
+                .db
+                .save_note_with_norm(*id, version, Some(&safe_new), &content, &build_content_norm(&content))
                 .map(|v| (old.clone(), v)),
             NoteKey::File(path) => {
                 let dest = path.with_file_name(&new_filename);
@@ -1081,6 +1225,7 @@ impl App {
             t.loaded_version = Some(version);
             t.modified = false;
             t.first_unsaved = None;
+            t.last_edit = None;
         }
         for key in &mut self.history {
             if key == old {
@@ -1219,19 +1364,57 @@ impl App {
         }
         match fsio::export_notes_to_dir(&self.db, &dir) {
             Err(e) => self.set_status(format!("Exportacao falhou: {}", e)),
-            Ok(n) => self.set_status(format!("Exportadas {} nota(s) como arquivos .md em {}", n, dir)),
+            Ok(r) if r.failed > 0 => self.set_status(format!(
+                "⚠ Exportação parcial: {} nota(s) gravada(s) em {}, {} NÃO puderam ser gravadas",
+                r.written, dir, r.failed
+            )),
+            Ok(r) => self.set_status(format!("Exportadas {} nota(s) como arquivos .md em {}", r.written, dir)),
         }
     }
 
     /// Salvamento de emergencia (encerramento ou falha inesperada).
-    pub fn emergency_save(&mut self) -> bool {
+    ///
+    /// Com `after_panic` o buffer pode estar inconsistente (um panico no meio de
+    /// uma edicao): antes de sobrescrever, a versao hoje gravada vai para a tabela
+    /// `recovery` (notas do banco) ou para `<arquivo>.notas-bak` (arquivos avulsos).
+    /// Se mesmo assim a gravacao falhar, o texto vai para um arquivo
+    /// `notas-recuperado-*.md` na pasta atual, para nao se perder.
+    pub fn emergency_save(&mut self, after_panic: bool) -> bool {
         let mut saved = true;
         for i in 0..self.tabs.len() {
-            if self.tabs[i].modified && !self.save_tab(i) {
+            if !self.tabs[i].modified {
+                continue;
+            }
+            if after_panic {
+                match self.tabs[i].key.clone() {
+                    NoteKey::Db(id) => {
+                        self.db.stash_recovery(id, now_secs());
+                    }
+                    NoteKey::File(p) => {
+                        let mut bak = p.clone().into_os_string();
+                        bak.push(".notas-bak");
+                        let _ = std::fs::copy(&p, PathBuf::from(bak));
+                    }
+                }
+            }
+            if !self.save_tab(i) {
                 saved = false;
+                self.dump_tab_to_file(i);
             }
         }
         saved
+    }
+
+    /// Ultimo recurso: grava o texto da aba num arquivo avulso na pasta atual.
+    fn dump_tab_to_file(&self, idx: usize) {
+        // Os testes nao deixam arquivos soltos na pasta do projeto.
+        if cfg!(test) {
+            return;
+        }
+        let Some(t) = self.tabs.get(idx) else { return };
+        let stem = fsio::export_file_stem(&t.title);
+        let name = format!("notas-recuperado-{}-{}.md", if stem.is_empty() { "nota" } else { &stem }, now_secs());
+        let _ = fsio::write_file(std::path::Path::new(&name), t.buf.to_content().as_bytes(), fsio::FileWrite::Create);
     }
 
     /// Copia para o clipboard do sistema e guarda no buffer interno.

@@ -1018,7 +1018,7 @@ fn legacy_database_is_migrated_and_indexed_lazily() {
     );
     // Reconstruir uma vez basta: o indice ficou gravado junto da nota.
     assert!(
-        a.db.all_content_norms()[0].1.as_deref().is_some_and(|n| n.contains("marketing")),
+        a.db.all_content_norms().unwrap()[0].1.as_deref().is_some_and(|n| n.contains("marketing")),
         "o indice fica no banco para a proxima abertura"
     );
 }
@@ -1476,7 +1476,7 @@ fn fuzz(seed: u64, steps: usize) {
         }
     }
     let _ = draw(&mut a);
-    a.emergency_save();
+    a.emergency_save(false);
 }
 
 #[test]
@@ -1688,6 +1688,119 @@ fn failed_autosave_backs_off_instead_of_retrying_every_tick() {
     a.status = None;
     a.check_autosave();
     assert!(a.status_text().is_none(), "sem nova tentativa (nem nova mensagem) ate o proximo minuto");
+}
+
+#[test]
+fn autosave_fires_after_a_typing_pause_not_while_typing() {
+    use crate::app::AUTOSAVE_IDLE;
+    let mut a = app_with(&[("A", "# A\n")]);
+    open(&mut a, "A");
+    keys(&mut a, "ix<Esc>");
+    a.check_autosave();
+    assert!(a.tab().unwrap().modified, "acabou de digitar: espera a pausa");
+    a.tab_mut().unwrap().last_edit = Some(std::time::Instant::now() - AUTOSAVE_IDLE);
+    a.check_autosave();
+    assert!(!a.tab().unwrap().modified, "a pausa gravou");
+    assert!(db_text(&a, "A").contains('x'));
+    assert!(a.tab().unwrap().last_edit.is_none() && a.tab().unwrap().first_unsaved.is_none());
+    // Continuar digitando rearma os dois relogios.
+    keys(&mut a, "iy<Esc>");
+    assert!(a.tab().unwrap().last_edit.is_some() && a.tab().unwrap().first_unsaved.is_some());
+}
+
+#[test]
+fn list_navigation_in_a_batch_loads_the_preview_once() {
+    let mut a = app_with(&[("A", "# A\n"), ("B", "# B\n"), ("C", "# C\n")]);
+    a.focus = Focus::Left;
+    a.selected = 0;
+    a.sync_preview_to_selection();
+    let primeira = a.preview.as_ref().unwrap().key.clone();
+
+    a.defer_preview = true;
+    keys(&mut a, "jj");
+    assert_eq!(a.selected, 2);
+    assert_eq!(a.preview.as_ref().unwrap().key, primeira, "dentro do lote a previa nao e recarregada");
+    assert!(a.preview_pending);
+    a.defer_preview = false;
+    a.flush_preview();
+    assert!(!a.preview_pending);
+    assert_eq!(a.preview.as_ref().unwrap().key, a.selected_key().unwrap(), "no fim do lote segue a selecao");
+
+    // Abrir com `l` no meio de um lote usa a nota selecionada, nunca a previa velha.
+    a.selected = 0;
+    a.sync_preview_to_selection();
+    a.defer_preview = true;
+    keys(&mut a, "jl");
+    a.defer_preview = false;
+    assert_eq!(a.tab().unwrap().title, "B");
+}
+
+#[test]
+fn rescan_keeps_the_loaded_search_index_and_indexes_only_what_changed() {
+    let mut a = app_with(&[("Alfa", "conteudo um\n"), ("Beta", "outro texto\n")]);
+    a.search_query = "conteudo".into();
+    a.apply_search();
+    assert!(a.norms_loaded);
+    for n in &mut a.notes {
+        n.search_norm.push_str(" marca");
+    }
+    assert!(a.rescan_notes());
+    assert!(a.norms_loaded, "o indice continua carregado");
+    assert!(
+        a.notes.iter().all(|n| n.search_norm.ends_with(" marca")),
+        "notas inalteradas reaproveitam o indice, sem reler o banco"
+    );
+    a.create_new_note("Gama");
+    assert!(a.norms_loaded);
+    let gama = a.notes.iter().find(|n| n.title == "Gama").unwrap();
+    assert!(gama.search_norm.contains("gama"), "so a nota nova foi indexada: {:?}", gama.search_norm);
+    assert!(a.notes.iter().filter(|n| n.title != "Gama").all(|n| n.search_norm.ends_with(" marca")));
+}
+
+#[test]
+fn saving_with_the_index_not_loaded_leaves_it_to_the_lazy_load() {
+    let mut a = app_with(&[("A", "# A\n"), ("B", "# B\n")]);
+    assert!(!a.norms_loaded);
+    open(&mut a, "A");
+    keys(&mut a, "iabacaxi<Esc>:w<CR>");
+    assert!(a.notes.iter().all(|n| n.search_norm.is_empty()));
+    a.search_query = "abacaxi".into();
+    a.apply_search();
+    assert_eq!(a.filtered.len(), 1, "a busca acha a nota gravada");
+}
+
+#[test]
+fn emergency_save_after_a_panic_keeps_the_replaced_version() {
+    let mut a = app_with(&[("A", "versao boa\n")]);
+    open(&mut a, "A");
+    keys(&mut a, "ix<Esc>");
+    assert!(a.emergency_save(true));
+    assert_eq!(a.db.recovery_count(), 1, "a versao substituida foi guardada");
+    assert!(db_text(&a, "A").contains('x'));
+
+    let mut b = app_with(&[("B", "texto\n")]);
+    open(&mut b, "B");
+    keys(&mut b, "ix<Esc>");
+    assert!(b.emergency_save(false));
+    assert_eq!(b.db.recovery_count(), 0, "encerramento normal nao enche a tabela de recuperacao");
+}
+
+#[test]
+fn a_lost_terminal_and_a_panic_both_end_with_pending_notes_saved() {
+    let mut a = app_with(&[("A", "# A\n")]);
+    open(&mut a, "A");
+    keys(&mut a, "ix<Esc>");
+    let r = crate::run_session(&mut a, |_| crate::ExitReason::TerminalLost);
+    assert_eq!(r, Err("Terminal indisponível. As alterações pendentes foram salvas."));
+    assert!(!a.tab().unwrap().modified && db_text(&a, "A").contains('x'));
+
+    let mut b = app_with(&[("B", "# B\n")]);
+    open(&mut b, "B");
+    keys(&mut b, "iy<Esc>");
+    let r = crate::run_session(&mut b, |_| -> crate::ExitReason { panic!("falha simulada") });
+    assert_eq!(r, Err("Erro interno inesperado. Salvamento de emergência concluído."));
+    assert!(db_text(&b, "B").contains('y'));
+    assert_eq!(b.db.recovery_count(), 1);
 }
 
 #[test]

@@ -150,6 +150,11 @@ pub fn find_styles(s: &str) -> Vec<StyleSpan> {
     let len = b.len();
     let mut out = Vec::new();
     let mut i = 0;
+    // Se a busca de um fechamento de `n` asteriscos chegou ao fim sem achar, nenhum
+    // abridor posterior com o mesmo `n` acharia (procuraria num trecho menor, com a
+    // mesma regra). Sem isso, `*a *a *a ...` varria o resto da linha a cada `*`:
+    // quadratico (~40 ms numa linha de 20 KB, repetido varias vezes por quadro).
+    let mut no_close = [false; 4];
     while i < len && out.len() < MAX_SPANS {
         if b[i] == b'`' {
             i += 1;
@@ -169,7 +174,7 @@ pub fn find_styles(s: &str) -> Vec<StyleSpan> {
         while i + dlen < len && b[i + dlen] == b'*' {
             dlen += 1;
         }
-        if (1..=3).contains(&dlen) {
+        if (1..=3).contains(&dlen) && !no_close[dlen] {
             let next = i + dlen;
             if next < len && !matches!(b[next], b' ' | b'\t' | b'\r' | b'\n') {
                 let mut j = next;
@@ -205,6 +210,7 @@ pub fn find_styles(s: &str) -> Vec<StyleSpan> {
                 if found {
                     continue;
                 }
+                no_close[dlen] = true;
             }
         }
         i += dlen;
@@ -326,6 +332,99 @@ mod tests {
         assert_eq!(kinds, [StyleKind::Italic, StyleKind::Bold, StyleKind::BoldItalic]);
         assert_eq!(st[0].content_start, 3);
         assert_eq!(st[0].close_start, 5);
+    }
+
+    /// A versao anterior de `find_styles` (sem a memoria de "nao ha fechamento").
+    fn find_styles_reference(s: &str) -> Vec<StyleSpan> {
+        let b = s.as_bytes();
+        let len = b.len();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < len && out.len() < MAX_SPANS {
+            if b[i] == b'`' {
+                i += 1;
+                while i < len && b[i] != b'`' {
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                continue;
+            }
+            if b[i] != b'*' {
+                i += 1;
+                continue;
+            }
+            let mut dlen = 0;
+            while i + dlen < len && b[i + dlen] == b'*' {
+                dlen += 1;
+            }
+            if (1..=3).contains(&dlen) {
+                let next = i + dlen;
+                if next < len && !matches!(b[next], b' ' | b'\t' | b'\r' | b'\n') {
+                    let mut j = next;
+                    let mut found = false;
+                    while j < len {
+                        if b[j] == b'*' {
+                            let mut cdlen = 0;
+                            while j + cdlen < len && b[j + cdlen] == b'*' {
+                                cdlen += 1;
+                            }
+                            if cdlen == dlen && j > 0 && b[j - 1] != b' ' && b[j - 1] != b'\t' {
+                                out.push(StyleSpan {
+                                    open_start: i,
+                                    content_start: i + dlen,
+                                    content_end: j,
+                                    close_start: j,
+                                    close_len: dlen,
+                                    kind: match dlen {
+                                        3 => StyleKind::BoldItalic,
+                                        2 => StyleKind::Bold,
+                                        _ => StyleKind::Italic,
+                                    },
+                                });
+                                i = j + cdlen;
+                                found = true;
+                                break;
+                            }
+                            j += cdlen;
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    if found {
+                        continue;
+                    }
+                }
+            }
+            i += dlen;
+        }
+        out
+    }
+
+    #[test]
+    fn style_search_matches_the_reference_and_stays_linear() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let alphabet = ["*", "*", "**", "***", "a", "b", " ", "`", "x y"];
+        for _ in 0..20_000 {
+            let s: String = (0..rnd(24)).map(|_| alphabet[rnd(alphabet.len())]).collect();
+            assert_eq!(find_styles(&s), find_styles_reference(&s), "{s:?}");
+        }
+        // Caso patologico: antes ~40 ms por chamada (em release); agora uma varredura.
+        let ruim = "*a ".repeat(6_600);
+        let t = std::time::Instant::now();
+        assert!(find_styles(&ruim).is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_millis(30), "{:?}", t.elapsed());
+        // Um par valido depois do trecho sem fechamento continua sendo achado.
+        let st = find_styles("*a *a *a **b** fim");
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].kind, StyleKind::Bold);
     }
 
     #[test]

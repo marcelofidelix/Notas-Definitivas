@@ -730,6 +730,7 @@ impl App {
                 }
             }
             Key::Char('l') | Key::Right => {
+                self.flush_preview();
                 let prev_scroll = self.preview.as_ref().map_or(0, |p| p.scroll_y);
                 if self.open_selected(true) {
                     self.with_buf(|b| b.scroll_y = prev_scroll);

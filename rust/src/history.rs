@@ -9,6 +9,7 @@
 //! linhas. Desfazer reconstroi o estado anterior a partir do completo.
 
 use crate::doc::Line;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -69,7 +70,8 @@ impl Delta {
 /// do `i + 1` (e o ultimo a partir de `top`).
 #[derive(Default)]
 pub struct Stack {
-    deltas: Vec<Delta>,
+    /// Fila dupla: esquecer o estado mais antigo (a frente) nao desloca os demais.
+    deltas: VecDeque<Delta>,
     top: Option<Snapshot>,
 }
 
@@ -85,14 +87,14 @@ impl Stack {
 
     pub fn push(&mut self, s: Snapshot) {
         if let Some(old) = self.top.take() {
-            self.deltas.push(Delta::between(old, &s));
+            self.deltas.push_back(Delta::between(old, &s));
         }
         self.top = Some(s);
     }
 
     pub fn pop(&mut self) -> Option<Snapshot> {
         let top = self.top.take()?;
-        if let Some(d) = self.deltas.pop() {
+        if let Some(d) = self.deltas.pop_back() {
             self.top = Some(d.apply(&top));
         }
         Some(top)
@@ -103,7 +105,7 @@ impl Stack {
         if self.deltas.is_empty() {
             self.top = None;
         } else {
-            self.deltas.remove(0);
+            self.deltas.pop_front();
         }
     }
 

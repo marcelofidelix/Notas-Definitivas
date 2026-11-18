@@ -37,6 +37,11 @@ pub struct Line {
     pub hidden: bool,
     pub fence: bool,
     pub in_code: bool,
+    /// O texto contem TAB. Calculado quando o texto muda (`detect_heading`): a
+    /// varredura do quadro consulta isto por linha e nao deve reler o texto.
+    pub has_tab: bool,
+    /// O texto tem a forma de uma linha de tabela (`| a | b |`); idem.
+    pub tbl_line: bool,
     pub memo: Cell<RowMemo>,
     /// Bloco de tabela (2+ linhas seguidas) a que a linha pertence, e seu indice nele.
     pub tb: Option<Rc<TableBlock>>,
@@ -63,7 +68,11 @@ impl Line {
         r
     }
 
+    /// Recalcula o que depende so do texto: nivel de titulo e os indicadores
+    /// `has_tab`/`tbl_line`. Todo caminho que troca `text` passa por aqui.
     pub fn detect_heading(&mut self) {
+        self.has_tab = self.text.contains('\t');
+        self.tbl_line = is_table_line(&self.text);
         let b = self.text.as_bytes();
         let n = b.iter().take_while(|&&c| c == b'#').count();
         self.heading = if (1..=6).contains(&n) && n < b.len() && b[n] == b' ' {
@@ -211,6 +220,10 @@ pub struct Buffer {
     pub vis_y: usize,
     pub vis_x: usize,
     pub has_selection: bool,
+    /// (linha visual, coluna visual) do cursor, calculada por `editor_scroll` no
+    /// inicio de cada quadro; o desenho do cursor a reaproveita em vez de varrer
+    /// o documento de novo.
+    pub vpos: (usize, usize),
     undo: Stack,
     redo: Stack,
     typing: Option<Typing>,

@@ -271,8 +271,10 @@ impl<'a> Frame<'a> {
 
     /// Fecha a linha em construcao e a guarda.
     fn end_row(&mut self) {
-        let row = self.s.clone();
-        self.s.clear();
+        // Move a linha pronta e deixa um buffer novo com a mesma capacidade (a
+        // linha seguinte tem tamanho parecido): sem copiar o texto da linha.
+        let cap = self.s.len();
+        let row = std::mem::replace(&mut self.s, String::with_capacity(cap));
         self.rows.push(row);
     }
 
@@ -1899,9 +1901,9 @@ impl<'a> Frame<'a> {
             }
             _ if app.tabs.is_empty() => self.p("\x1b[?25l"),
             _ => {
-                let lay = app.layout(false);
                 let Some(b) = app.buf() else { return };
-                let (vrow, vcol) = crate::layout::cursor_visual_pos(b, &lay);
+                // Calculada por `editor_scroll` no inicio deste mesmo quadro.
+                let (vrow, vcol) = b.vpos;
                 let cy = (vrow as i32 - b.scroll_y as i32 + 2).clamp(2, editor_rows.max(2));
                 let lo = app.left_width + 2;
                 let gutter = app.gutter_width(false) as i32;

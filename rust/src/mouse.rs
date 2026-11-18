@@ -192,6 +192,7 @@ impl App {
             }
             return;
         }
+        self.flush_preview();
         if self.in_preview() {
             if let Some(p) = &mut self.preview {
                 if up {
@@ -502,6 +503,7 @@ impl App {
 
     /// Se a previa esta na tela, abre a nota em aba mantendo a rolagem.
     fn promote_preview(&mut self) {
+        self.flush_preview();
         let key = self.preview.as_ref().map(|p| p.key.clone()).or_else(|| {
             if self.focus == Focus::Left {
                 self.selected_key()

@@ -137,16 +137,49 @@ pub fn find_all_caseless(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
         }
         return out;
     }
-    // Fora do ASCII: cada byte dobrado guarda o caractere original de origem.
-    let (low, mapa) = lowered_with_map(haystack);
     let needle_low = needle.to_lowercase();
     if needle_low.is_empty() {
         return Vec::new();
     }
+    // Texto acentuado (o caso comum em portugues) costuma baixar caractere a
+    // caractere com o mesmo tamanho em bytes: os indices do texto em minusculas
+    // valem para o original e nao precisa de mapa (16 bytes por byte do texto).
+    if let Some(low) = lowercase_same_layout(haystack) {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = low[from..].find(&needle_low) {
+            let a = from + rel;
+            let b = a + needle_low.len();
+            out.push((a, b));
+            from = b;
+        }
+        return out;
+    }
+    find_all_mapped(haystack, &needle_low)
+}
+
+/// `s` em minusculas, se cada caractere virar exatamente um caractere do mesmo
+/// tamanho em bytes (entao as posicoes coincidem com as de `s`).
+fn lowercase_same_layout(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let mut lower = c.to_lowercase();
+        let (Some(l), None) = (lower.next(), lower.next()) else { return None };
+        if l.len_utf8() != c.len_utf8() {
+            return None;
+        }
+        out.push(l);
+    }
+    Some(out)
+}
+
+/// Caminho geral: cada byte dobrado guarda o caractere original de origem.
+fn find_all_mapped(haystack: &str, needle_low: &str) -> Vec<(usize, usize)> {
+    let (low, mapa) = lowered_with_map(haystack);
     let mut out = Vec::new();
     let mut from = 0;
     while from <= low.len() {
-        let Some(rel) = low[from..].find(&needle_low) else { break };
+        let Some(rel) = low[from..].find(needle_low) else { break };
         let a = from + rel;
         let b = a + needle_low.len();
         let (ini, _) = mapa[a];
@@ -379,6 +412,25 @@ mod tests {
         assert_eq!(find_all_caseless("日本語です", "です"), [(9, 15)]);
         assert_eq!(find_all_caseless("İİ", "i̇"), [(0, 2), (2, 4)], "caractere que dobra ao baixar");
         assert_eq!(find_all_caseless("ÜBER ÜBER", "über"), [(0, 5), (6, 11)]);
+    }
+
+    #[test]
+    fn same_layout_shortcut_agrees_with_the_mapped_search() {
+        let casos = [
+            ("Ação e ação, AÇÃO", "ação"),
+            ("ÜBER über ÜBER", "über"),
+            ("日本語です日本", "です"),
+            ("İİ e i̇", "i̇"),
+            ("Ǆ ǆ ǅ", "ǆ"),
+            ("sem acento Nenhum", "NENHUM"),
+            ("aaaa ÁÁÁÁ", "áá"),
+        ];
+        for (h, n) in casos {
+            let esperado = find_all_mapped(h, &n.to_lowercase());
+            assert_eq!(find_all_caseless(h, n), esperado, "{h:?} / {n:?}");
+        }
+        assert!(lowercase_same_layout("Ação").is_some());
+        assert!(lowercase_same_layout("İ").is_none(), "baixar muda o tamanho");
     }
 
     #[test]

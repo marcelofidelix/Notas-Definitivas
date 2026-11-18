@@ -2,7 +2,7 @@
 //! posicao na tela. Com links/estilos ocultos, so o texto visivel ocupa colunas.
 
 use crate::doc::{Buffer, Line, RowMemo};
-use crate::md::{find_links, find_styles, is_table_line, task_item, LinkSpan, StyleSpan, Task};
+use crate::md::{find_links, find_styles, task_item, LinkSpan, StyleSpan, Task};
 use crate::tbl::{self, TView};
 use crate::text::{cp_width, str_width, width_len};
 
@@ -96,8 +96,8 @@ fn plain_single(l: &Line, lay: &Layout) -> bool {
     !lay.wrap
         || l.fence
         || l.in_code
-        || (l.text.len() <= lay.avail_w && !l.text.contains('\t'))
-        || is_table_line(&l.text)
+        || (l.text.len() <= lay.avail_w && !l.has_tab)
+        || l.tbl_line
 }
 
 fn layout_key(lay: &Layout) -> u32 {

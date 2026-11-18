@@ -267,12 +267,20 @@ fn next_poll_timeout(app: &App) -> Duration {
     if let Some((_, t)) = &app.status {
         wait = wait.min(STATUS_TTL.saturating_sub(t.elapsed()).max(piso));
     }
+    // Autosave: o que vencer primeiro, a pausa na edicao ou o teto desde a
+    // primeira alteracao nao gravada.
     if let Some(restante) = app
         .tabs
         .iter()
         .filter(|t| t.modified)
-        .filter_map(|t| t.first_unsaved)
-        .map(|t| app::AUTOSAVE_DELAY.saturating_sub(t.elapsed()))
+        .filter_map(|t| {
+            let teto = t.first_unsaved.map(|f| app::AUTOSAVE_DELAY.saturating_sub(f.elapsed()));
+            let pausa = t.last_edit.map(|e| app::AUTOSAVE_IDLE.saturating_sub(e.elapsed()));
+            match (teto, pausa) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        })
         .min()
     {
         wait = wait.min(restante.max(piso));
@@ -284,9 +292,18 @@ fn next_poll_timeout(app: &App) -> Duration {
 enum ExitReason {
     Quit,
     Shutdown,
+    /// O terminal deixou de existir (SSH caiu, janela fechada sem sinal): salva e sai.
+    TerminalLost,
 }
 
+/// Quantas falhas seguidas de escrita (100 ms entre elas, ~5 s) ou de leitura de
+/// eventos (50 ms, ~5 s) indicam que o terminal sumiu. Sem isto o programa ficava
+/// para sempre num laco de tentativas, orfao e consumindo CPU.
+const WRITE_FAILURES_LIMIT: u32 = 50;
+const INPUT_FAILURES_LIMIT: u32 = 100;
+
 fn run(app: &mut App) -> ExitReason {
+    let (mut write_failures, mut input_failures) = (0u32, 0u32);
     while !app.quit {
         if let Ok((c, r)) = terminal::size() {
             if i32::from(c) != app.cols || i32::from(r) != app.rows {
@@ -297,7 +314,13 @@ fn run(app: &mut App) -> ExitReason {
         }
         if should_draw(app) {
             let frame = render::draw(app);
-            if !write_frame(&frame) {
+            if write_frame(&frame) {
+                write_failures = 0;
+            } else {
+                write_failures += 1;
+                if write_failures >= WRITE_FAILURES_LIMIT {
+                    return ExitReason::TerminalLost;
+                }
                 // Saida indisponivel: tenta de novo no proximo ciclo.
                 app.clear_needed = true;
                 app.needs_redraw = true;
@@ -306,18 +329,37 @@ fn run(app: &mut App) -> ExitReason {
         }
         match event::poll(next_poll_timeout(app)) {
             Ok(true) => {
+                // Trocar a selecao da lista varias vezes no mesmo lote carrega a
+                // previa uma so vez, no fim dele.
+                app.defer_preview = true;
                 while let Ok(true) = event::poll(Duration::from_millis(0)) {
                     match event::read() {
-                        Ok(ev) => handle_event(app, ev),
-                        Err(_) => break,
+                        Ok(ev) => {
+                            input_failures = 0;
+                            handle_event(app, ev);
+                        }
+                        Err(_) => {
+                            input_failures += 1;
+                            std::thread::sleep(Duration::from_millis(50));
+                            break;
+                        }
                     }
                     if app.quit {
+                        app.defer_preview = false;
                         return ExitReason::Quit;
                     }
                 }
+                app.defer_preview = false;
+                app.flush_preview();
             }
-            Ok(false) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            Ok(false) => input_failures = 0,
+            Err(_) => {
+                input_failures += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        if input_failures >= INPUT_FAILURES_LIMIT {
+            return ExitReason::TerminalLost;
         }
         if SHUTDOWN.load(Ordering::SeqCst) {
             return ExitReason::Shutdown;
@@ -336,11 +378,14 @@ fn run_session(app: &mut App, events: impl FnOnce(&mut App) -> ExitReason) -> Re
     if matches!(result, Ok(ExitReason::Quit)) {
         return Ok(());
     }
-    let saved = catch_unwind(AssertUnwindSafe(|| app.emergency_save())).unwrap_or(false);
+    let panicked = result.is_err();
+    let saved = catch_unwind(AssertUnwindSafe(|| app.emergency_save(panicked))).unwrap_or(false);
     if !saved {
         Err("Falha no salvamento de emergência. Há alterações pendentes.")
-    } else if result.is_err() {
+    } else if panicked {
         Err("Erro interno inesperado. Salvamento de emergência concluído.")
+    } else if matches!(result, Ok(ExitReason::TerminalLost)) {
+        Err("Terminal indisponível. As alterações pendentes foram salvas.")
     } else {
         Ok(())
     }
@@ -383,6 +428,14 @@ fn main() {
         }
     };
     warnings.extend(db.warnings.iter().cloned());
+
+    // Backup diario consistente (VACUUM INTO) em `notas-backups/`, ao lado do banco,
+    // com os 7 mais recentes. `NOTAS_NO_BACKUP=1` desliga.
+    if std::env::var_os("NOTAS_NO_BACKUP").is_none() {
+        if let Err(e) = db.backup_if_due(&db_path(), db::now_secs()) {
+            warnings.push(format!("backup diario falhou: {e}"));
+        }
+    }
 
     install_shutdown_handler();
     install_panic_hook(db_path().parent().map(PathBuf::from).unwrap_or_else(exe_dir));

@@ -28,7 +28,7 @@ Ou direto com o Cargo: `cargo build --release` (binário em `target/release/nota
 
 ## Funcionalidades
 
-O editor Rust oferece: edição modal (Normal, Inserção, Visual caractere/linha, `:` comandos), `y`/`p`/`x`/`dd`/`u`/`Ctrl+R`, seleção por `Shift+Setas` e mouse, abas (`gt`/`gT`, `c`/`C`, clique do meio), lista lateral por urgência (`[1]…[O]`, filtros `0`–`6`, `m`/`!`), busca sem acentos com prévia (`Ctrl+F`), tabelas auto-alinhadas (`Tab`, `gqq`, `:table`, `:tableall`), dobras (`za`, `zM`, `zR`, `zc`, `zo`), links `[t](url)` e `[[wiki]]` (Enter, `gl`, `Ctrl+N`) — **inclusive execução de scripts** (`.bat`, `.cmd`, `.ps1`, `.sh`, `.exe`… com a pasta do script como diretório de trabalho) —, quebra de linha visual, 8 temas TrueColor, `:import`/`:export`, autosave a cada 1 min, histórico (`Backspace`), Game of Life (`:life`, ociosidade de 10 min) e cursor **fixo** (sem piscar) com quadros sincronizados (DEC 2026).
+O editor Rust oferece: edição modal (Normal, Inserção, Visual caractere/linha, `:` comandos), `y`/`p`/`x`/`dd`/`u`/`Ctrl+R`, seleção por `Shift+Setas` e mouse, abas (`gt`/`gT`, `c`/`C`, clique do meio), lista lateral por urgência (`[1]…[O]`, filtros `0`–`6`, `m`/`!`), busca sem acentos com prévia (`Ctrl+F`), tabelas auto-alinhadas (`Tab`, `gqq`, `:table`, `:tableall`), dobras (`za`, `zM`, `zR`, `zc`, `zo`), links `[t](url)` e `[[wiki]]` (Enter, `gl`, `Ctrl+N`) — **inclusive execução de scripts** (`.bat`, `.cmd`, `.ps1`, `.sh`, `.exe`… com a pasta do script como diretório de trabalho) —, quebra de linha visual, 8 temas TrueColor, `:import`/`:export`, autosave após 3 s de pausa na digitação (teto de 20 s), histórico (`Backspace`), Game of Life (`:life`, ociosidade de 10 min) e cursor **fixo** (sem piscar) com quadros sincronizados (DEC 2026).
 
 ### Detalhes de edição e segurança
 
@@ -153,14 +153,34 @@ O que foi feito:
 - **Linhas gigantes** (> 20 mil bytes) são tratadas como texto simples (sem varrer links/estilos a cada quadro).
 - No SQLite, salvar e renomear conferem a versão carregada e gravam na mesma transação. Um conflito mantém a edição na aba. Em arquivos avulsos, o editor compara o conteúdo no disco imediatamente antes da substituição. Se o arquivo estava por criar, a gravação exige que o destino continue livre. Use `:e!` para recarregar ou `:w!` para sobrescrever deliberadamente.
 - A importação de uma pasta é integral. Uma falha de leitura ou gravação em um arquivo elegível desfaz o lote e mostra o caminho e o motivo.
-- **Autosave que falha não entra em laço** (antes repetiria a cada 100 ms): tenta de novo em 1 minuto.
+- **Autosave que falha não entra em laço** (antes repetiria a cada 100 ms): tenta de novo só no próximo teto (20 s).
 - **Fechar a janela do console (Windows)** salva as notas pendentes antes de sair (logoff/desligamento também). No Linux/macOS, `SIGTERM`, `SIGHUP` (queda de SSH) e `SIGQUIT` levantam a mesma flag de encerramento.
 - **Pânico deixa rastro:** `notas-crash.log`, ao lado do banco, guarda data, local e mensagem antes de a tela ser restaurada (antes a mensagem do Rust era apagada junto com a tela alternativa).
 - **Degradação não é silenciosa:** WAL indisponível, pasta do executável inacessível e exportação parcial aparecem no status inicial.
 - **Exportação nunca perde nota:** nomes diferentes que higienizam para o mesmo arquivo (`a:b` e `a*b`) recebem sufixo em vez de se sobrescreverem.
 - **Menos desperdícios:** o laço de eventos espera até o próximo prazo interno (letreiro, status, autosave, batimento) em vez de acordar a cada 100 ms; o clipboard reaproveita o handle de leitura e tenta 3 vezes em vez de 10 (congelamento máximo de 50 ms para 15 ms); a colagem tem teto de 16 MB (era 64 MB, que podia custar ~200 MB de pico); busca de texto sem acento não aloca por linha.
 
-Oportunidades ainda abertas (maiores, não medidas como problema hoje): custo do quadro ainda cresce com o número de linhas até o cursor (duas varreduras por quadro — invisível até ~50 mil linhas, resolveria com índice de prefixo); indexar a busca em segundo plano para bancos com dezenas de milhares de notas; teste automatizado do terminal real (pty).
+### Segunda revisão: estabilidade e desempenho
+
+**Dados e recuperação**
+
+- **Autosave por pausa:** grava 3 s depois da última tecla, e no máximo 20 s depois da primeira alteração não gravada (antes só após 60 s: uma queda de energia perdia até um minuto de texto).
+- **Backup diário automático:** na abertura, `VACUUM INTO` cria `notas-backups/notas-backup-AAAAMMDD.db` ao lado do banco (um por dia, os 7 mais recentes). Cada backup é um `notas.db` completo e consistente. `NOTAS_NO_BACKUP=1` desliga. Falha de backup aparece no status inicial.
+- **Salvamento de emergência não sobrescreve a versão boa:** depois de um pânico, a versão que estava gravada é copiada para a tabela `recovery` (últimas 20; `SELECT name, datetime(ts,'unixepoch'), content FROM recovery`) ou, em arquivo avulso, para `<arquivo>.notas-bak`. Se nem o salvamento funcionar, o texto vai para `notas-recuperado-*.md` na pasta do executável.
+- **Terminal que some não deixa o programa órfão:** ~5 s de falhas seguidas de escrita ou de leitura de eventos (SSH caiu sem sinal) disparam o salvamento de emergência e o encerramento. Antes o laço tentava para sempre.
+- **Erros do SQLite não viram "vazio":** a lista de notas, o índice de busca, a prévia e a exportação passam a devolver o erro. Uma falha mantém a lista atual e avisa; linhas ilegíveis são contadas e mostradas; a exportação lê uma nota por vez (não carrega o banco inteiro), é interrompida se a leitura falhar e informa quantas notas não foram gravadas.
+- **Índice de busca nunca é "envenenado":** uma nota que não pôde ser lida não recebe mais índice vazio gravado, e as reconstruções acontecem numa única transação. Um gatilho no banco invalida (`NULL`) o `content_norm` quando alguém grava só o `content` (a versão em C, o `sqlite3`): o Rust o reconstrói na próxima busca.
+- **Arquivos avulsos:** regravar segue symlinks e preserva as permissões (antes o link virava arquivo e o modo caía para 0600). Nomes exportados evitam nomes reservados do Windows (`CON`, `NUL`, `COM1`…), ponto/espaço no fim e caracteres de controle. A importação reserva o escritor desde o início.
+
+**Desempenho**
+
+- **`find_styles` linear:** `*a *a *a…` numa linha de 20 KB custava ~39 ms por chamada (várias por quadro); agora é uma varredura. Verificado contra a versão anterior em 20 mil textos aleatórios.
+- **Menos varreduras por quadro:** o cursor reaproveita a posição calculada no início do quadro (eram 4 varreduras do documento, agora 3), e "linha tem TAB / é linha de tabela" é calculado quando o texto muda, não a cada quadro. Quadro 120×30: 0,32 ms; tecla + quadro: 0,23 ms (era 0,35); `Enter`: 0,29 ms.
+- **Prévia carregada uma vez por lote de eventos:** segurar `j`/`↓` na lista só carrega a nota em que a seleção parou.
+- **Índice de busca preservado:** criar, renomear, excluir ou abrir um `[[link]]` não descarta mais o índice; só a nota afetada é reindexada (lotes grandes, como importar, voltam ao carregamento sob demanda). Salvar normaliza o texto uma vez (antes, duas) e não monta o índice da lista se ele nem foi carregado; ler a versão da nota no salvamento não copia mais o texto.
+- **Miudezas:** `end_row` não copia a linha; busca de texto com acentos não aloca mais 16 bytes por byte; pilha de desfazer com fila dupla; conexão SQLite sem trava interna; `temp_store=MEMORY`, `journal_size_limit` e `PRAGMA optimize` ao fechar.
+
+Oportunidades ainda abertas (maiores, não medidas como problema hoje): custo do quadro ainda cresce com o número de linhas até o cursor (três varreduras por quadro — invisível até ~50 mil linhas, resolveria com índice de prefixo); indexar a busca em segundo plano para bancos com dezenas de milhares de notas; teste automatizado do terminal real (pty).
 
 ## Arquitetura (`src/`)
 

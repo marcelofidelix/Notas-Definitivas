@@ -79,11 +79,33 @@ fn check_file_version(path: &Path, expected: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Destino real de um symlink (o proprio caminho se nao for um link).
+fn resolve_symlink(path: &Path) -> std::path::PathBuf {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Publica um temporário completo no mesmo diretório. Ao criar uma nota nova,
 /// a própria publicação falha se o destino já existir.
 pub fn write_file(path: &Path, data: &[u8], mode: FileWrite) -> io::Result<()> {
+    // Ao regravar um arquivo existente, o symlink e seguido (senao o link seria
+    // trocado por um arquivo comum) e as permissoes sao preservadas.
+    let replacing = !matches!(mode, FileWrite::Create);
+    let resolved = if replacing { resolve_symlink(path) } else { path.to_path_buf() };
+    let path = resolved.as_path();
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    #[cfg(unix)]
+    {
+        if replacing {
+            if let Ok(meta) = fs::metadata(path) {
+                // O temporario nasce 0600; o arquivo original pode ser 0644, 0664...
+                let _ = tmp.as_file().set_permissions(meta.permissions());
+            }
+        }
+    }
     tmp.write_all(data)?;
     tmp.as_file().sync_all()?;
     match mode {
@@ -159,7 +181,9 @@ pub fn import_notes_from_dir(db: &Db, dir: &str) -> Result<ImportReport, String>
         return Err("nenhuma pasta informada".into());
     }
     let entries = fs::read_dir(dir).map_err(|e| format!("{dir}: {e}"))?;
-    let tx = db.transaction(rusqlite::TransactionBehavior::Deferred).map_err(|e| e.to_string())?;
+    // Imediata: reserva o escritor ja no inicio, em vez de arriscar um
+    // SQLITE_BUSY no meio do lote ao subir de leitura para escrita.
+    let tx = db.transaction(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
     let (mut added, mut updated) = (0, 0);
     for entry in entries {
         let entry = entry.map_err(|e| format!("{dir}: {e}"))?;
@@ -198,12 +222,45 @@ pub fn import_notes_from_dir(db: &Db, dir: &str) -> Result<ImportReport, String>
     Ok(ImportReport { added, updated })
 }
 
+#[derive(Debug)]
+pub struct ExportReport {
+    pub written: usize,
+    /// Notas que nao puderam ser gravadas (a interface precisa avisar).
+    pub failed: usize,
+}
+
+/// Nome de arquivo seguro (sem extensao) para exportar uma nota, em qualquer
+/// sistema: troca caracteres invalidos e de controle, descarta `.`/espaco no fim
+/// (o Windows os remove sozinho e o nome deixaria de bater), evita nomes
+/// reservados do Windows (`CON`, `NUL`, `COM1`...) e limita o tamanho.
+pub fn export_file_stem(name: &str) -> String {
+    let cleaned: String = sanitize_note_name(name).chars().map(|c| if c.is_control() { '_' } else { c }).collect();
+    let mut stem = cleaned.trim_end_matches(['.', ' ']).trim_start_matches(' ').to_string();
+    if stem.is_empty() {
+        return stem;
+    }
+    // Maximo de 200 bytes (sobra espaco para " (2)" e ".md" nos 255 do sistema).
+    stem.truncate(crate::text::floor_boundary(&stem, 200));
+    let first = stem.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(first.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (first.len() == 4
+            && (first.starts_with("COM") || first.starts_with("LPT"))
+            && first.as_bytes()[3].is_ascii_digit()
+            && first.as_bytes()[3] != b'0');
+    if reserved {
+        stem.insert(0, '_');
+    }
+    stem
+}
+
 /// Exporta cada nota como `<nome>.md` (nome higienizado) com escrita atomica.
-/// Devolve quantas foram gravadas; erro se nada pode ser gravado.
+/// As notas sao lidas e gravadas uma a uma (o banco inteiro nunca fica na
+/// memoria). Erro se a leitura do banco falhar ou se nada puder ser gravado;
+/// falhas parciais voltam em `failed`.
 ///
 /// Nomes diferentes podem higienizar para o mesmo arquivo (`a:b` e `a*b` viram
 /// `a_b`): o segundo recebe um sufixo, em vez de sobrescrever o primeiro.
-pub fn export_notes_to_dir(db: &Db, dir: &str) -> Result<usize, String> {
+pub fn export_notes_to_dir(db: &Db, dir: &str) -> Result<ExportReport, String> {
     if dir.is_empty() {
         return Err("nenhuma pasta informada".into());
     }
@@ -213,11 +270,11 @@ pub fn export_notes_to_dir(db: &Db, dir: &str) -> Result<usize, String> {
     })?;
     let (mut written, mut failed) = (0usize, 0usize);
     let mut usados: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (name, content) in db.all_name_content() {
-        let base = sanitize_note_name(&name);
+    let read = db.for_each_note(|name, content| {
+        let base = export_file_stem(name);
         if base.is_empty() {
             failed += 1;
-            continue;
+            return;
         }
         // Windows e macOS nao diferenciam maiusculas no nome do arquivo.
         let mut safe = base.clone();
@@ -232,11 +289,14 @@ pub fn export_notes_to_dir(db: &Db, dir: &str) -> Result<usize, String> {
         } else {
             failed += 1;
         }
+    });
+    if let Err(e) = read {
+        return Err(format!("leitura do banco falhou depois de {written} nota(s): {e}"));
     }
     if failed > 0 && written == 0 {
         return Err(format!("{} nota(s) nao puderam ser exportadas", failed));
     }
-    Ok(written)
+    Ok(ExportReport { written, failed })
 }
 
 #[cfg(test)]
@@ -294,7 +354,7 @@ mod tests {
         db.insert_note("a*b", "asterisco", 2, 0).unwrap();
 
         let out = d.path().join("saida");
-        let n = export_notes_to_dir(&db, out.to_str().unwrap()).unwrap();
+        let n = export_notes_to_dir(&db, out.to_str().unwrap()).unwrap().written;
         let arquivos = fs::read_dir(&out).unwrap().count();
         assert_eq!(n, 6);
         assert_eq!(arquivos, 6, "nenhuma nota pode sobrescrever a outra");
@@ -317,7 +377,8 @@ mod tests {
         assert_eq!(db.count_notes(), 2);
 
         let out = d.path().join("saida");
-        assert_eq!(export_notes_to_dir(&db, out.to_str().unwrap()).unwrap(), 2);
+        let r = export_notes_to_dir(&db, out.to_str().unwrap()).unwrap();
+        assert_eq!((r.written, r.failed), (2, 0));
         assert_eq!(fs::read_to_string(out.join("Beta.md")).unwrap(), "beta ção\n");
     }
 
@@ -357,6 +418,46 @@ mod tests {
         let db = Db::open_memory();
         assert!(import_notes_from_dir(&db, "Z:/nao/existe/mesmo").is_err());
         assert_eq!(db.count_notes(), 0);
+    }
+
+    #[test]
+    fn export_names_are_safe_on_every_system() {
+        assert_eq!(export_file_stem("Reuniao: 1/2"), "Reuniao_ 1_2");
+        assert_eq!(export_file_stem("Nota final. "), "Nota final");
+        assert_eq!(export_file_stem("con"), "_con", "nome reservado do Windows");
+        assert_eq!(export_file_stem("NUL.backup"), "_NUL.backup");
+        assert_eq!(export_file_stem("com1"), "_com1");
+        assert_eq!(export_file_stem("com0"), "com0");
+        assert_eq!(export_file_stem("console"), "console");
+        assert_eq!(export_file_stem("a\u{1}b"), "a_b", "controle vira _");
+        assert_eq!(export_file_stem("..."), "");
+        assert!(export_file_stem(&"ç".repeat(300)).len() <= 200);
+    }
+
+    #[test]
+    fn export_reports_unwritable_notes_instead_of_hiding_them() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open_memory();
+        db.insert_note("Boa", "texto", 1, 0).unwrap();
+        db.insert_note("...", "so pontos", 2, 0).unwrap();
+        let r = export_notes_to_dir(&db, d.path().join("out").to_str().unwrap()).unwrap();
+        assert_eq!((r.written, r.failed), (1, 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwrite_keeps_symlink_and_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real.md");
+        fs::write(&real, "antigo").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = d.path().join("link.md");
+        symlink(&real, &link).unwrap();
+        write_file(&link, b"novo", FileWrite::Overwrite).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "o link continua sendo link");
+        assert_eq!(fs::read(&real).unwrap(), b"novo");
+        assert_eq!(fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
     #[test]

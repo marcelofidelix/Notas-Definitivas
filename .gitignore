@@ -11,6 +11,12 @@ notas.db-shm
 # Backups temporarios de trabalho (nao sao artefatos do projeto)
 *.bak-*
 
+# Backups diarios, copias de recuperacao e relatorios de falha do proprio programa
+notas-backups/
+notas-recuperado-*.md
+*.notas-bak
+notas-crash.log
+
 # Instrucoes pessoais de desenvolvimento permanecem locais.
 /AGENTS.md
 
