@@ -468,11 +468,9 @@ impl App {
         let clicked = (m.row - 4).max(0) as usize + self.sidebar_scroll;
         let Some(&actual) = self.filtered.get(clicked) else { return };
         self.selected = clicked;
-        if (1..=5).contains(&m.col) {
-            self.last_note_click = None;
-            self.toggle_attention_at(actual);
-            return;
-        }
+        // A caixinha de urgencia (colunas 1..=5) nao marca mais a nota ao ser
+        // clicada: o clique ali e igual ao clique no resto da linha (previa; duplo
+        // clique abre). A marcacao continua disponivel pelo teclado (`m`/`!`).
         let double = self
             .last_note_click
             .is_some_and(|(i, t)| i == clicked && now.duration_since(t) < Duration::from_millis(500));

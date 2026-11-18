@@ -721,10 +721,12 @@ fn mouse_buttons_tabs_wheel_and_double_click() {
     click(&mut a, 10, 5);
     assert_eq!(a.focus, Focus::Right);
     assert_eq!(a.tabs.len(), n_tabs + 1, "duplo clique abre a nota");
-    // Clique na caixinha de urgencia.
+    // Clique na caixinha de urgencia: nao marca mais a nota (so o teclado marca).
     a.focus = Focus::Left;
     click(&mut a, 3, 4);
-    assert!(a.notes.iter().any(|n| n.attention == 1));
+    assert!(a.notes.iter().all(|n| n.attention == 0), "clicar na caixinha nao altera a urgencia");
+    assert_eq!(a.focus, Focus::Left);
+    assert!(a.preview.is_some(), "o clique na caixinha se comporta como clique na linha: mostra a previa");
     // Roda do mouse na lista nao ultrapassa os limites.
     for _ in 0..50 {
         a.on_mouse(Mouse { btn: Btn::WheelDown, col: 5, row: 6, released: false });
